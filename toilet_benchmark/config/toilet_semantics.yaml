@@ -1,0 +1,89 @@
+scene_name: shenxinfu_841837_toilet
+scene_root_path: /World/shenxinfu_841837
+
+entrances:
+  - id: entrance_main
+    scene_prim: Door_0000
+    pose: [-3.8, -0.95, 0.0]
+
+exits:
+  - id: exit_main
+    scene_prim: Door_0000
+    pose: [-3.8, -0.95, 0.0]
+
+urinals:
+  - id: urinal_1
+    scene_prim: Edestalurinal_0000
+    placement:
+      offset_local: [0.0, -0.38, 0.0]
+      yaw_mode: face_anchor
+    queue_rule:
+      slots: 2
+      first_gap: 0.4
+      spacing: 0.4
+      axis_local: [0.0, -1.0, 0.0]
+      yaw_mode: same_as_resource
+  - id: urinal_2
+    scene_prim: Edestalurinal_0001
+    placement:
+      offset_local: [0.0, -0.38, 0.0]
+      yaw_mode: face_anchor
+    queue_rule:
+      slots: 2
+      first_gap: 0.4
+      spacing: 0.4
+      axis_local: [0.0, -1.0, 0.0]
+      yaw_mode: same_as_resource
+  - id: urinal_3
+    scene_prim: Edestalurinal_0002
+    placement:
+      offset_local: [0.0, -0.38, 0.0]
+      yaw_mode: face_anchor
+    queue_rule:
+      slots: 2
+      first_gap: 0.4
+      spacing: 0.4
+      axis_local: [0.0, -1.0, 0.0]
+      yaw_mode: same_as_resource
+  - id: urinal_4
+    scene_prim: Edestalurinal_0003
+    placement:
+      offset_local: [0.0, -0.38, 0.0]
+      yaw_mode: face_anchor
+    queue_rule:
+      slots: 2
+      first_gap: 0.4
+      spacing: 0.4
+      axis_local: [0.0, -1.0, 0.0]
+      yaw_mode: same_as_resource
+  - id: urinal_5
+    scene_prim: Edestalurinal_0004
+    placement:
+      offset_local: [0.0, -0.38, 0.0]
+      yaw_mode: face_anchor
+    queue_rule:
+      slots: 2
+      first_gap: 0.4
+      spacing: 0.4
+      axis_local: [0.0, -1.0, 0.0]
+      yaw_mode: same_as_resource
+
+stalls:
+  - id: stall_1
+    scene_prim: Toilet_0000
+    pose: [2.0, -0.5, 1.57]
+    queue_slots:
+      - [1.6, -0.5, 1.57]
+      - [1.2, -0.5, 1.57]
+  - id: stall_2
+    scene_prim: Toilet_0001
+    pose: [2.0, -1.2, 1.57]
+    queue_slots:
+      - [1.6, -1.2, 1.57]
+      - [1.2, -1.2, 1.57]
+
+sinks:
+  - id: sink_1
+    pose: [0.5, 1.0, 3.14]
+    queue_slots:
+      - [0.5, 0.6, 3.14]

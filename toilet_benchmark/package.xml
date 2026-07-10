@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>toilet_benchmark</name>
+  <version>0.0.0</version>
+  <description>Toilet-scene benchmark director skeleton for Arena-Rosnav + Isaac + Hunav.</description>
+  <maintainer email="stardust@example.com">stardust</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>ament_cmake_python</build_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>ament_index_python</depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>isaacsim_msgs</depend>
+  <depend>hunav_msgs</depend>
+  <exec_depend>people_msgs</exec_depend>
+
+  <exec_depend>arena_bringup</exec_depend>
+  <exec_depend>task_generator</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,64 @@
+arrival:
+  seed: 12345
+  lambda_per_min: 6.0
+  max_active_agents: 8
+
+intent_distribution:
+  urinal: 0.55
+  stall: 0.30
+  sink_only: 0.05
+  pass_through: 0.10
+
+service_time_sec:
+  urinal: [20.0, 45.0]
+  stall: [60.0, 180.0]
+  sink: [10.0, 25.0]
+
+queue_policy:
+  max_queue_len_per_resource: 3
+  choose_nearest_queue_slot: true
+
+director:
+  live_pose_topic: /isaac/pedestrian_states
+  arrival_tolerance_m: 0.35
+  actor_stop_radius_m: 0.5
+  exit_arrival_tolerance_m: 0.55
+  walk_plane_z: 0.0
+  pose_stale_sec: 5.0
+  max_live_pose_jump_m: 3.0
+  allow_eta_fallback: false
+  exit_when_complete: true
+  initial_spawn_interval_sec: 1.5
+
+path_planner:
+  enabled: true
+  backend: voxel
+  voxel_map_path: /home/stardust/resources/arena_ws/arena_assets/collision_configs/shenxinfu_841837.voxel.json.gz
+  z_min: 0.05
+  z_max: 1.2
+  agent_radius_m: 0.25
+  bounds_padding_m: 1.0
+  nearest_free_radius_m: 0.8
+  max_expansions: 20000
+  simplify: true
+
+hunav_profile:
+  regular:
+    desired_velocity: [0.5, 0.9]
+    behavior_type: REGULAR
+  impatient:
+    desired_velocity: [0.8, 1.1]
+    behavior_type: THREATENING
+
+character_pool:
+  - original_female_adult_business_02
+  - original_female_adult_medical_01
+  - original_female_adult_police_01
+  - original_female_adult_police_02
+  - original_female_adult_police_03
+  - original_male_adult_construction_01
+  - original_male_adult_construction_02
+  - original_male_adult_construction_03
+  - original_male_adult_construction_05
+  - original_male_adult_medical_01
+  - original_male_adult_police_04
