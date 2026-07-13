@@ -73,8 +73,14 @@ class ResourceManager:
         resource = self.resources.get(resource_id)
         if resource is None:
             return None
-        if resource.occupied_by == agent_id:
-            resource.occupied_by = None
+        if resource.occupied_by != agent_id:
+            for slot in resource.queue_slots:
+                if slot.occupant_id == agent_id:
+                    slot.occupant_id = None
+                    break
+            return None
+
+        resource.occupied_by = None
         promoted = None
         for slot in resource.queue_slots:
             if slot.occupant_id:

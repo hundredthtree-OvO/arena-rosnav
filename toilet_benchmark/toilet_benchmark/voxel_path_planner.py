@@ -12,12 +12,16 @@ from typing import Iterable
 GridCell = tuple[int, int]
 
 
+class PathPlanningError(RuntimeError):
+    """Raised when the voxel planner cannot produce a collision-free path."""
+
+
 @dataclass(frozen=True)
 class VoxelPathPlannerConfig:
     map_path: str
     z_min: float = 0.05
     z_max: float = 1.2
-    agent_radius_m: float = 0.25
+    agent_radius_m: float = 0.30
     bounds_padding_m: float = 1.0
     max_expansions: int = 20000
     nearest_free_radius_m: float = 0.8
@@ -40,12 +44,14 @@ class VoxelPathPlanner:
         resolution: float,
         origin: tuple[float, float, float],
         occupied: set[GridCell],
+        grid_bounds: tuple[int, int, int, int] | None,
         config: VoxelPathPlannerConfig,
     ):
         self.resolution = float(resolution)
         self.origin = origin
         self.config = config
         self.occupied = set(occupied)
+        self.grid_bounds = grid_bounds
         self.inflated_occupied = self._inflate_occupied(self.occupied, config.agent_radius_m)
 
     @classmethod
@@ -62,25 +68,60 @@ class VoxelPathPlanner:
             z_min=float(config.z_min),
             z_max=float(config.z_max),
         )
-        return cls(resolution=resolution, origin=origin, occupied=occupied, config=config)
+        bounds_raw = data.get("grid_bounds")
+        grid_bounds = None
+        if isinstance(bounds_raw, (list, tuple)) and len(bounds_raw) >= 4:
+            grid_bounds = tuple(int(value) for value in bounds_raw[:4])
+        return cls(
+            resolution=resolution,
+            origin=origin,
+            occupied=occupied,
+            grid_bounds=grid_bounds,
+            config=config,
+        )
 
     def plan(self, start: list[float], goal: list[float], *, z: float = 0.0) -> list[list[float]]:
-        start_cell = self.nearest_free(self.world_to_cell(float(start[0]), float(start[1])))
+        requested_start_cell = self.world_to_cell(float(start[0]), float(start[1]))
+        start_cell = self.nearest_free(requested_start_cell)
         goal_cell = self.nearest_free(self.world_to_cell(float(goal[0]), float(goal[1])))
         if start_cell is None or goal_cell is None:
-            return [[float(goal[0]), float(goal[1]), float(z)]]
+            raise PathPlanningError("start or goal has no nearby free voxel cell")
         if start_cell == goal_cell:
-            return [[float(goal[0]), float(goal[1]), float(z)]]
+            points = [self.cell_to_world(goal_cell, z=z)]
+            return self._append_safe_exact_goal(points, goal, z=z)
 
         cells = self._astar(start_cell, goal_cell)
         if not cells:
-            return [[float(goal[0]), float(goal[1]), float(z)]]
+            raise PathPlanningError(f"no voxel path from {start_cell} to {goal_cell}")
         if self.config.simplify:
             cells = self._simplify_cells(cells)
 
         points = [self.cell_to_world(cell, z=z) for cell in cells[1:]]
+        if requested_start_cell != start_cell:
+            if not self._line_avoids_raw_obstacles(requested_start_cell, start_cell):
+                raise PathPlanningError("start cannot safely enter the bounded voxel map")
+            points.insert(0, self.cell_to_world(start_cell, z=z))
+        if not points:
+            points = [self.cell_to_world(goal_cell, z=z)]
+        return self._append_safe_exact_goal(points, goal, z=z)
+
+    def _append_safe_exact_goal(
+        self,
+        points: list[list[float]],
+        goal: list[float],
+        *,
+        z: float,
+    ) -> list[list[float]]:
         exact_goal = [float(goal[0]), float(goal[1]), float(z)]
-        if not points or _planar_distance(points[-1], exact_goal) > 1e-6:
+        if _planar_distance(points[-1], exact_goal) <= 1e-6:
+            return _dedupe_nearby_points(points)
+        goal_cell = self.world_to_cell(exact_goal[0], exact_goal[1])
+        start_cell = self.world_to_cell(points[-1][0], points[-1][1])
+        # Final semantic placement may enter the inflated safety margin, but it
+        # must never enter raw scene geometry or cross a raw occupied cell.
+        if self._in_bounds(goal_cell) and goal_cell not in self.occupied and self._line_avoids_raw_obstacles(
+            start_cell, goal_cell
+        ):
             points.append(exact_goal)
         return _dedupe_nearby_points(points)
 
@@ -115,7 +156,13 @@ class VoxelPathPlanner:
         return None
 
     def is_free(self, cell: GridCell) -> bool:
-        return cell not in self.inflated_occupied
+        return self._in_bounds(cell) and cell not in self.inflated_occupied
+
+    def _in_bounds(self, cell: GridCell) -> bool:
+        if self.grid_bounds is None:
+            return True
+        min_x, max_x, min_y, max_y = self.grid_bounds
+        return min_x <= cell[0] <= max_x and min_y <= cell[1] <= max_y
 
     def _inflate_occupied(self, occupied: set[GridCell], radius_m: float) -> set[GridCell]:
         radius_cells = max(0, math.ceil(float(radius_m) / self.resolution))
@@ -170,6 +217,10 @@ class VoxelPathPlanner:
             (1, -1, math.sqrt(2.0)),
             (1, 1, math.sqrt(2.0)),
         ):
+            if dx != 0 and dy != 0:
+                # Do not let a diagonal step cut between two blocked corners.
+                if not self.is_free((cell[0] + dx, cell[1])) or not self.is_free((cell[0], cell[1] + dy)):
+                    continue
             yield (cell[0] + dx, cell[1] + dy), cost
 
     def _search_bounds(self, start: GridCell, goal: GridCell) -> tuple[int, int, int, int]:
@@ -202,6 +253,9 @@ class VoxelPathPlanner:
             if not self.is_free(cell):
                 return False
         return True
+
+    def _line_avoids_raw_obstacles(self, start: GridCell, goal: GridCell) -> bool:
+        return all(cell not in self.occupied for cell in _bresenham_cells(start, goal))
 
 
 def _occupied_columns_from_voxel_data(
