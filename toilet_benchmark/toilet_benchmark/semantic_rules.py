@@ -139,3 +139,50 @@ def build_queue_poses(
         )
         queue_poses.append(SemanticPose(position=position, yaw=yaw))
     return queue_poses
+
+
+def remaining_polyline_waypoints(
+    points: list[list[float]],
+    current_pose: list[float],
+    *,
+    rejoin_tolerance_m: float = 0.05,
+) -> list[list[float]]:
+    """Return a safe forward-only suffix, rejoining the nearest segment first."""
+    parsed: list[list[float]] = []
+    for point in points:
+        value = [float(point[0]), float(point[1]), float(point[2])]
+        if not parsed or math.dist(parsed[-1][:2], value[:2]) > 1e-6:
+            parsed.append(value)
+    if len(parsed) <= 1:
+        return parsed
+
+    current_x = float(current_pose[0])
+    current_y = float(current_pose[1])
+    best: tuple[float, int, list[float]] | None = None
+    for index, (start, end) in enumerate(zip(parsed, parsed[1:])):
+        dx = float(end[0]) - float(start[0])
+        dy = float(end[1]) - float(start[1])
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            continue
+        progress = max(
+            0.0,
+            min(1.0, ((current_x - start[0]) * dx + (current_y - start[1]) * dy) / length_sq),
+        )
+        projection = [
+            float(start[0]) + progress * dx,
+            float(start[1]) + progress * dy,
+            float(start[2]) + progress * (float(end[2]) - float(start[2])),
+        ]
+        distance = math.hypot(current_x - projection[0], current_y - projection[1])
+        candidate = (distance, index, projection)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+
+    if best is None:
+        return [parsed[-1]]
+    distance, segment_index, projection = best
+    remaining = parsed[segment_index + 1 :]
+    if distance > max(0.0, float(rejoin_tolerance_m)):
+        remaining.insert(0, projection)
+    return remaining or [parsed[-1]]

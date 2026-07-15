@@ -20,7 +20,7 @@ queue_policy:
 
 director:
   live_pose_topic: /isaac/pedestrian_states
-  arrival_tolerance_m: 0.35
+  arrival_tolerance_m: 0.18
   actor_stop_radius_m: 0.5
   exit_arrival_tolerance_m: 0.55
   walk_plane_z: 0.0
@@ -33,9 +33,18 @@ director:
   portal_stall_recovery_sec: 3.0
   portal_max_recovery_attempts: 3
   portal_staging_arrival_tolerance_m: 0.20
-  pre_spawn_holding_offset: [-0.8, 0.0, 0.0]
-  pre_spawn_holding_axis: [-1.0, 0.0, 0.0]
-  pre_spawn_holding_spacing_m: 0.5
+  exit_staging_arrival_tolerance_m: 0.30
+  portal_crossing_velocity_mps: 0.45
+  activation_settle_sec: 0.20
+  activation_confirm_timeout_sec: 2.0
+  activation_max_attempts: 3
+  activation_confirmation_tolerance_m: 0.35
+  motion_stall_recovery_sec: 4.0
+  motion_max_recovery_attempts: 3
+  pre_spawn_holding_origin: [1000.0, 1000.0, 0.0]
+  pre_spawn_holding_offset: [0.0, 0.0, 0.0]
+  pre_spawn_holding_axis: [1.0, 0.0, 0.0]
+  pre_spawn_holding_spacing_m: 2.0
 
 path_planner:
   enabled: true
@@ -48,6 +57,15 @@ path_planner:
   nearest_free_radius_m: 0.8
   max_expansions: 20000
   simplify: true
+  max_segment_length_m: 2.0
+  constrained_segment_length_m: 0.9
+  preferred_clearance_m: 0.50
+  clearance_cost_weight: 4.0
+  turn_cost_weight: 0.35
+  robot_odom_topic: /odom
+  robot_obstacle_radius_m: 0.38
+  robot_obstacle_timeout_sec: 1.0
+  robot_prediction_horizon_sec: 0.75
 
 hunav_profile:
   regular:
