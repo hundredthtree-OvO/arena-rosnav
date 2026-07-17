@@ -4,12 +4,13 @@ scene_root_path: /World/shenxinfu_841837
 entrances:
   - id: entrance_main
     scene_prim: Door_0000
-    pose: [-3.8, -0.91, 0.0]
+    pose: [-3.8, -0.91, 1.5708]
 
 exits:
   - id: exit_main
     scene_prim: Door_0000
     pose: [-3.8, -0.91, 0.0]
+    yaw: 1.5708
 
 portals:
   - id: entrance_portal
@@ -17,7 +18,7 @@ portals:
     outside_pose: [-3.8, -0.91, 0.0]
     center_pose: [-2.24, -0.9, 0.0]
     inside_pose: [-2.24, -0.9, 0.0]
-    inside_staging_pose: [-1.8, -0.9, 0.0]
+    inside_staging_pose: [-2.24, -0.675, 0.0]
     release_tolerance_m: 0.10
 
 urinals:
@@ -26,6 +27,7 @@ urinals:
     placement:
       offset_local: [0.0, -0.38, 0.0]
       yaw_mode: face_anchor
+      yaw_local: 1.5708
     queue_rule:
       slots: 2
       first_gap: 0.4
@@ -37,6 +39,7 @@ urinals:
     placement:
       offset_local: [0.0, -0.38, 0.0]
       yaw_mode: face_anchor
+      yaw_local: 1.5708
     queue_rule:
       slots: 2
       first_gap: 0.4
@@ -48,6 +51,7 @@ urinals:
     placement:
       offset_local: [0.0, -0.38, 0.0]
       yaw_mode: face_anchor
+      yaw_local: 1.5708
     queue_rule:
       slots: 2
       first_gap: 0.4
@@ -59,6 +63,7 @@ urinals:
     placement:
       offset_local: [0.0, -0.38, 0.0]
       yaw_mode: face_anchor
+      yaw_local: 1.5708
     queue_rule:
       slots: 2
       first_gap: 0.4
@@ -70,6 +75,7 @@ urinals:
     placement:
       offset_local: [0.0, -0.38, 0.0]
       yaw_mode: face_anchor
+      yaw_local: 1.5708
     queue_rule:
       slots: 2
       first_gap: 0.4
