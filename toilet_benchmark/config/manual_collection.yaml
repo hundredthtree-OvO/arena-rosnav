@@ -1,0 +1,91 @@
+session:
+  output_root: /home/stardust/resources/arena_ws/data/toilet_manual
+  operator_id: operator_01
+  seed: 42
+  selection_mode: round_robin
+  fixed_scenario_id: robot_urinal_3_ped_urinal_3
+  max_episodes: 0
+  inter_episode_delay_sec: 1.0
+
+episode:
+  timeout_sec: 120.0
+  goal_tolerance_m: 0.35
+  goal_stop_speed_mps: 0.08
+  settle_timeout_sec: 8.0
+  settle_min_stable_sec: 0.6
+  settle_position_tolerance_m: 0.08
+  settle_yaw_tolerance_rad: 0.12
+  settle_linear_speed_mps: 0.03
+  settle_angular_speed_rps: 0.08
+
+robot:
+  name: xms_mecanum
+  reset_service: /isaac/reset_mecanum_episode
+  control_hold_service: /isaac/set_mecanum_control_hold
+  odom_topic: /odom
+
+pedestrian:
+  agent_id: toilet_agent_01
+  character_name: original_female_adult_business_02
+  parking_service: /isaac/delete_prim
+  semantics_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_semantics.yaml
+  benchmark_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_benchmark.yaml
+
+recording:
+  enabled: true
+  command: [ros2, bag, record]
+  ready_timeout_sec: 10.0
+  # Only require continuously available bridge topics. Optional event topics
+  # may have no publisher until an event occurs and must not gate bag readiness.
+  ready_topics: [/odom, /cmd_vel_applied, /front_scan, /rear_scan]
+  topics:
+    - /clock
+    - /tf
+    - /tf_static
+    - /cmd_vel_gamepad_diff
+    - /cmd_vel_applied
+    - /odom
+    - /front_scan
+    - /rear_scan
+    - /isaac/pedestrian_states
+    - /toilet_benchmark/collection_status
+    - /isaac/pedestrian_hard_guard_events
+    - /isaac/scene_collision_events
+
+events:
+  hard_guard_topic: /isaac/pedestrian_hard_guard_events
+  scene_collision_topic: /isaac/scene_collision_events
+
+# These starts are initial candidates placed in the open aisle in front of each
+# urinal. Validate them in the current USD before a formal collection session.
+scenarios:
+  - id: robot_urinal_1_ped_urinal_1
+    enabled: true
+    weight: 1.0
+    robot_start: [2.86, 0.75, 0.03, -1.5708]
+    robot_goal: [-3.8, -0.91, 0.0]
+    pedestrian_target_urinal_id: urinal_1
+  - id: robot_urinal_2_ped_urinal_2
+    enabled: true
+    weight: 1.0
+    robot_start: [2.09, 0.75, 0.03, -1.5708]
+    robot_goal: [-3.8, -0.91, 0.0]
+    pedestrian_target_urinal_id: urinal_2
+  - id: robot_urinal_3_ped_urinal_3
+    enabled: true
+    weight: 1.0
+    robot_start: [1.31, 0.75, 0.03, -1.5708]
+    robot_goal: [-3.8, -0.91, 0.0]
+    pedestrian_target_urinal_id: urinal_3
+  - id: robot_urinal_4_ped_urinal_4
+    enabled: true
+    weight: 1.0
+    robot_start: [0.51, 0.75, 0.03, -1.5708]
+    robot_goal: [-3.8, -0.91, 0.0]
+    pedestrian_target_urinal_id: urinal_4
+  - id: robot_urinal_5_ped_urinal_5
+    enabled: true
+    weight: 1.0
+    robot_start: [-0.31, 0.75, 0.03, -1.5708]
+    robot_goal: [-3.8, -0.91, 0.0]
+    pedestrian_target_urinal_id: urinal_5

@@ -12,6 +12,11 @@ install(
 )
 
 install(
+  DIRECTORY docs
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(
   FILES
     package.xml
     README.md
@@ -21,6 +26,7 @@ install(
 install(
   PROGRAMS
     scripts/toilet_director_node
+    scripts/manual_collection_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

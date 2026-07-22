@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -15,6 +16,7 @@ from isaacsim_msgs.msg import NavPed, Person
 from isaacsim_msgs.srv import DeletePrim, GetPrimAttributes, MovePed, Pedestrian
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from std_msgs.msg import String
 
 try:
     from people_msgs.msg import People
@@ -27,6 +29,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
     ArenaPedestrians = None
 
 from .hunav_adapter import DirectedAgentState, HunavAdapter
+from .interaction_policy import dynamic_robot_obstacles, robot_blocks_pedestrian
 from .pose_utils import SemanticPose, parse_semantic_pose
 from .resource_manager import QueueSlot, Resource, ResourceManager
 from .semantic_rules import (
@@ -155,6 +158,8 @@ class RuntimeAgent:
     guard_block_generation: int = -1
     guard_block_count: int = 0
     guard_feedback_at: float = 0.0
+    nominal_path: list[list[float]] | None = None
+    nominal_goal: list[float] | None = None
 
 
 class ToiletDirectorNode(Node):
@@ -171,6 +176,8 @@ class ToiletDirectorNode(Node):
         character_name: str,
         character_pool: list[str] | None,
         profile_name: str,
+        target_resource_ids: list[str] | None = None,
+        status_topic: str = "/toilet_benchmark/director_status",
     ):
         super().__init__("toilet_director_node")
         self.semantics_path = str(semantics_path)
@@ -180,6 +187,17 @@ class ToiletDirectorNode(Node):
         self.initial_agents = max(0, int(initial_agents))
         self.character_name = str(character_name)
         self.profile_name = str(profile_name)
+        self.target_resource_ids = [
+            str(resource_id).strip()
+            for resource_id in (target_resource_ids or [])
+            if str(resource_id).strip()
+        ]
+        self.status_topic = str(status_topic).strip()
+        self._status_publisher = (
+            self.create_publisher(String, self.status_topic, 10)
+            if self.status_topic
+            else None
+        )
         self.semantics = _load_yaml(self.semantics_path)
         self.benchmark = _load_yaml(self.benchmark_path)
         self.portal = self._load_portal_config(self.semantics)
@@ -254,6 +272,9 @@ class ToiletDirectorNode(Node):
         )
         self.live_pose_topic = str(director_cfg.get("live_pose_topic", "/isaac/pedestrian_states"))
         planner_cfg = self.benchmark.get("path_planner", {}) or {}
+        self.robot_obstacle_mode = str(
+            planner_cfg.get("robot_obstacle_mode", "static_route")
+        ).strip().lower()
         self.robot_odom_topic = str(planner_cfg.get("robot_odom_topic", "/odom"))
         self.robot_obstacle_radius_m = max(
             0.0,
@@ -266,6 +287,14 @@ class ToiletDirectorNode(Node):
         self.robot_prediction_horizon_sec = max(
             0.0,
             float(planner_cfg.get("robot_prediction_horizon_sec", 0.75)),
+        )
+        self.robot_yield_pedestrian_radius_m = max(
+            0.0,
+            float(planner_cfg.get("robot_yield_pedestrian_radius_m", 0.22)),
+        )
+        self.robot_yield_clearance_m = max(
+            0.0,
+            float(planner_cfg.get("robot_yield_clearance_m", 0.10)),
         )
         self.path_planner: VoxelPathPlanner | None = None
         self._robot_state: tuple[float, float, float, float, float] | None = None
@@ -339,6 +368,7 @@ class ToiletDirectorNode(Node):
             f"motion_stall_recovery_sec={self.motion_stall_recovery_sec:.1f}, "
             f"motion_max_recovery_attempts={self.motion_max_recovery_attempts}, "
             f"robot_odom_topic={self.robot_odom_topic}, "
+            f"robot_obstacle_mode={self.robot_obstacle_mode}, "
             f"robot_obstacle_radius_m={self.robot_obstacle_radius_m:.2f}, "
             f"robot_prediction_horizon_sec={self.robot_prediction_horizon_sec:.2f}, "
             f"pre_spawn_holding_origin={self.pre_spawn_holding_origin}, "
@@ -439,22 +469,26 @@ class ToiletDirectorNode(Node):
         self._robot_state = (*values, time.monotonic())
 
     def _dynamic_obstacles(self, now: float) -> list[tuple[float, float, float]]:
-        if self._robot_state is None or self.robot_obstacle_radius_m <= 0.0:
-            return []
-        x, y, velocity_x, velocity_y, observed_at = self._robot_state
-        if now - observed_at > self.robot_obstacle_timeout_sec:
-            return []
-        obstacles = [(x, y, self.robot_obstacle_radius_m)]
-        horizon = self.robot_prediction_horizon_sec
-        if horizon > 0.0 and math.hypot(velocity_x, velocity_y) >= 0.05:
-            obstacles.append(
-                (
-                    x + velocity_x * horizon,
-                    y + velocity_y * horizon,
-                    self.robot_obstacle_radius_m,
-                )
-            )
-        return obstacles
+        return dynamic_robot_obstacles(
+            mode=self.robot_obstacle_mode,
+            robot_state=self._robot_state,
+            now=now,
+            timeout_sec=self.robot_obstacle_timeout_sec,
+            radius_m=self.robot_obstacle_radius_m,
+            prediction_horizon_sec=self.robot_prediction_horizon_sec,
+        )
+
+    def _is_yielding_to_robot(self, state: RuntimeAgent, now: float) -> bool:
+        return robot_blocks_pedestrian(
+            pedestrian_pose=state.current_pose,
+            robot_state=self._robot_state,
+            now=now,
+            timeout_sec=self.robot_obstacle_timeout_sec,
+            robot_radius_m=self.robot_obstacle_radius_m,
+            pedestrian_radius_m=self.robot_yield_pedestrian_radius_m,
+            clearance_m=self.robot_yield_clearance_m,
+            prediction_horizon_sec=self.robot_prediction_horizon_sec,
+        )
 
     def _bootstrap_once(self):
         if self._bootstrapped:
@@ -869,6 +903,19 @@ class ToiletDirectorNode(Node):
         future = self._delete_client.call_async(request)
         future.add_done_callback(lambda fut, agent_id=state.agent_id: self._despawn_done_cb(agent_id, fut))
         self.get_logger().info(f"Releasing {state.agent_id} to the bridge pedestrian pool: {reason}.")
+        self._publish_status_event("pedestrian_retiring", state, reason=reason)
+
+    def _publish_status_event(self, event: str, state: RuntimeAgent, **extra) -> None:
+        if self._status_publisher is None:
+            return
+        payload = {
+            "event": str(event),
+            "agent_id": state.agent_id,
+            "phase": state.current_phase,
+            "resource_id": state.resource_id,
+            **extra,
+        }
+        self._status_publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
     def _despawn_done_cb(self, agent_id: str, future):
         self._pending_despawns.discard(agent_id)
@@ -916,6 +963,14 @@ class ToiletDirectorNode(Node):
             self.get_logger().warning("No entrances defined in semantics config; nothing to spawn.")
             return []
         resources = [res for res in self.resources.resources.values() if res.category == "urinals"]
+        if self.target_resource_ids:
+            requested = set(self.target_resource_ids)
+            resources = [res for res in resources if res.resource_id in requested]
+            missing = requested - {res.resource_id for res in resources}
+            if missing:
+                self.get_logger().warning(
+                    f"Requested target resources are unavailable: {sorted(missing)}"
+                )
         if not resources:
             self.get_logger().warning("No urinal resources defined in semantics config; nothing to target.")
             return []
@@ -932,8 +987,17 @@ class ToiletDirectorNode(Node):
         for idx in range(count):
             entrance = self.entrances[idx % len(self.entrances)]
             agent_id = f"toilet_agent_{idx + 1:02d}"
-            candidate_ids = [res.resource_id for res in resources]
-            self._rng.shuffle(candidate_ids)
+            if self.target_resource_ids:
+                candidate_ids = [
+                    resource_id
+                    for resource_id in self.target_resource_ids
+                    if any(res.resource_id == resource_id for res in resources)
+                ]
+                if candidate_ids:
+                    candidate_ids = candidate_ids[idx % len(candidate_ids):] + candidate_ids[:idx % len(candidate_ids)]
+            else:
+                candidate_ids = [res.resource_id for res in resources]
+                self._rng.shuffle(candidate_ids)
             resource_id, reservation = self.resources.acquire_or_queue(
                 agent_id,
                 "urinals",
@@ -1285,6 +1349,7 @@ class ToiletDirectorNode(Node):
             f"Activated {state.agent_id}: start={state.current_pose}, phase={state.current_phase}, "
             f"target={state.target_pose}"
         )
+        self._publish_status_event("pedestrian_active", state)
 
     def _move_done_cb(self, agent_id: str, future):
         try:
@@ -1310,6 +1375,7 @@ class ToiletDirectorNode(Node):
         direct_pose: list[float] | None = None,
         path_points_override: list[list[float]] | None = None,
         constrain_to_path: bool = False,
+        preserve_nominal_path: bool = False,
         done_callback=None,
     ) -> bool:
         request = MovePed.Request()
@@ -1338,6 +1404,18 @@ class ToiletDirectorNode(Node):
         nav.use_direct_pose = bool(use_direct_pose)
         if direct_pose is not None:
             nav.direct_pose = [float(x) for x in direct_pose]
+        runtime_state = self._runtime_agents.get(agent_id)
+        if (
+            runtime_state is not None
+            and path_points
+            and not stop
+            and not use_direct_pose
+            and not preserve_nominal_path
+        ):
+            runtime_state.nominal_path = self._dedupe_waypoints(
+                [list(runtime_state.current_pose), *path_points]
+            )
+            runtime_state.nominal_goal = [float(x) for x in goal_pose]
         request.nav_list = [nav]
         future = self._move_client.call_async(request)
         if done_callback is None:
@@ -1497,6 +1575,11 @@ class ToiletDirectorNode(Node):
             return
         if state.aligned_at_target:
             return
+        if self._is_yielding_to_robot(state, now):
+            state.motion_last_motion_at = float(now)
+            state.motion_last_pose = list(state.current_pose)
+            self._log_phase_wait(state, "yielding to robot", now)
+            return
         if state.motion_watch_phase != state.current_phase:
             state.motion_watch_phase = state.current_phase
             state.motion_last_motion_at = float(now)
@@ -1510,11 +1593,22 @@ class ToiletDirectorNode(Node):
             self._abort_stalled_motion_agent(state)
             return
 
-        recovery_path = self._path_points_for_move(
-            agent_id=state.agent_id,
-            start_pose=state.current_pose,
-            goal_pose=state.target_pose,
-        )
+        recovery_path = None
+        if (
+            state.nominal_path
+            and state.nominal_goal
+            and _planar_distance(state.nominal_goal, state.target_pose) <= 1e-4
+        ):
+            recovery_path = remaining_polyline_waypoints(
+                state.nominal_path,
+                state.current_pose,
+            )
+        if not recovery_path:
+            recovery_path = self._path_points_for_move(
+                agent_id=state.agent_id,
+                start_pose=state.current_pose,
+                goal_pose=state.target_pose,
+            )
         state.motion_last_motion_at = float(now)
         state.motion_last_pose = list(state.current_pose)
         if recovery_path is None:
@@ -1526,16 +1620,22 @@ class ToiletDirectorNode(Node):
             orientation=state.target_yaw,
             path_points_override=recovery_path,
             constrain_to_path=True,
+            preserve_nominal_path=True,
         ):
             state.motion_recovery_attempts += 1
             self.get_logger().warning(
-                f"{state.agent_id} stalled during {state.current_phase}; replanned from live pose with "
-                f"constrained recovery (attempt {state.motion_recovery_attempts}/"
+                f"{state.agent_id} stalled during {state.current_phase}; redispatched remaining nominal path "
+                f"with constrained recovery (attempt {state.motion_recovery_attempts}/"
                 f"{self.motion_max_recovery_attempts})."
             )
 
     def _recover_portal_if_stalled(self, state: RuntimeAgent, now: float) -> None:
         if self.portal is None or state.portal_direction is None:
+            return
+        if self._is_yielding_to_robot(state, now):
+            state.portal_last_motion_at = float(now)
+            state.portal_last_pose = list(state.current_pose)
+            self._log_phase_wait(state, "yielding to robot in portal", now)
             return
         if state.portal_last_motion_at <= 0.0:
             state.portal_last_motion_at = float(now)
@@ -2016,6 +2116,17 @@ def main(args=None):
     parser.add_argument("--character-name", default="original_female_adult_business_02")
     parser.add_argument("--character-pool", default="")
     parser.add_argument("--profile", default="regular")
+    parser.add_argument(
+        "--target-resource",
+        action="append",
+        default=[],
+        help="Restrict initial agents to one or more explicit semantic resource IDs.",
+    )
+    parser.add_argument(
+        "--status-topic",
+        default="/toilet_benchmark/director_status",
+        help="Publish pedestrian lifecycle JSON events for orchestration.",
+    )
     parsed, ros_args = parser.parse_known_args(args=args)
 
     character_pool = [
@@ -2034,9 +2145,13 @@ def main(args=None):
         character_name=parsed.character_name,
         character_pool=character_pool or None,
         profile_name=parsed.profile,
+        target_resource_ids=parsed.target_resource,
+        status_topic=parsed.status_topic,
     )
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
         if rclpy.ok():

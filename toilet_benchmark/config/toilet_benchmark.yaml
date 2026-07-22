@@ -49,6 +49,9 @@ director:
 path_planner:
   enabled: true
   backend: voxel
+  # Keep A* deterministic. The robot is handled as an execution-time yield
+  # condition rather than a global replanning obstacle.
+  robot_obstacle_mode: static_route
   voxel_map_path: /home/stardust/resources/arena_ws/arena_assets/collision_configs/shenxinfu_841837.voxel.json.gz
   z_min: 0.05
   z_max: 1.2
@@ -66,6 +69,8 @@ path_planner:
   robot_obstacle_radius_m: 0.38
   robot_obstacle_timeout_sec: 1.0
   robot_prediction_horizon_sec: 0.75
+  robot_yield_pedestrian_radius_m: 0.22
+  robot_yield_clearance_m: 0.10
 
 hunav_profile:
   regular:
