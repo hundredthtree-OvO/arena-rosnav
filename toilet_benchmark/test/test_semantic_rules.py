@@ -6,12 +6,33 @@ from toilet_benchmark.semantic_rules import (
     QueueRule,
     build_queue_poses,
     classify_motion_observation,
+    portal_inside_plane_reached,
     remaining_polyline_waypoints,
     resolve_local_placement,
 )
 
 
 class TestSemanticRules(unittest.TestCase):
+    def test_portal_entry_accepts_root_at_indoor_plane_before_short_turn(self):
+        self.assertTrue(
+            portal_inside_plane_reached(
+                current_pose=[-2.24, -0.90, 0.0],
+                inside_pose=[-2.24, -0.90, 0.0],
+                staging_pose=[-2.24, -0.675, 0.0],
+                lateral_tolerance_m=0.10,
+            )
+        )
+
+    def test_portal_entry_rejects_pose_beside_corridor(self):
+        self.assertFalse(
+            portal_inside_plane_reached(
+                current_pose=[-2.00, -0.90, 0.0],
+                inside_pose=[-2.24, -0.90, 0.0],
+                staging_pose=[-2.24, -0.675, 0.0],
+                lateral_tolerance_m=0.10,
+            )
+        )
+
     def test_lateral_root_motion_is_not_misclassified_as_stationary(self):
         observation = classify_motion_observation(
             previous_pose=[-2.24, -0.90, 0.0],
@@ -99,6 +120,20 @@ class TestSemanticRules(unittest.TestCase):
         self.assertEqual(remaining[0], [-2.24, -0.9, 0.0])
         self.assertEqual(remaining[-1], [-3.8, -0.91, 0.0])
         self.assertGreater(len(remaining), 1)
+
+    def test_remaining_path_rejoins_near_current_pose_before_suffix(self):
+        points = [
+            [-1.675, -0.225, 0.0],
+            [0.075, 0.675, 0.0],
+            [2.075, 0.675, 0.0],
+            [2.875, 0.875, 0.0],
+            [2.862, 1.032, 0.0],
+        ]
+
+        remaining = remaining_polyline_waypoints(points, [1.54, 0.65, 0.0])
+
+        self.assertEqual(remaining[0], [2.075, 0.675, 0.0])
+        self.assertNotEqual(remaining[0], [2.875, 0.875, 0.0])
 
 
 if __name__ == "__main__":

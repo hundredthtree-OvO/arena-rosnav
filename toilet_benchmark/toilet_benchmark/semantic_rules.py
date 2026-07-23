@@ -29,6 +29,30 @@ class MotionObservation:
     progressed: bool
     distance_to_target: float
 
+def portal_inside_plane_reached(
+    *,
+    current_pose: list[float],
+    inside_pose: list[float],
+    staging_pose: list[float],
+    lateral_tolerance_m: float,
+) -> bool:
+    """Accept entry once the root reaches the indoor side of the portal."""
+    dx = float(staging_pose[0]) - float(inside_pose[0])
+    dy = float(staging_pose[1]) - float(inside_pose[1])
+    length = math.hypot(dx, dy)
+    if length <= 1e-6:
+        return math.dist(current_pose[:2], inside_pose[:2]) <= max(
+            0.01,
+            float(lateral_tolerance_m),
+        )
+    axis_x = dx / length
+    axis_y = dy / length
+    relative_x = float(current_pose[0]) - float(inside_pose[0])
+    relative_y = float(current_pose[1]) - float(inside_pose[1])
+    progress = relative_x * axis_x + relative_y * axis_y
+    lateral = abs(relative_x * axis_y - relative_y * axis_x)
+    return progress >= -0.02 and lateral <= max(0.01, float(lateral_tolerance_m))
+
 
 def classify_motion_observation(
     *,

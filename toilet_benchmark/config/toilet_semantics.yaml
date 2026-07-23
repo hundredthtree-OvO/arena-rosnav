@@ -19,7 +19,7 @@ portals:
     center_pose: [-2.24, -0.9, 0.0]
     inside_pose: [-2.24, -0.9, 0.0]
     inside_staging_pose: [-2.24, -0.675, 0.0]
-    release_tolerance_m: 0.10
+    release_tolerance_m: 0.20
 
 urinals:
   - id: urinal_1

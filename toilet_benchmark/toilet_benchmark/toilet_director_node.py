@@ -29,7 +29,11 @@ except Exception:  # pragma: no cover - optional runtime dependency
     ArenaPedestrians = None
 
 from .hunav_adapter import DirectedAgentState, HunavAdapter
-from .interaction_policy import dynamic_robot_obstacles, robot_blocks_pedestrian
+from .interaction_policy import (
+    dynamic_robot_obstacles,
+    guard_block_requires_wait,
+    robot_blocks_pedestrian,
+)
 from .pose_utils import SemanticPose, parse_semantic_pose
 from .resource_manager import QueueSlot, Resource, ResourceManager
 from .semantic_rules import (
@@ -37,6 +41,7 @@ from .semantic_rules import (
     QueueRule,
     build_queue_poses,
     classify_motion_observation,
+    portal_inside_plane_reached,
     remaining_polyline_waypoints,
     resolve_local_placement,
     yaw_from_quaternion_xyzw,
@@ -159,6 +164,9 @@ class RuntimeAgent:
     guard_block_generation: int = -1
     guard_block_count: int = 0
     guard_feedback_at: float = 0.0
+    guard_blocked: bool = False
+    guard_block_reason: str = ""
+    guard_clear_grace_until: float = 0.0
     nominal_path: list[list[float]] | None = None
     nominal_goal: list[float] | None = None
 
@@ -278,6 +286,10 @@ class ToiletDirectorNode(Node):
         self.stall_progress_epsilon_m = max(
             0.005,
             float(director_cfg.get("stall_progress_epsilon_m", 0.03)),
+        )
+        self.guard_clear_grace_sec = max(
+            0.0,
+            float(director_cfg.get("guard_clear_grace_sec", 0.75)),
         )
         self.live_pose_topic = str(director_cfg.get("live_pose_topic", "/isaac/pedestrian_states"))
         planner_cfg = self.benchmark.get("path_planner", {}) or {}
@@ -1576,6 +1588,19 @@ class ToiletDirectorNode(Node):
             return
         if state.aligned_at_target:
             return
+        if guard_block_requires_wait(state.guard_block_reason) and state.guard_blocked:
+            state.motion_last_motion_at = float(now)
+            state.motion_last_pose = list(state.current_pose)
+            self._log_phase_wait(
+                state,
+                f"guard wait: {state.guard_block_reason}",
+                now,
+            )
+            return
+        if now < state.guard_clear_grace_until:
+            state.motion_last_motion_at = float(now)
+            state.motion_last_pose = list(state.current_pose)
+            return
         if self._is_yielding_to_robot(state, now):
             state.motion_last_motion_at = float(now)
             state.motion_last_pose = list(state.current_pose)
@@ -1632,6 +1657,19 @@ class ToiletDirectorNode(Node):
 
     def _recover_portal_if_stalled(self, state: RuntimeAgent, now: float) -> None:
         if self.portal is None or state.portal_direction is None:
+            return
+        if guard_block_requires_wait(state.guard_block_reason) and state.guard_blocked:
+            state.portal_last_motion_at = float(now)
+            state.portal_last_pose = list(state.current_pose)
+            self._log_phase_wait(
+                state,
+                f"guard wait in portal: {state.guard_block_reason}",
+                now,
+            )
+            return
+        if now < state.guard_clear_grace_until:
+            state.portal_last_motion_at = float(now)
+            state.portal_last_pose = list(state.current_pose)
             return
         if self._is_yielding_to_robot(state, now):
             state.portal_last_motion_at = float(now)
@@ -1923,7 +1961,17 @@ class ToiletDirectorNode(Node):
             threshold = float(self.arrival_tolerance_m)
         if self._has_live_pose(state, now):
             distance = _planar_distance(state.current_pose, state.target_pose)
-            if distance > threshold:
+            portal_entry_complete = (
+                state.current_phase == "WALK_TO_ENTRY_CLEARANCE"
+                and self.portal is not None
+                and portal_inside_plane_reached(
+                    current_pose=state.current_pose,
+                    inside_pose=self.portal["inside"],
+                    staging_pose=self.portal["inside_staging"],
+                    lateral_tolerance_m=self.portal["release_tolerance_m"],
+                )
+            )
+            if distance > threshold and not portal_entry_complete:
                 return False
             state.target_reached = True
         else:
@@ -2046,7 +2094,27 @@ class ToiletDirectorNode(Node):
         names = list(getattr(person, "tagnames", []) or [])
         values = list(getattr(person, "tags", []) or [])
         metadata = {str(name): str(value) for name, value in zip(names, values)}
-        if metadata.get("guard_blocked", "false").lower() != "true":
+        blocked = metadata.get("guard_blocked", "false").lower() == "true"
+        if not blocked:
+            if state.guard_blocked:
+                state.guard_blocked = False
+                state.guard_block_reason = ""
+                state.guard_clear_grace_until = observed_at + self.guard_clear_grace_sec
+                state.motion_last_motion_at = observed_at
+                state.portal_last_motion_at = observed_at
+            return
+        reason = metadata.get("guard_block_reason", "unknown").strip().lower() or "unknown"
+        state.guard_blocked = True
+        state.guard_block_reason = reason
+        state.guard_clear_grace_until = 0.0
+        if guard_block_requires_wait(reason):
+            state.motion_last_motion_at = observed_at
+            state.portal_last_motion_at = observed_at
+            state.motion_last_pose = list(state.current_pose)
+            state.portal_last_pose = list(state.current_pose)
+            state.motion_recovery_attempts = 0
+            state.portal_recovery_attempts = 0
+        if metadata.get("guard_block_generation") is None:
             return
         try:
             generation = int(metadata.get("guard_block_generation", "0"))
@@ -2061,20 +2129,16 @@ class ToiletDirectorNode(Node):
         if observed_at - state.guard_feedback_at < 1.0:
             return
         state.guard_feedback_at = observed_at
-        if state.portal_direction is not None:
-            state.portal_last_motion_at = min(
-                state.portal_last_motion_at or observed_at,
-                observed_at - self.portal_stall_recovery_sec,
+        if guard_block_requires_wait(reason):
+            self.get_logger().info(
+                f"{state.agent_id} guard blocked by {reason} at command generation {generation}; "
+                "pausing stall recovery until the external actor clears."
             )
-        elif state.current_phase in {"WALK_TO_URINAL", "QUEUEING", "WALK_TO_EXIT_STAGING"}:
-            state.motion_last_motion_at = min(
-                state.motion_last_motion_at or observed_at,
-                observed_at - self.motion_stall_recovery_sec,
+        else:
+            self.get_logger().warning(
+                f"{state.agent_id} guard blocked by {reason} at command generation {generation}; "
+                "normal stall timeout remains active."
             )
-        self.get_logger().warning(
-            f"{state.agent_id} voxel guard blocked motion command generation {generation}; "
-            "requesting an early safe-path recovery."
-        )
 
     def _accept_live_pose_update(self, state: RuntimeAgent, xyz: list[float], observed_at: float) -> bool:
         if not all(math.isfinite(float(value)) for value in xyz[:3]):

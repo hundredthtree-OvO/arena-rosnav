@@ -45,6 +45,8 @@ director:
   stall_displacement_epsilon_m: 0.02
   # Recovery attempts reset only after meaningful progress toward the phase target.
   stall_progress_epsilon_m: 0.03
+  # External-actor guard release must settle before stall timing resumes.
+  guard_clear_grace_sec: 0.75
   pre_spawn_holding_origin: [1000.0, 1000.0, 0.0]
   pre_spawn_holding_offset: [0.0, 0.0, 0.0]
   pre_spawn_holding_axis: [1.0, 0.0, 0.0]

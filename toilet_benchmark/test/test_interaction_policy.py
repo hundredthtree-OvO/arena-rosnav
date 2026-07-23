@@ -2,11 +2,18 @@ import unittest
 
 from toilet_benchmark.interaction_policy import (
     dynamic_robot_obstacles,
+    guard_block_requires_wait,
     robot_blocks_pedestrian,
 )
 
 
 class TestInteractionPolicy(unittest.TestCase):
+    def test_external_actor_guard_blocks_pause_recovery(self):
+        self.assertTrue(guard_block_requires_wait("robot"))
+        self.assertTrue(guard_block_requires_wait("pedestrian"))
+        self.assertFalse(guard_block_requires_wait("static_voxel"))
+        self.assertFalse(guard_block_requires_wait(""))
+
     def test_static_route_never_adds_robot_to_global_plan(self):
         state = (1.0, 2.0, 0.5, 0.0, 9.5)
 

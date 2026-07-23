@@ -8,6 +8,11 @@ RobotState = tuple[float, float, float, float, float]
 DynamicObstacle = tuple[float, float, float]
 
 
+def guard_block_requires_wait(reason: str | None) -> bool:
+    """External actors may wait indefinitely without consuming recovery attempts."""
+    return str(reason or "").strip().lower() in {"robot", "pedestrian"}
+
+
 def dynamic_robot_obstacles(
     *,
     mode: str,
