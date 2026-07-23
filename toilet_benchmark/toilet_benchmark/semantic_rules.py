@@ -23,6 +23,33 @@ class QueueRule:
     yaw_local: float = 0.0
 
 
+@dataclass(frozen=True)
+class MotionObservation:
+    moved: bool
+    progressed: bool
+    distance_to_target: float
+
+
+def classify_motion_observation(
+    *,
+    previous_pose: list[float] | None,
+    current_pose: list[float],
+    target_pose: list[float],
+    best_distance: float,
+    displacement_epsilon_m: float,
+    progress_epsilon_m: float,
+) -> MotionObservation:
+    """Separate actual root motion from progress toward the phase target."""
+    moved = previous_pose is None or (
+        math.dist(previous_pose[:2], current_pose[:2]) >= max(0.001, float(displacement_epsilon_m))
+    )
+    distance = math.dist(current_pose[:2], target_pose[:2])
+    progressed = not math.isfinite(float(best_distance)) or (
+        distance <= float(best_distance) - max(0.001, float(progress_epsilon_m))
+    )
+    return MotionObservation(moved=moved, progressed=progressed, distance_to_target=distance)
+
+
 def normalize_xy_axis(axis_local) -> tuple[float, float, float]:
     vals = [float(v) for v in axis_local]
     if len(vals) < 2:

@@ -36,6 +36,7 @@ from .semantic_rules import (
     PlacementRule,
     QueueRule,
     build_queue_poses,
+    classify_motion_observation,
     remaining_polyline_waypoints,
     resolve_local_placement,
     yaw_from_quaternion_xyzw,
@@ -148,7 +149,7 @@ class RuntimeAgent:
     portal_acquired_at: float = 0.0
     portal_last_motion_at: float = 0.0
     portal_last_pose: list[float] | None = None
-    portal_best_progress: float = -math.inf
+    portal_best_distance: float = math.inf
     portal_recovery_attempts: int = 0
     motion_watch_phase: str | None = None
     motion_last_motion_at: float = 0.0
@@ -270,6 +271,14 @@ class ToiletDirectorNode(Node):
             0,
             int(director_cfg.get("motion_max_recovery_attempts", 3)),
         )
+        self.stall_displacement_epsilon_m = max(
+            0.005,
+            float(director_cfg.get("stall_displacement_epsilon_m", 0.02)),
+        )
+        self.stall_progress_epsilon_m = max(
+            0.005,
+            float(director_cfg.get("stall_progress_epsilon_m", 0.03)),
+        )
         self.live_pose_topic = str(director_cfg.get("live_pose_topic", "/isaac/pedestrian_states"))
         planner_cfg = self.benchmark.get("path_planner", {}) or {}
         self.robot_obstacle_mode = str(
@@ -367,6 +376,8 @@ class ToiletDirectorNode(Node):
             f"activation_confirmation_tolerance_m={self.activation_confirmation_tolerance_m:.2f}, "
             f"motion_stall_recovery_sec={self.motion_stall_recovery_sec:.1f}, "
             f"motion_max_recovery_attempts={self.motion_max_recovery_attempts}, "
+            f"stall_displacement_epsilon_m={self.stall_displacement_epsilon_m:.3f}, "
+            f"stall_progress_epsilon_m={self.stall_progress_epsilon_m:.3f}, "
             f"robot_odom_topic={self.robot_odom_topic}, "
             f"robot_obstacle_mode={self.robot_obstacle_mode}, "
             f"robot_obstacle_radius_m={self.robot_obstacle_radius_m:.2f}, "
@@ -1340,6 +1351,8 @@ class ToiletDirectorNode(Node):
         )
         state.aligned_at_target = False
         state.target_reached = False
+        if state.portal_direction is not None:
+            self._reset_portal_motion_watch(state, now)
         state.activation_requested = False
         state.activation_pose_applied = False
         state.activation_pose_confirmed = False
@@ -1495,24 +1508,6 @@ class ToiletDirectorNode(Node):
         staging = self.portal["inside_staging"]
         return math.atan2(float(staging[1]) - float(inside[1]), float(staging[0]) - float(inside[0]))
 
-    def _portal_progress(self, pose: list[float], direction: str) -> float:
-        if self.portal is None:
-            return 0.0
-        if direction == "exiting":
-            start = self.portal["inside"]
-            end = self.portal["outside"]
-        else:
-            start = self.portal["outside"]
-            end = self.portal["inside"]
-        axis_x = float(end[0]) - float(start[0])
-        axis_y = float(end[1]) - float(start[1])
-        length_sq = axis_x * axis_x + axis_y * axis_y
-        if length_sq <= 1e-9:
-            return 0.0
-        rel_x = float(pose[0]) - float(start[0])
-        rel_y = float(pose[1]) - float(start[1])
-        return (rel_x * axis_x + rel_y * axis_y) / length_sq
-
     def _acquire_portal(self, state: RuntimeAgent, direction: str, now: float) -> bool:
         if not self.serialize_exit_corridor:
             return True
@@ -1523,9 +1518,15 @@ class ToiletDirectorNode(Node):
         state.portal_acquired_at = float(now)
         state.portal_last_motion_at = float(now)
         state.portal_last_pose = list(state.current_pose)
-        state.portal_best_progress = self._portal_progress(state.current_pose, direction)
+        state.portal_best_distance = math.inf
         state.portal_recovery_attempts = 0
         return True
+
+    def _reset_portal_motion_watch(self, state: RuntimeAgent, now: float) -> None:
+        state.portal_last_motion_at = float(now)
+        state.portal_last_pose = list(state.current_pose)
+        state.portal_best_distance = _planar_distance(state.current_pose, state.target_pose)
+        state.portal_recovery_attempts = 0
 
     def _release_portal(self, state: RuntimeAgent, reason: str) -> None:
         if self._exit_corridor_agent_id == state.agent_id:
@@ -1535,7 +1536,7 @@ class ToiletDirectorNode(Node):
         state.portal_acquired_at = 0.0
         state.portal_last_motion_at = 0.0
         state.portal_last_pose = None
-        state.portal_best_progress = -math.inf
+        state.portal_best_distance = math.inf
         state.portal_recovery_attempts = 0
 
     def _log_phase_wait(self, state: RuntimeAgent, reason: str, now: float) -> None:
@@ -1881,6 +1882,7 @@ class ToiletDirectorNode(Node):
                 )
                 state.aligned_at_target = False
                 state.target_reached = False
+                self._reset_portal_motion_watch(state, now)
                 self.get_logger().info(
                     f"{state.agent_id} acquired portal and started continuous exit crossing"
                 )
@@ -1973,18 +1975,34 @@ class ToiletDirectorNode(Node):
                     continue
                 self._apply_guard_feedback(state, person, observed_at)
                 if state.portal_direction is not None:
-                    progress = self._portal_progress(xyz, state.portal_direction)
-                    if progress >= state.portal_best_progress + 0.03:
+                    observation = classify_motion_observation(
+                        previous_pose=state.portal_last_pose,
+                        current_pose=xyz,
+                        target_pose=state.target_pose,
+                        best_distance=state.portal_best_distance,
+                        displacement_epsilon_m=self.stall_displacement_epsilon_m,
+                        progress_epsilon_m=self.stall_progress_epsilon_m,
+                    )
+                    if observation.moved:
                         state.portal_last_pose = list(xyz)
-                        state.portal_best_progress = progress
                         state.portal_last_motion_at = observed_at
+                    if observation.progressed:
+                        state.portal_best_distance = observation.distance_to_target
                         state.portal_recovery_attempts = 0
                 if state.motion_watch_phase == state.current_phase:
-                    distance = _planar_distance(xyz, state.target_pose)
-                    if distance <= state.motion_best_distance - 0.05:
+                    observation = classify_motion_observation(
+                        previous_pose=state.motion_last_pose,
+                        current_pose=xyz,
+                        target_pose=state.target_pose,
+                        best_distance=state.motion_best_distance,
+                        displacement_epsilon_m=self.stall_displacement_epsilon_m,
+                        progress_epsilon_m=self.stall_progress_epsilon_m,
+                    )
+                    if observation.moved:
                         state.motion_last_pose = list(xyz)
-                        state.motion_best_distance = distance
                         state.motion_last_motion_at = observed_at
+                    if observation.progressed:
+                        state.motion_best_distance = observation.distance_to_target
                         state.motion_recovery_attempts = 0
                 state.current_pose = xyz
                 state.last_pose_update = observed_at
@@ -2016,7 +2034,7 @@ class ToiletDirectorNode(Node):
         state.activation_ready_at = observed_at + self.activation_settle_sec
         if state.portal_direction is not None:
             state.portal_last_pose = list(xyz)
-            state.portal_best_progress = self._portal_progress(xyz, state.portal_direction)
+            state.portal_best_distance = _planar_distance(xyz, state.target_pose)
             state.portal_last_motion_at = observed_at
             state.portal_recovery_attempts = 0
         self.get_logger().info(

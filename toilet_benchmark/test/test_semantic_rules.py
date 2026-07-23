@@ -5,12 +5,39 @@ from toilet_benchmark.semantic_rules import (
     PlacementRule,
     QueueRule,
     build_queue_poses,
+    classify_motion_observation,
     remaining_polyline_waypoints,
     resolve_local_placement,
 )
 
 
 class TestSemanticRules(unittest.TestCase):
+    def test_lateral_root_motion_is_not_misclassified_as_stationary(self):
+        observation = classify_motion_observation(
+            previous_pose=[-2.24, -0.90, 0.0],
+            current_pose=[-2.24, -0.86, 0.0],
+            target_pose=[-2.24, -0.675, 0.0],
+            best_distance=0.225,
+            displacement_epsilon_m=0.02,
+            progress_epsilon_m=0.03,
+        )
+
+        self.assertTrue(observation.moved)
+        self.assertTrue(observation.progressed)
+
+    def test_motion_without_target_progress_keeps_activity_but_not_progress(self):
+        observation = classify_motion_observation(
+            previous_pose=[0.0, 0.0, 0.0],
+            current_pose=[0.0, 0.04, 0.0],
+            target_pose=[1.0, 0.0, 0.0],
+            best_distance=1.0,
+            displacement_epsilon_m=0.02,
+            progress_epsilon_m=0.03,
+        )
+
+        self.assertTrue(observation.moved)
+        self.assertFalse(observation.progressed)
+
     def test_resolve_local_placement_rotates_offset_with_anchor_yaw(self):
         pose = resolve_local_placement(
             anchor_position=(1.0, 2.0, 0.0),

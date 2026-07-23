@@ -41,6 +41,10 @@ director:
   activation_confirmation_tolerance_m: 0.35
   motion_stall_recovery_sec: 4.0
   motion_max_recovery_attempts: 3
+  # Root displacement refreshes the stall clock even while turning or moving laterally.
+  stall_displacement_epsilon_m: 0.02
+  # Recovery attempts reset only after meaningful progress toward the phase target.
+  stall_progress_epsilon_m: 0.03
   pre_spawn_holding_origin: [1000.0, 1000.0, 0.0]
   pre_spawn_holding_offset: [0.0, 0.0, 0.0]
   pre_spawn_holding_axis: [1.0, 0.0, 0.0]
