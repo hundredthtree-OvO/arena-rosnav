@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -74,6 +75,20 @@ class EpisodeConfig:
 @dataclass(frozen=True)
 class PedestrianConfig:
     agent_id: str
+    count: int = 1
+    character_pool: tuple[str, ...] = ()
+
+    @property
+    def agent_ids(self) -> tuple[str, ...]:
+        match = re.fullmatch(r"(.*?)(\d+)", self.agent_id)
+        if match is None:
+            if self.count == 1:
+                return (self.agent_id,)
+            raise ValueError("pedestrian.agent_id must end in digits when pedestrian.count is greater than one")
+        prefix, number = match.groups()
+        start = int(number)
+        width = len(number)
+        return tuple(f"{prefix}{index:0{width}d}" for index in range(start, start + self.count))
 
 
 @dataclass(frozen=True)
@@ -83,7 +98,12 @@ class ScenarioConfig:
     weight: float
     robot_start: tuple[float, float, float, float]
     robot_goal: tuple[float, float, float]
-    pedestrian_target_urinal_id: str
+    pedestrian_target_urinal_ids: tuple[str, ...]
+
+    @property
+    def pedestrian_target_urinal_id(self) -> str:
+        """Backward-compatible primary target for single-pedestrian callers."""
+        return self.pedestrian_target_urinal_ids[0]
 
     @property
     def as_manifest_dict(self) -> dict[str, Any]:
@@ -137,8 +157,40 @@ def _parse_episode(raw: Mapping[str, Any]) -> EpisodeConfig:
 
 
 def _parse_pedestrian(raw: Mapping[str, Any]) -> PedestrianConfig:
-    return PedestrianConfig(
+    count = _require_int(raw.get("count", 1), name="pedestrian.count")
+    if count <= 0:
+        raise ValueError("pedestrian.count must be greater than zero")
+    character_pool_raw = raw.get("character_pool", [])
+    character_pool = tuple(
+        _require_str(value, name=f"pedestrian.character_pool[{index}]")
+        for index, value in enumerate(
+            _require_sequence(character_pool_raw, name="pedestrian.character_pool")
+        )
+    )
+    config = PedestrianConfig(
         agent_id=_require_str(raw.get("agent_id"), name="pedestrian.agent_id"),
+        count=count,
+        character_pool=character_pool,
+    )
+    config.agent_ids
+    return config
+
+
+def _parse_target_urinal_ids(raw: Mapping[str, Any], *, index: int) -> tuple[str, ...]:
+    plural = raw.get("pedestrian_target_urinal_ids")
+    if plural is None:
+        return (
+            _require_str(
+                raw.get("pedestrian_target_urinal_id"),
+                name=f"scenarios[{index}].pedestrian_target_urinal_id",
+            ),
+        )
+    values = _require_sequence(plural, name=f"scenarios[{index}].pedestrian_target_urinal_ids")
+    if not values:
+        raise ValueError(f"scenarios[{index}].pedestrian_target_urinal_ids must not be empty")
+    return tuple(
+        _require_str(value, name=f"scenarios[{index}].pedestrian_target_urinal_ids[{target_index}]")
+        for target_index, value in enumerate(values)
     )
 
 
@@ -154,9 +206,7 @@ def _parse_scenario(raw: Mapping[str, Any], *, index: int) -> ScenarioConfig:
         weight=weight,
         robot_start=_parse_pose(raw.get("robot_start"), name=f"scenarios[{index}].robot_start", dims=4),
         robot_goal=_parse_pose(raw.get("robot_goal"), name=f"scenarios[{index}].robot_goal", dims=3),
-        pedestrian_target_urinal_id=_require_str(
-            raw.get("pedestrian_target_urinal_id"), name=f"scenarios[{index}].pedestrian_target_urinal_id"
-        ),
+        pedestrian_target_urinal_ids=_parse_target_urinal_ids(raw, index=index),
     )
 
 
@@ -280,6 +330,8 @@ def dump_manual_collection_config(config: ManualCollectionConfig) -> dict[str, A
         "episode": asdict(config.episode),
         "pedestrian": {
             "agent_id": config.pedestrian.agent_id,
+            "count": config.pedestrian.count,
+            "character_pool": list(config.pedestrian.character_pool),
         },
         "scenarios": [
             {
@@ -288,7 +340,7 @@ def dump_manual_collection_config(config: ManualCollectionConfig) -> dict[str, A
                 "weight": scenario.weight,
                 "robot_start": list(scenario.robot_start),
                 "robot_goal": list(scenario.robot_goal),
-                "pedestrian_target_urinal_id": scenario.pedestrian_target_urinal_id,
+                "pedestrian_target_urinal_ids": list(scenario.pedestrian_target_urinal_ids),
             }
             for scenario in config.scenarios
         ],

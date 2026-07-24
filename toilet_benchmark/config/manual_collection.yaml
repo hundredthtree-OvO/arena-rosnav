@@ -26,7 +26,11 @@ robot:
 
 pedestrian:
   agent_id: toilet_agent_01
+  count: 2
   character_name: original_female_adult_business_02
+  character_pool:
+    - original_female_adult_business_02
+    - original_female_adult_medical_01
   parking_service: /isaac/delete_prim
   semantics_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_semantics.yaml
   benchmark_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_benchmark.yaml
@@ -64,28 +68,28 @@ scenarios:
     weight: 1.0
     robot_start: [2.86, 0.75, 0.03, -1.5708]
     robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_id: urinal_1
+    pedestrian_target_urinal_ids: [urinal_1, urinal_2]
   - id: robot_urinal_2_ped_urinal_2
     enabled: true
     weight: 1.0
     robot_start: [2.09, 0.75, 0.03, -1.5708]
     robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_id: urinal_2
+    pedestrian_target_urinal_ids: [urinal_2, urinal_3]
   - id: robot_urinal_3_ped_urinal_3
     enabled: true
     weight: 1.0
     robot_start: [1.31, 0.75, 0.03, -1.5708]
     robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_id: urinal_3
+    pedestrian_target_urinal_ids: [urinal_3, urinal_4]
   - id: robot_urinal_4_ped_urinal_4
     enabled: true
     weight: 1.0
     robot_start: [0.51, 0.75, 0.03, -1.5708]
     robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_id: urinal_4
+    pedestrian_target_urinal_ids: [urinal_4, urinal_5]
   - id: robot_urinal_5_ped_urinal_5
     enabled: true
     weight: 1.0
     robot_start: [-0.31, 0.75, 0.03, -1.5708]
     robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_id: urinal_5
+    pedestrian_target_urinal_ids: [urinal_5, urinal_4]

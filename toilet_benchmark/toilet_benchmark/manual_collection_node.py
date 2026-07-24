@@ -29,6 +29,36 @@ def _default_config_path() -> str:
     return os.path.join(get_package_share_directory("toilet_benchmark"), "config", "manual_collection.yaml")
 
 
+def _build_director_command(
+    *,
+    semantics_path: str,
+    benchmark_path: str,
+    pedestrian_count: int,
+    character_name: str,
+    character_pool: tuple[str, ...],
+    target_resource_ids: tuple[str, ...],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "toilet_benchmark.toilet_director_node",
+        "--semantics",
+        semantics_path,
+        "--benchmark",
+        benchmark_path,
+        "--initial-agents",
+        str(pedestrian_count),
+        "--character-name",
+        character_name,
+    ]
+    if character_pool:
+        command.extend(["--character-pool", ",".join(character_pool)])
+    for resource_id in target_resource_ids:
+        command.extend(["--target-resource", resource_id])
+    command.extend(["--status-topic", "/toilet_benchmark/director_status"])
+    return command
+
+
 def _yaw_from_quaternion(quaternion) -> float:
     w = float(quaternion.w)
     x = float(quaternion.x)
@@ -58,7 +88,7 @@ class _ShutdownSignalLatch:
 
 
 class ManualCollectionNode(Node):
-    """Continuous single-pedestrian manual collection coordinator."""
+    """Continuous manual collection coordinator for one or more pedestrians."""
 
     def __init__(self, config_path: str, *, record_bag: bool | None = None):
         super().__init__("toilet_manual_collection")
@@ -110,8 +140,10 @@ class ManualCollectionNode(Node):
             )
             if str(topic).strip()
         )
-        self.agent_id = self.config.pedestrian.agent_id
+        self.agent_ids = self.config.pedestrian.agent_ids
+        self.pedestrian_count = self.config.pedestrian.count
         self.character_name = str(pedestrian_cfg.get("character_name", "original_female_adult_business_02"))
+        self.character_pool = self.config.pedestrian.character_pool
         self.parking_service_name = str(pedestrian_cfg.get("parking_service", "/isaac/delete_prim"))
         self.semantics_path = str(pedestrian_cfg.get("semantics_path", ""))
         self.benchmark_path = str(pedestrian_cfg.get("benchmark_path", ""))
@@ -176,7 +208,8 @@ class ManualCollectionNode(Node):
         self._last_status = None
         self.get_logger().info(
             f"Manual collection ready: config={self.config_path}, session={session_id}, "
-            f"mode={self.selector.mode}, seed={self.selector.seed}, recording={recording_enabled}"
+            f"mode={self.selector.mode}, seed={self.selector.seed}, recording={recording_enabled}, "
+            f"pedestrians={self.pedestrian_count}"
         )
 
     def _set_state(self, state: str) -> None:
@@ -191,6 +224,7 @@ class ManualCollectionNode(Node):
             "scenario_id": scenario_id,
             "episodes_finished": self._episodes_finished,
             "coverage": self.selector.coverage_counts,
+            "pedestrian_count": self.pedestrian_count,
         }
         encoded = json.dumps(payload, sort_keys=True)
         if force or encoded != self._last_status:
@@ -259,15 +293,16 @@ class ManualCollectionNode(Node):
         if self._state != "WAIT_PEDESTRIAN":
             return
         payload = self._event_payload(message)
-        if payload.get("event") != "pedestrian_active" or payload.get("agent_id") != self.agent_id:
+        if payload.get("event") != "pedestrian_active" or payload.get("agent_id") not in self.agent_ids:
             return
         if self._selection is None:
             return
-        if payload.get("resource_id") != self._selection.scenario.pedestrian_target_urinal_id:
+        if payload.get("resource_id") not in self._selection.scenario.pedestrian_target_urinal_ids:
             return
+        active_agent_id = str(payload.get("agent_id"))
         self.get_logger().info(
-            f"Pedestrian {self.agent_id} is active at resource target {payload.get('resource_id')}; "
-            "releasing operator control."
+            f"Pedestrian {active_agent_id} is active at resource target {payload.get('resource_id')}; "
+            "releasing operator control while remaining pedestrians activate on schedule."
         )
         self._request_control_release()
 
@@ -367,7 +402,7 @@ class ManualCollectionNode(Node):
         self.get_logger().info(
             f"Resetting robot for selection {self._selection.selection_index}: "
             f"scenario={scenario.id}, start={list(scenario.robot_start)}, "
-            f"pedestrian_target={scenario.pedestrian_target_urinal_id}"
+            f"pedestrian_targets={list(scenario.pedestrian_target_urinal_ids)}"
         )
 
     def _reset_done(self, future) -> None:
@@ -490,23 +525,14 @@ class ManualCollectionNode(Node):
     def _start_pedestrian(self) -> None:
         if self._selection is None:
             return
-        command = [
-            sys.executable,
-            "-m",
-            "toilet_benchmark.toilet_director_node",
-            "--semantics",
-            self.semantics_path,
-            "--benchmark",
-            self.benchmark_path,
-            "--initial-agents",
-            "1",
-            "--character-name",
-            self.character_name,
-            "--target-resource",
-            self._selection.scenario.pedestrian_target_urinal_id,
-            "--status-topic",
-            "/toilet_benchmark/director_status",
-        ]
+        command = _build_director_command(
+            semantics_path=self.semantics_path,
+            benchmark_path=self.benchmark_path,
+            pedestrian_count=self.pedestrian_count,
+            character_name=self.character_name,
+            character_pool=self.character_pool,
+            target_resource_ids=self._selection.scenario.pedestrian_target_urinal_ids,
+        )
         try:
             self._director_process = subprocess.Popen(command, start_new_session=True)
         except Exception as exc:
@@ -520,8 +546,10 @@ class ManualCollectionNode(Node):
             return
         self._set_state("WAIT_PEDESTRIAN")
         self.get_logger().info(
-            f"Started pedestrian director for scenario={self._selection.scenario.id}; "
-            "waiting for pedestrian_active before releasing operator control."
+            f"Started pedestrian director for scenario={self._selection.scenario.id}, "
+            f"agents={list(self.agent_ids)}, "
+            f"targets={list(self._selection.scenario.pedestrian_target_urinal_ids)}; "
+            "waiting for the first pedestrian_active before releasing operator control."
         )
 
     def _request_control_release(self) -> None:
@@ -559,7 +587,9 @@ class ManualCollectionNode(Node):
             "episode_started",
             {
                 "scenario_id": self._selection.scenario.id,
-                "pedestrian_target": self._selection.scenario.pedestrian_target_urinal_id,
+                "pedestrian_count": self.pedestrian_count,
+                "pedestrian_agent_ids": list(self.agent_ids),
+                "pedestrian_targets": list(self._selection.scenario.pedestrian_target_urinal_ids),
             },
         )
         self._episode_started_at = time.monotonic()
@@ -606,17 +636,18 @@ class ManualCollectionNode(Node):
                 except Exception:
                     pass
 
-    def _park_pedestrian(self) -> None:
+    def _park_pedestrians(self) -> None:
         if not self.context.ok():
             return
-        try:
-            if not self._parking_client.service_is_ready():
-                return
-            request = DeletePrim.Request()
-            request.name = f"/World/Characters/{self.agent_id}"
-            self._parking_client.call_async(request)
-        except Exception as exc:
-            self.get_logger().warning(f"Could not park pedestrian during cleanup: {exc}")
+        if not self._parking_client.service_is_ready():
+            return
+        for agent_id in self.agent_ids:
+            try:
+                request = DeletePrim.Request()
+                request.name = f"/World/Characters/{agent_id}"
+                self._parking_client.call_async(request)
+            except Exception as exc:
+                self.get_logger().warning(f"Could not park pedestrian {agent_id} during cleanup: {exc}")
 
     def _engage_control_hold_best_effort(self) -> None:
         if not self.context.ok():
@@ -650,7 +681,7 @@ class ManualCollectionNode(Node):
             except RuntimeError:
                 recording_prepared = False
         self._stop_director()
-        self._park_pedestrian()
+        self._park_pedestrians()
         if recording_prepared:
             self.recorder.finalize_episode(status=status, termination_reason=reason, extra=extra or {})
             self._episodes_finished += 1
@@ -677,7 +708,7 @@ class ManualCollectionNode(Node):
 
         # Local subprocess cleanup must not depend on a live ROS context.
         self._stop_director()
-        self._park_pedestrian()
+        self._park_pedestrians()
 
         if active_episode:
             try:

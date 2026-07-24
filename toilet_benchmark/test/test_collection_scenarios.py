@@ -73,9 +73,56 @@ class TestCollectionScenarios(unittest.TestCase):
 
         self.assertIsInstance(config, ManualCollectionConfig)
         self.assertEqual(config.session.selection_mode, "round_robin")
+        self.assertEqual(config.pedestrian.count, 1)
+        self.assertEqual(config.pedestrian.agent_ids, ("toilet_agent_01",))
         self.assertEqual(config.scenarios[0].robot_start, (1.8, 0.25, 0.0, 3.14159))
         self.assertEqual(config.scenarios[0].robot_goal, (-3.8, -0.91, 3.14159))
+        self.assertEqual(config.scenarios[0].pedestrian_target_urinal_ids, ("urinal_3",))
         self.assertEqual([scenario.id for scenario in config.enabled_scenarios()], ["left", "right"])
+
+    def test_loader_accepts_multiple_pedestrians_and_target_resources(self):
+        payload = self._base_payload()
+        payload["pedestrian"].update(
+            {
+                "count": 3,
+                "character_pool": [
+                    "original_female_adult_business_02",
+                    "original_female_adult_medical_01",
+                ],
+            }
+        )
+        scenario = payload["scenarios"][0]
+        scenario.pop("pedestrian_target_urinal_id")
+        scenario["pedestrian_target_urinal_ids"] = ["urinal_3", "urinal_4"]
+
+        config = load_manual_collection_config(self._write_config(payload))
+
+        self.assertEqual(config.pedestrian.count, 3)
+        self.assertEqual(
+            config.pedestrian.agent_ids,
+            ("toilet_agent_01", "toilet_agent_02", "toilet_agent_03"),
+        )
+        self.assertEqual(
+            config.pedestrian.character_pool,
+            ("original_female_adult_business_02", "original_female_adult_medical_01"),
+        )
+        self.assertEqual(config.scenarios[0].pedestrian_target_urinal_ids, ("urinal_3", "urinal_4"))
+
+    def test_loader_rejects_non_positive_pedestrian_count(self):
+        payload = self._base_payload()
+        payload["pedestrian"]["count"] = 0
+
+        with self.assertRaises(ValueError):
+            load_manual_collection_config(self._write_config(payload))
+
+    def test_loader_rejects_empty_target_resource_list(self):
+        payload = self._base_payload()
+        scenario = payload["scenarios"][0]
+        scenario.pop("pedestrian_target_urinal_id")
+        scenario["pedestrian_target_urinal_ids"] = []
+
+        with self.assertRaises(ValueError):
+            load_manual_collection_config(self._write_config(payload))
 
     def test_fixed_selector_is_deterministic(self):
         config = load_manual_collection_config(self._write_config(self._base_payload()))
