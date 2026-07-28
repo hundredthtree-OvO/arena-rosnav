@@ -21,7 +21,12 @@ from rclpy.task import Future
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .hunav_phase0_safety import SafetyConfig, project_safe_step
-from .motion_backend import IsaacPeopleBackend, MotionCommand
+from .motion_backend import (
+    EXTERNAL_MOTION_FREEZE,
+    EXTERNAL_MOTION_TERMINAL_ALIGN,
+    IsaacPeopleBackend,
+    MotionCommand,
+)
 from .polyline_lookahead import LookaheadTarget, PolylineLookaheadTracker
 from .robot_reaction import ReactionDecision, RobotProximityReactionController
 
@@ -181,6 +186,7 @@ class HuNavMotionBackend:
         self._lookahead_tracker: PolylineLookaheadTracker | None = None
         self._lookahead_target: LookaheadTarget | None = None
         self._yield_hold_yaw: float | None = None
+        self._last_external_motion_mode = 0
         diagnostic_dir = FilesystemPath(
             str(
                 self._config.get(
@@ -471,6 +477,7 @@ class HuNavMotionBackend:
         dt = max(1e-3, now - self._last_compute_at)
         self._last_compute_at = now
         agent = updated.agents[0]
+        terminal_align = False
         if self._reaction_decision.reaction == "yielding":
             actual = self._actual_for_command()
             if actual is not None:
@@ -505,10 +512,11 @@ class HuNavMotionBackend:
             agent.velocity.linear.y = 0.0
             agent.linear_vel = 0.0
             agent.yaw = float(self._command.orientation)
+            terminal_align = True
             self._mark_goal_settled()
         self._shadow = updated
         self._publish_live_diagnostics(previous, agent, safety)
-        self._send_external_motion(agent)
+        self._send_external_motion(agent, terminal_align=terminal_align)
 
     def _mark_goal_settled(self) -> None:
         if (
@@ -734,6 +742,11 @@ class HuNavMotionBackend:
             return
         if self._yield_hold_yaw is None:
             self._yield_hold_yaw = self._resolve_hold_yaw(actual)
+        self._record_motion_mode(
+            EXTERNAL_MOTION_FREEZE,
+            actual,
+            target_yaw=self._yield_hold_yaw,
+        )
         self._write_hold_diagnostic("hold_dispatch", actual)
         hold = MotionCommand(
             agent_id=self._command.agent_id,
@@ -750,9 +763,41 @@ class HuNavMotionBackend:
             external_velocity=(0.0, 0.0, 0.0),
             external_timeout_sec=self._external_timeout_sec,
             external_freeze_pose=True,
+            external_motion_mode=EXTERNAL_MOTION_FREEZE,
             phase=self._command.phase,
         )
         self._external_future = self._isaac.send(hold, self._external_done)
+
+    def _record_motion_mode(
+        self,
+        mode: int,
+        actual: Mapping[str, float],
+        *,
+        target_yaw: float,
+    ) -> None:
+        previous = int(getattr(self, "_last_external_motion_mode", 0))
+        current = int(mode)
+        if previous == current:
+            return
+        self._last_external_motion_mode = current
+        names = {
+            0: "LOCOMOTION",
+            EXTERNAL_MOTION_FREEZE: "FREEZE",
+            EXTERNAL_MOTION_TERMINAL_ALIGN: "TERMINAL_ALIGN",
+        }
+        self._write_hold_diagnostic(
+            "motion_mode_transition",
+            actual,
+            previous_motion_mode=names.get(previous, str(previous)),
+            motion_mode=names.get(current, str(current)),
+            target_yaw=float(target_yaw),
+        )
+        self._logger.info(
+            f"HuNav external mode: agent={self._command.agent_id}, "
+            f"{names.get(previous, previous)}->{names.get(current, current)}, "
+            f"target_yaw={float(target_yaw):.3f}, "
+            f"actual_yaw={float(actual.get('yaw', 0.0)):.3f}"
+        )
 
     def _build_robot(self) -> Agent:
         robot_state = self._robot
@@ -993,13 +1038,28 @@ class HuNavMotionBackend:
         marker.points = [Point(x=x, y=y, z=0.03) for x, y in corners]
         return marker
 
-    def _send_external_motion(self, agent: Agent) -> None:
+    def _send_external_motion(
+        self,
+        agent: Agent,
+        *,
+        terminal_align: bool = False,
+    ) -> None:
         if (
             self._external_future is not None
             and not self._external_future.done()
         ):
             return
         actual = self._actual.get(self._command.agent_id) or {}
+        mode = (
+            EXTERNAL_MOTION_TERMINAL_ALIGN
+            if terminal_align
+            else 0
+        )
+        self._record_motion_mode(
+            mode,
+            actual,
+            target_yaw=float(agent.yaw),
+        )
         command = MotionCommand(
             agent_id=self._command.agent_id,
             goal_pose=self._command.goal_pose,
@@ -1018,6 +1078,7 @@ class HuNavMotionBackend:
                 0.0,
             ),
             external_timeout_sec=self._external_timeout_sec,
+            external_motion_mode=mode,
         )
         self._external_future = self._isaac.send(
             command,

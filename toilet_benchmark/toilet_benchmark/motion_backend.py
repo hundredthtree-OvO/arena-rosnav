@@ -8,6 +8,10 @@ from typing import Callable, Protocol, Sequence
 from isaacsim_msgs.msg import NavPed
 from isaacsim_msgs.srv import MovePed
 
+EXTERNAL_MOTION_LOCOMOTION = 0
+EXTERNAL_MOTION_FREEZE = 1
+EXTERNAL_MOTION_TERMINAL_ALIGN = 2
+
 
 @dataclass(frozen=True)
 class MotionCommand:
@@ -23,6 +27,7 @@ class MotionCommand:
     external_velocity: Sequence[float] | None = None
     external_timeout_sec: float = 0.5
     external_freeze_pose: bool = False
+    external_motion_mode: int = EXTERNAL_MOTION_LOCOMOTION
     constrain_to_path: bool = False
     # Semantic phase is diagnostics-only. Motion backends must not infer FSM
     # transitions from it.
@@ -96,6 +101,7 @@ class IsaacPeopleBackend:
             ]
         nav.external_timeout_sec = float(command.external_timeout_sec)
         nav.external_freeze_pose = bool(command.external_freeze_pose)
+        nav.external_motion_mode = int(command.external_motion_mode)
 
         request = MovePed.Request()
         request.nav_list = [nav]

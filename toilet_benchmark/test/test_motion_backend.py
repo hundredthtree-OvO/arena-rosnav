@@ -57,6 +57,7 @@ def _install_fake_isaacsim_msgs():
             self.external_velocity = []
             self.external_timeout_sec = None
             self.external_freeze_pose = None
+            self.external_motion_mode = None
             self.constrain_to_path = None
             self.loop_path = None
 
@@ -98,6 +99,7 @@ class TestMotionBackend(unittest.TestCase):
             external_velocity=[0.2, -0.1, 0.0],
             external_timeout_sec=0.4,
             external_freeze_pose=True,
+            external_motion_mode=2,
             constrain_to_path=True,
         )
 
@@ -113,6 +115,7 @@ class TestMotionBackend(unittest.TestCase):
         self.assertEqual(command.external_velocity, [0.2, -0.1, 0.0])
         self.assertEqual(command.external_timeout_sec, 0.4)
         self.assertTrue(command.external_freeze_pose)
+        self.assertEqual(command.external_motion_mode, 2)
         self.assertTrue(command.constrain_to_path)
 
     def test_backend_wait_for_service_uses_move_client_timeout(self):
@@ -157,6 +160,7 @@ class TestMotionBackend(unittest.TestCase):
             external_velocity=[0.3, 0.4, 0.0],
             external_timeout_sec=0.6,
             external_freeze_pose=True,
+            external_motion_mode=2,
             constrain_to_path=True,
         )
 
@@ -179,6 +183,7 @@ class TestMotionBackend(unittest.TestCase):
         self.assertEqual(nav.external_velocity, [0.3, 0.4, 0.0])
         self.assertEqual(nav.external_timeout_sec, 0.6)
         self.assertTrue(nav.external_freeze_pose)
+        self.assertEqual(nav.external_motion_mode, 2)
         self.assertTrue(nav.constrain_to_path)
         self.assertFalse(nav.loop_path)
 

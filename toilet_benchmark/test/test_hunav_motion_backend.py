@@ -52,6 +52,7 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._lookahead_tracker = None
         self.backend._lookahead_target = None
         self.backend._yield_hold_yaw = None
+        self.backend._last_external_motion_mode = 0
         self.backend._agent_radius = 0.30
         self.backend._goal_radius = 0.12
         self.backend._behavior = {}
@@ -166,6 +167,7 @@ class TestHuNavMotionBackend(unittest.TestCase):
         hold = self.backend._isaac.commands[-1]
         self.assertTrue(hold.use_external_motion)
         self.assertTrue(hold.external_freeze_pose)
+        self.assertEqual(hold.external_motion_mode, 1)
         self.assertEqual(hold.external_velocity, (0.0, 0.0, 0.0))
         self.assertEqual(hold.direct_pose, (0.4, -0.2, 0.0))
         self.assertAlmostEqual(hold.orientation, 1.2)
@@ -191,6 +193,15 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._reset_robot_reaction()
 
         self.assertIsNone(self.backend._yield_hold_yaw)
+
+    def test_motion_mode_transition_is_recorded_once(self):
+        self.backend.send(_walking_command())
+        actual = {"x": 0.4, "y": -0.2, "z": 0.0, "yaw": 1.2}
+
+        self.backend._record_motion_mode(1, actual, target_yaw=1.2)
+        self.backend._record_motion_mode(1, actual, target_yaw=1.2)
+
+        self.assertEqual(self.backend._last_external_motion_mode, 1)
 
 
 if __name__ == "__main__":
