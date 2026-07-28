@@ -29,6 +29,105 @@ class MotionObservation:
     progressed: bool
     distance_to_target: float
 
+
+@dataclass(frozen=True)
+class PortalCorridor:
+    """Oriented portal geometry shared by event and motion backends."""
+
+    outside: tuple[float, float, float]
+    inside: tuple[float, float, float]
+    half_width_m: float
+    clearance_m: float
+    capacity: int = 1
+
+    def __post_init__(self) -> None:
+        if self.length_m <= 1e-6:
+            raise ValueError("Portal outside and inside poses must be distinct")
+        if float(self.half_width_m) <= 0.0:
+            raise ValueError("Portal half_width_m must be positive")
+        if float(self.clearance_m) < 0.0:
+            raise ValueError("Portal clearance_m must not be negative")
+        if int(self.capacity) < 1:
+            raise ValueError("Portal capacity must be at least one")
+
+    @property
+    def length_m(self) -> float:
+        return math.hypot(
+            float(self.inside[0]) - float(self.outside[0]),
+            float(self.inside[1]) - float(self.outside[1]),
+        )
+
+    @property
+    def axis(self) -> tuple[float, float]:
+        length = self.length_m
+        return (
+            (float(self.inside[0]) - float(self.outside[0])) / length,
+            (float(self.inside[1]) - float(self.outside[1])) / length,
+        )
+
+    @property
+    def yaw(self) -> float:
+        axis_x, axis_y = self.axis
+        return math.atan2(axis_y, axis_x)
+
+    def coordinates(self, pose) -> tuple[float, float]:
+        """Return longitudinal progress from outside and signed lateral offset."""
+        axis_x, axis_y = self.axis
+        relative_x = float(pose[0]) - float(self.outside[0])
+        relative_y = float(pose[1]) - float(self.outside[1])
+        return (
+            relative_x * axis_x + relative_y * axis_y,
+            relative_x * -axis_y + relative_y * axis_x,
+        )
+
+    def clear_pose(self, direction: str) -> list[float]:
+        """Return the first pose that fully clears the portal in a direction."""
+        axis_x, axis_y = self.axis
+        if direction == "entering":
+            anchor = self.inside
+            sign = 1.0
+        elif direction == "exiting":
+            anchor = self.outside
+            sign = -1.0
+        else:
+            raise ValueError(f"Unsupported portal direction: {direction!r}")
+        return [
+            float(anchor[0]) + sign * float(self.clearance_m) * axis_x,
+            float(anchor[1]) + sign * float(self.clearance_m) * axis_y,
+            float(anchor[2]),
+        ]
+
+    def contains_laterally(self, pose, *, margin_m: float = 0.0) -> bool:
+        _, lateral = self.coordinates(pose)
+        return abs(lateral) <= float(self.half_width_m) + max(0.0, float(margin_m))
+
+    def cleared(self, pose, direction: str, *, lateral_margin_m: float = 0.0) -> bool:
+        """Check directional clear-plane crossing without requiring point arrival."""
+        if not self.contains_laterally(pose, margin_m=lateral_margin_m):
+            return False
+        longitudinal, _ = self.coordinates(pose)
+        if direction == "entering":
+            return longitudinal >= self.length_m + float(self.clearance_m)
+        if direction == "exiting":
+            return longitudinal <= -float(self.clearance_m)
+        raise ValueError(f"Unsupported portal direction: {direction!r}")
+
+    def traversal_goal(
+        self,
+        direction: str,
+        *,
+        overshoot_m: float = 0.0,
+    ) -> list[float]:
+        """Place locomotion goals beyond the event clear plane when needed."""
+        goal = self.clear_pose(direction)
+        axis_x, axis_y = self.axis
+        sign = 1.0 if direction == "entering" else -1.0
+        overshoot = max(0.0, float(overshoot_m))
+        goal[0] += sign * overshoot * axis_x
+        goal[1] += sign * overshoot * axis_y
+        return goal
+
+
 def portal_inside_plane_reached(
     *,
     current_pose: list[float],
@@ -36,7 +135,7 @@ def portal_inside_plane_reached(
     staging_pose: list[float],
     lateral_tolerance_m: float,
 ) -> bool:
-    """Accept entry once the root reaches the indoor side of the portal."""
+    """Legacy entry-plane check retained for the current Isaac backend."""
     dx = float(staging_pose[0]) - float(inside_pose[0])
     dy = float(staging_pose[1]) - float(inside_pose[1])
     length = math.hypot(dx, dy)

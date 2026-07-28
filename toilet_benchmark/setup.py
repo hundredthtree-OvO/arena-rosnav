@@ -28,6 +28,9 @@ setup(
         "console_scripts": [
             "toilet_director_node = toilet_benchmark.toilet_director_node:main",
             "manual_collection_node = toilet_benchmark.manual_collection_node:main",
+            "hunav_phase0_smoke = toilet_benchmark.hunav_phase0_smoke:main",
+            "hunav_isaac_mirror = toilet_benchmark.hunav_isaac_mirror:main",
+            "walkable_map_publisher = toilet_benchmark.walkable_map:main",
         ]
     },
 )

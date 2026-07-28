@@ -23,6 +23,11 @@ director:
   arrival_tolerance_m: 0.18
   actor_stop_radius_m: 0.5
   exit_arrival_tolerance_m: 0.55
+  # HuNav reaches the interaction point before the director begins the service
+  # timer. Keep yaw and speed stable to prevent target-region micro-walking.
+  urinal_final_yaw_tolerance_rad: 0.20
+  urinal_final_alignment_stable_sec: 0.50
+  urinal_final_alignment_max_speed_mps: 0.05
   walk_plane_z: 0.0
   pose_stale_sec: 5.0
   max_live_pose_jump_m: 3.0
@@ -34,6 +39,7 @@ director:
   portal_max_recovery_attempts: 3
   portal_staging_arrival_tolerance_m: 0.20
   exit_staging_arrival_tolerance_m: 0.30
+  # Compatibility backend cap. HuNav uses each agent's regular indoor speed.
   portal_crossing_velocity_mps: 0.45
   activation_settle_sec: 0.20
   activation_confirm_timeout_sec: 2.0
@@ -55,6 +61,18 @@ director:
 path_planner:
   enabled: true
   backend: voxel
+  # HuNav takeover uses the static PhysX-derived map. The compatibility
+  # isaac_people backend continues to use backend: voxel above.
+  hunav_backend: walkable_map
+  walkable_map_path: /home/stardust/resources/arena_ws/arena_assets/navigation/shenxinfu_841837.walkable.json
+  walkable_agent_radius_m: 0.24
+  walkable_nearest_free_radius_m: 0.60
+  walkable_max_expansions: 30000
+  walkable_simplify: true
+  walkable_max_segment_length_m: 1.50
+  walkable_preferred_clearance_m: 0.40
+  walkable_clearance_cost_weight: 3.0
+  walkable_turn_cost_weight: 0.25
   # Keep A* deterministic. The robot is handled as an execution-time yield
   # condition rather than a global replanning obstacle.
   robot_obstacle_mode: static_route
@@ -78,12 +96,69 @@ path_planner:
   robot_yield_pedestrian_radius_m: 0.22
   robot_yield_clearance_m: 0.10
 
+# Keep isaac_people as the compatibility default. Override with
+# --motion-backend hunav for the Phase 1 single-agent takeover.
+motion_backend:
+  type: isaac_people
+  hunav_namespace: /toilet_hunav_takeover
+  hunav:
+    compute_hz: 10.0
+    # Experimental main path: let walkable-map routes run continuously across
+    # the doorway instead of rebuilding point-based entry/exit portal paths.
+    use_portal_controller: false
+    state_topic: /isaac/pedestrian_states
+    robot_odom_topic: /odom
+    state_timeout_sec: 0.5
+    external_timeout_sec: 0.35
+    agent_radius_m: 0.30
+    # Keep HuNav's terminal condition tighter than the director's normal
+    # tolerance. The backend separately reports its settled state.
+    goal_radius_m: 0.12
+    lookahead_distance_m: 0.80
+    settled_arrival_tolerance_m: 0.35
+    robot_radius_m: 0.45
+    behavior:
+      social_force_factor: 5.0
+      goal_force_factor: 2.0
+      obstacle_force_factor: 10.0
+      other_force_factor: 20.0
+    robot_proximity_reaction:
+      enabled: true
+      mode: fixed
+      reaction: yielding
+      trigger:
+        distance_m: 0.85
+        time_to_collision_sec: 1.5
+        front_half_angle_deg: 180.0
+      release:
+        distance_m: 0.50
+        stable_sec: 0.8
+      reactions:
+        yielding:
+          speed_scale: 0.0
+        impatient:
+          speed_scale: 1.35
+        regular:
+          speed_scale: 1.0
+    safety:
+      enabled: true
+      clearance_m: 0.01
+      contact_epsilon_m: 0.0001
+      max_iterations: 8
+    visualization:
+      enabled: true
+      frame_id: map
+      route_topic: /toilet_benchmark/hunav/route
+      marker_topic: /toilet_benchmark/hunav/markers
+      diagnostic_log_period_sec: 1.0
+
 hunav_profile:
   regular:
-    desired_velocity: [0.5, 0.9]
+    desired_velocity: [0.9, 1.2]
     behavior_type: REGULAR
   impatient:
-    desired_velocity: [0.8, 1.1]
+    # desired_velocity: [0.8, 1.1]
+    desired_velocity: [1.1, 1.5]
     behavior_type: THREATENING
 
 character_pool:

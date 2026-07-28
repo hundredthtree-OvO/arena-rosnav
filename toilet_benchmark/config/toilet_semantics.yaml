@@ -19,7 +19,10 @@ portals:
     center_pose: [-2.24, -0.9, 0.0]
     inside_pose: [-2.24, -0.9, 0.0]
     inside_staging_pose: [-2.24, -0.675, 0.0]
-    release_tolerance_m: 0.50
+    half_width_m: 0.45
+    clearance_m: 0.40
+    capacity: 1
+    release_tolerance_m: 0.65
 
 urinals:
   - id: urinal_1

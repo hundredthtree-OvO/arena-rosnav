@@ -1,0 +1,26 @@
+# Validation-only snapshot. These points do not drive pedestrian motion.
+anchors:
+  - id: entrance_spawn
+    pose: [-3.80, -0.91]
+    expected: free
+  - id: portal_inside
+    pose: [-2.24, -0.90]
+    expected: free
+  - id: portal_staging
+    pose: [-2.24, -0.675]
+    expected: free
+  - id: urinal_1_interaction
+    pose: [2.861556, 1.031731]
+    expected: free
+  - id: urinal_2_interaction
+    pose: [2.094500, 1.032630]
+    expected: free
+  - id: urinal_3_interaction
+    pose: [1.308970, 1.056970]
+    expected: free
+  - id: urinal_4_interaction
+    pose: [0.510724, 1.052539]
+    expected: free
+  - id: urinal_5_interaction
+    pose: [-0.314167, 1.089255]
+    expected: free

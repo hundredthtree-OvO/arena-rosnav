@@ -1,5 +1,14 @@
 ## Toilet Benchmark
 
+HuNav 单行人 takeover 已提供实验入口。它保持
+`bridge physx_diff_contact` 主链路不变，由 HuNav 独占行走位姿推进，并由 Isaac
+external-motion adapter 驱动角色根位姿和 Walk/Idle 动画。
+
+编译、启动、回滚及首轮观察项见
+[`docs/hunav_takeover_cn.md`](docs/hunav_takeover_cn.md)。当前仅支持
+`--initial-agents 1`，默认不带 `--motion-backend hunav` 时仍使用原
+`IsaacPeopleBackend`。
+
 This package is the upper-layer "event director" placeholder for toilet-scene
 benchmarking on top of:
 

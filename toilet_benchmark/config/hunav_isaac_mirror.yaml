@@ -1,0 +1,32 @@
+agent_name: toilet_agent_01
+agent_numeric_id: 1
+actual_topic: /isaac/pedestrian_states
+intent_topic: /toilet_benchmark/director_status
+robot_odom_topic: /odom
+use_sim_time: true
+
+mirror:
+  compute_hz: 10.0
+  startup_timeout_sec: 15.0
+  service_timeout_sec: 2.0
+  max_actual_age_sec: 0.5
+  exit_on_retire: true
+  agent_radius_m: 0.30
+  goal_radius_m: 0.20
+  robot_radius_m: 0.45
+  motion_heading_min_speed_mps: 0.10
+  near_target_radius_m: 0.35
+  settled_speed_mps: 0.05
+  settled_hold_sec: 1.0
+
+behavior:
+  social_force_factor: 5.0
+  goal_force_factor: 2.0
+  obstacle_force_factor: 10.0
+  other_force_factor: 20.0
+
+safety:
+  enabled: true
+  clearance_m: 0.01
+  contact_epsilon_m: 0.0001
+  max_iterations: 8

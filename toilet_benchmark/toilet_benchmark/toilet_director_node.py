@@ -12,8 +12,8 @@ from pathlib import Path
 import rclpy
 import yaml
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
-from isaacsim_msgs.msg import NavPed, Person
-from isaacsim_msgs.srv import DeletePrim, GetPrimAttributes, MovePed, Pedestrian
+from isaacsim_msgs.msg import Person
+from isaacsim_msgs.srv import DeletePrim, GetPrimAttributes, Pedestrian
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -29,15 +29,25 @@ except Exception:  # pragma: no cover - optional runtime dependency
     ArenaPedestrians = None
 
 from .hunav_adapter import DirectedAgentState, HunavAdapter
+from .hunav_isaac_mirror_core import build_motion_intent_payload
 from .interaction_policy import (
     dynamic_robot_obstacles,
     guard_block_requires_wait,
     robot_blocks_pedestrian,
 )
+from .motion_backend import IsaacPeopleBackend, MotionCommand
+from .pedestrian_state_stream import observations_from_message
 from .pose_utils import SemanticPose, parse_semantic_pose
 from .resource_manager import QueueSlot, Resource, ResourceManager
+from .route_provider import (
+    RouteProvider,
+    RouteRequest,
+    VoxelRouteProvider,
+    WalkableMapRouteProvider,
+)
 from .semantic_rules import (
     PlacementRule,
+    PortalCorridor,
     QueueRule,
     build_queue_poses,
     classify_motion_observation,
@@ -46,7 +56,8 @@ from .semantic_rules import (
     resolve_local_placement,
     yaw_from_quaternion_xyzw,
 )
-from .voxel_path_planner import PathPlanningError, VoxelPathPlanner, VoxelPathPlannerConfig
+from .voxel_path_planner import VoxelPathPlanner, VoxelPathPlannerConfig
+from .walkable_map_planner import WalkableMapPlanner, WalkableMapPlannerConfig
 
 
 def _load_yaml(path: str | Path) -> dict:
@@ -109,10 +120,6 @@ def _pose_response_is_finite(response) -> bool:
     return all(math.isfinite(v) for v in values)
 
 
-def _flatten_path_points(points: list[list[float]]) -> list[float]:
-    return [float(value) for point in points for value in point[:3]]
-
-
 @dataclass
 class RuntimeAgent:
     agent_id: str
@@ -135,6 +142,9 @@ class RuntimeAgent:
     exit_pose: list[float] | None = None
     exit_yaw: float = 0.0
     last_pose_update: float = 0.0
+    current_yaw: float | None = None
+    current_speed_mps: float = 0.0
+    final_alignment_started_at: float = 0.0
     aligned_at_target: bool = False
     last_arrival_wait_log: float = 0.0
     last_pose_reject_log: float = 0.0
@@ -187,6 +197,8 @@ class ToiletDirectorNode(Node):
         profile_name: str,
         target_resource_ids: list[str] | None = None,
         status_topic: str = "/toilet_benchmark/director_status",
+        motion_backend_name: str = "",
+        hunav_namespace: str = "",
     ):
         super().__init__("toilet_director_node")
         self.semantics_path = str(semantics_path)
@@ -207,8 +219,24 @@ class ToiletDirectorNode(Node):
             if self.status_topic
             else None
         )
+        self._motion_intent_generations: dict[str, int] = {}
         self.semantics = _load_yaml(self.semantics_path)
         self.benchmark = _load_yaml(self.benchmark_path)
+        motion_cfg = dict(self.benchmark.get("motion_backend", {}) or {})
+        self.motion_backend_name = str(
+            motion_backend_name or motion_cfg.get("type", "isaac_people")
+        ).strip().lower()
+        self.hunav_namespace = str(
+            hunav_namespace
+            or motion_cfg.get("hunav_namespace", "/toilet_hunav_takeover")
+        ).strip()
+        hunav_motion_cfg = dict(motion_cfg.get("hunav", {}) or {})
+        self.hunav_use_portal_controller = bool(
+            hunav_motion_cfg.get(
+                "use_portal_controller",
+                hunav_motion_cfg.get("use_exit_portal_controller", False),
+            )
+        )
         self.portal = self._load_portal_config(self.semantics)
         self.scene_root_path = str(
             self.semantics.get("scene_root_path")
@@ -219,6 +247,18 @@ class ToiletDirectorNode(Node):
         self.arrival_tolerance_m = float(director_cfg.get("arrival_tolerance_m", 0.55))
         self.actor_stop_radius_m = float(director_cfg.get("actor_stop_radius_m", 0.5))
         self.exit_arrival_tolerance_m = float(director_cfg.get("exit_arrival_tolerance_m", 0.35))
+        self.urinal_final_yaw_tolerance_rad = max(
+            0.01,
+            float(director_cfg.get("urinal_final_yaw_tolerance_rad", 0.20)),
+        )
+        self.urinal_final_alignment_stable_sec = max(
+            0.0,
+            float(director_cfg.get("urinal_final_alignment_stable_sec", 0.50)),
+        )
+        self.urinal_final_alignment_max_speed_mps = max(
+            0.0,
+            float(director_cfg.get("urinal_final_alignment_max_speed_mps", 0.05)),
+        )
         self.walk_plane_z = float(director_cfg.get("walk_plane_z", 0.0))
         self.pose_stale_sec = float(director_cfg.get("pose_stale_sec", 5.0))
         self.max_live_pose_jump_m = float(director_cfg.get("max_live_pose_jump_m", 3.0))
@@ -317,9 +357,9 @@ class ToiletDirectorNode(Node):
             0.0,
             float(planner_cfg.get("robot_yield_clearance_m", 0.10)),
         )
-        self.path_planner: VoxelPathPlanner | None = None
+        self.path_planner: VoxelPathPlanner | WalkableMapPlanner | None = None
+        self.route_provider: RouteProvider | None = None
         self._robot_state: tuple[float, float, float, float, float] | None = None
-        self._dynamic_path_wait_log: dict[str, float] = {}
         self.character_pool = [
             str(name).strip()
             for name in (character_pool or self.benchmark.get("character_pool", []) or [])
@@ -329,9 +369,38 @@ class ToiletDirectorNode(Node):
         self.exits: list[dict] = []
         self.resources = ResourceManager({})
         self.adapter = HunavAdapter()
-        self._rng = random.Random(int(self.benchmark.get("arrival", {}).get("seed", 12345)))
+        self.arrival_seed = int(
+            self.benchmark.get("arrival", {}).get("seed", 12345)
+        )
+        self._rng = random.Random(self.arrival_seed)
         self._spawn_client = self.create_client(Pedestrian, self.spawn_service_name)
-        self._move_client = self.create_client(MovePed, self.move_service_name)
+        if self.motion_backend_name == "isaac_people":
+            self.motion_backend = IsaacPeopleBackend(self, self.move_service_name)
+        elif self.motion_backend_name == "hunav":
+            if self.initial_agents > 1:
+                raise ValueError(
+                    "Phase 1 HuNav takeover currently supports exactly one active "
+                    "pedestrian; use --initial-agents 1."
+                )
+            from .hunav_motion_backend import HuNavMotionBackend
+
+            hunav_config = hunav_motion_cfg
+            hunav_config.setdefault("reaction_seed", self.arrival_seed)
+            hunav_config.setdefault("visualization", {})
+            hunav_config["visualization"] = {
+                **dict(hunav_config["visualization"] or {}),
+                "portal": self._hunav_portal_visualization_config(),
+            }
+            self.motion_backend = HuNavMotionBackend(
+                self,
+                move_service_name=self.move_service_name,
+                namespace=self.hunav_namespace,
+                config=hunav_config,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported pedestrian motion backend: {self.motion_backend_name!r}"
+            )
         self._get_prim_client = self.create_client(GetPrimAttributes, "/isaac/get_prim_attributes")
         self._delete_client = self.create_client(DeletePrim, "/isaac/delete_prim")
         self._spawned_agents: list[DirectedAgentState] = []
@@ -364,6 +433,8 @@ class ToiletDirectorNode(Node):
             f"semantics={self.semantics_path}, benchmark={self.benchmark_path}, "
             f"scene_root_path={self.scene_root_path}, "
             f"spawn_service={self.spawn_service_name}, move_service={self.move_service_name}, "
+            f"motion_backend={self.motion_backend_name}, "
+            f"arrival_seed={self.arrival_seed}, "
             f"default_character={self.character_name}, character_pool={len(self.character_pool)}"
         )
         self.get_logger().info(
@@ -376,7 +447,10 @@ class ToiletDirectorNode(Node):
             f"exit_when_complete={self.exit_when_complete}, "
             f"initial_spawn_interval_sec={self.initial_spawn_interval_sec:.2f}, "
             f"serialize_exit_corridor={self.serialize_exit_corridor}, "
+            f"hunav_use_portal_controller={self.hunav_use_portal_controller}, "
             f"portal={self.portal.get('id') if self.portal else None}, "
+            f"portal_half_width_m={self.portal['corridor'].half_width_m if self.portal else 0.0:.2f}, "
+            f"portal_clearance_m={self.portal['corridor'].clearance_m if self.portal else 0.0:.2f}, "
             f"portal_stall_recovery_sec={self.portal_stall_recovery_sec:.1f}, "
             f"portal_max_recovery_attempts={self.portal_max_recovery_attempts}, "
             f"portal_staging_arrival_tolerance_m={self.portal_staging_arrival_tolerance_m:.2f}, "
@@ -404,7 +478,14 @@ class ToiletDirectorNode(Node):
         if not bool(planner_cfg.get("enabled", False)):
             self.get_logger().warning("Toilet path planner disabled; pedestrian motion will remain fail-closed.")
             return
-        backend = str(planner_cfg.get("backend", "voxel")).strip().lower()
+        backend = str(
+            planner_cfg.get("hunav_backend", "walkable_map")
+            if self.motion_backend_name == "hunav"
+            else planner_cfg.get("backend", "voxel")
+        ).strip().lower()
+        if backend == "walkable_map":
+            self._setup_walkable_map_planner(planner_cfg)
+            return
         if backend != "voxel":
             self.get_logger().error(
                 f"Unsupported toilet path planner backend={backend!r}; pedestrian motion will remain fail-closed."
@@ -435,6 +516,12 @@ class ToiletDirectorNode(Node):
                     turn_cost_weight=float(planner_cfg.get("turn_cost_weight", 0.35)),
                 )
             )
+            self.route_provider = VoxelRouteProvider(
+                planner=self.path_planner,
+                walk_plane_z=self.walk_plane_z,
+                dynamic_obstacles=self._dynamic_obstacles,
+                logger=self.get_logger(),
+            )
             if self.portal is not None:
                 portal_path = self._portal_entry_waypoints()
                 if not self.path_planner.polyline_is_free(
@@ -455,7 +542,73 @@ class ToiletDirectorNode(Node):
             )
         except Exception as exc:
             self.path_planner = None
+            self.route_provider = None
             self.get_logger().error(f"Failed to load toilet voxel path planner; pedestrian motion is disabled: {exc}")
+
+    def _setup_walkable_map_planner(self, planner_cfg: dict) -> None:
+        map_path = str(
+            planner_cfg.get("walkable_map_path")
+            or "/home/stardust/resources/arena_ws/arena_assets/navigation/"
+            "shenxinfu_841837.walkable.json"
+        )
+        try:
+            planner = WalkableMapPlanner.from_file(
+                WalkableMapPlannerConfig(
+                    map_path=map_path,
+                    agent_radius_m=float(
+                        planner_cfg.get("walkable_agent_radius_m", 0.24)
+                    ),
+                    nearest_free_radius_m=float(
+                        planner_cfg.get("walkable_nearest_free_radius_m", 0.60)
+                    ),
+                    max_expansions=int(
+                        planner_cfg.get("walkable_max_expansions", 30000)
+                    ),
+                    simplify=bool(planner_cfg.get("walkable_simplify", True)),
+                    max_segment_length_m=float(
+                        planner_cfg.get("walkable_max_segment_length_m", 1.50)
+                    ),
+                    preferred_clearance_m=float(
+                        planner_cfg.get("walkable_preferred_clearance_m", 0.40)
+                    ),
+                    clearance_cost_weight=float(
+                        planner_cfg.get("walkable_clearance_cost_weight", 3.0)
+                    ),
+                    turn_cost_weight=float(
+                        planner_cfg.get("walkable_turn_cost_weight", 0.25)
+                    ),
+                )
+            )
+            self.path_planner = planner
+            self.route_provider = WalkableMapRouteProvider(
+                planner=planner,
+                walk_plane_z=self.walk_plane_z,
+                logger=self.get_logger(),
+            )
+            if self.portal is not None:
+                portal_path = self._portal_entry_waypoints()
+                if not planner.polyline_is_free(
+                    portal_path,
+                    allow_out_of_bounds=False,
+                ):
+                    raise ValueError(
+                        f"portal {self.portal['id']} intersects the walkable-map "
+                        f"configuration space: {portal_path}"
+                    )
+            self.get_logger().info(
+                f"Toilet walkable-map planner loaded: map={map_path}, "
+                f"fingerprint={planner.scene_fingerprint[:12]}, "
+                f"resolution={planner.resolution:.3f}, "
+                f"occupied={planner.occupied_count}, "
+                f"inflated={planner.inflated_occupied_count}"
+            )
+        except Exception as exc:
+            self.path_planner = None
+            self.route_provider = None
+            self.get_logger().error(
+                "Failed to load toilet walkable-map planner; pedestrian motion "
+                f"is disabled: {exc}"
+            )
 
     def _setup_pose_subscriptions(self):
         if People is not None:
@@ -568,7 +721,7 @@ class ToiletDirectorNode(Node):
         if not self._spawn_client.wait_for_service(timeout_sec=0.0):
             self.get_logger().info(f"Waiting for service: {self.spawn_service_name}")
             return False
-        if not self._move_client.wait_for_service(timeout_sec=0.0):
+        if not self.motion_backend.wait_for_service(timeout_sec=0.0):
             self.get_logger().info(f"Waiting for service: {self.move_service_name}")
             return False
         if not self._get_prim_client.wait_for_service(timeout_sec=0.0):
@@ -894,19 +1047,42 @@ class ToiletDirectorNode(Node):
             return None
         item = entries[0]
         try:
+            outside = [float(value) for value in item["outside_pose"][:3]]
+            inside = [float(value) for value in item["inside_pose"][:3]]
+            corridor = PortalCorridor(
+                outside=tuple(outside),
+                inside=tuple(inside),
+                half_width_m=float(item.get("half_width_m", 0.45)),
+                clearance_m=float(item.get("clearance_m", 0.40)),
+                capacity=int(item.get("capacity", 1)),
+            )
             return {
                 "id": str(item.get("id", "door_portal")),
-                "outside": [float(value) for value in item["outside_pose"][:3]],
+                "outside": outside,
                 "center": [float(value) for value in item["center_pose"][:3]],
-                "inside": [float(value) for value in item["inside_pose"][:3]],
+                "inside": inside,
                 "inside_staging": [
                     float(value)
                     for value in item.get("inside_staging_pose", item["inside_pose"])[:3]
                 ],
+                "corridor": corridor,
                 "release_tolerance_m": float(item.get("release_tolerance_m", 0.30)),
             }
         except Exception as exc:
             raise ValueError(f"Invalid portal semantics: {exc}") from exc
+
+    def _hunav_portal_visualization_config(self) -> dict | None:
+        """Return plain geometry only; the backend never owns portal state."""
+        if self.portal is None:
+            return None
+        corridor = self.portal["corridor"]
+        return {
+            "id": self.portal["id"],
+            "outside": list(self.portal["outside"]),
+            "inside": list(self.portal["inside"]),
+            "half_width_m": float(corridor.half_width_m),
+            "clearance_m": float(corridor.clearance_m),
+        }
 
     @staticmethod
     def _vector3(value, *, default: list[float]) -> list[float]:
@@ -938,6 +1114,81 @@ class ToiletDirectorNode(Node):
             "resource_id": state.resource_id,
             **extra,
         }
+        self._status_publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
+
+    def _portal_motion_metadata(
+        self,
+        state: RuntimeAgent | None,
+        phase: str,
+    ) -> dict | None:
+        if self.portal is None or state is None:
+            return None
+        direction = state.portal_direction
+        if direction is None:
+            if phase == "WALK_TO_ENTRY_CLEARANCE":
+                direction = "entering"
+            elif phase == "EXITING":
+                direction = "exiting"
+        if direction not in {"entering", "exiting"}:
+            return None
+        corridor: PortalCorridor = self.portal["corridor"]
+        return {
+            "portal_id": self.portal["id"],
+            "direction": direction,
+            "outside": corridor.outside,
+            "inside": corridor.inside,
+            "half_width_m": corridor.half_width_m,
+            "clearance_m": corridor.clearance_m,
+            "capacity": corridor.capacity,
+        }
+
+    def _build_motion_intent(
+        self,
+        *,
+        agent_id: str,
+        goal_pose: list[float],
+        path_points: list[list[float]],
+        velocity: float,
+        orientation: float,
+        stop: bool,
+        use_direct_pose: bool,
+        constrain_to_path: bool,
+        intent_phase: str | None,
+    ) -> dict | None:
+        if self._status_publisher is None:
+            return None
+        generation = self._motion_intent_generations.get(agent_id, 0) + 1
+        self._motion_intent_generations[agent_id] = generation
+        state = self._runtime_agents.get(agent_id)
+        phase = (
+            str(intent_phase)
+            if intent_phase is not None
+            else ("" if state is None else state.current_phase)
+        )
+        return build_motion_intent_payload(
+            agent_id=agent_id,
+            generation=generation,
+            phase=phase,
+            resource_id=None if state is None else state.resource_id,
+            goal_pose=goal_pose,
+            path_points=path_points,
+            velocity=velocity,
+            final_yaw=orientation,
+            stop=stop,
+            use_direct_pose=use_direct_pose,
+            constrain_to_path=constrain_to_path,
+            portal=self._portal_motion_metadata(state, phase),
+        )
+
+    def _publish_motion_intent_if_accepted(self, payload: dict | None, future) -> None:
+        if payload is None or self._status_publisher is None:
+            return
+        try:
+            accepted = bool(getattr(future.result(), "ret", False))
+        except Exception:
+            return
+        if not accepted:
+            return
         self._status_publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
     def _despawn_done_cb(self, agent_id: str, future):
@@ -1213,7 +1464,7 @@ class ToiletDirectorNode(Node):
         now = time.monotonic()
         state.activation_requested = True
         state.activation_attempts += 1
-        if self.portal is not None:
+        if self._uses_portal_controller():
             if not self._acquire_portal(state, "entering", now):
                 state.activation_requested = False
                 self._initial_spawn_queue.append(state.agent_id)
@@ -1248,7 +1499,8 @@ class ToiletDirectorNode(Node):
         state.activation_confirm_deadline = 0.0
         self.get_logger().info(
             f"Activating {state.agent_id} at shared entrance pose {entrance_pose}; "
-            "portal motion will start after pose settlement."
+            f"{'portal motion' if self._uses_portal_controller() else 'direct activity motion'} "
+            "will start after pose settlement."
         )
 
     def _activation_pose_done_cb(self, agent_id: str, future):
@@ -1317,27 +1569,39 @@ class ToiletDirectorNode(Node):
         )
 
     def _dispatch_initial_motion(self, state: RuntimeAgent, now: float):
-        if self.portal is not None:
-            target_pose = list(self.portal["inside_staging"])
+        use_portal = self._uses_portal_controller()
+        if use_portal:
+            target_pose = self._portal_staging_pose()
             target_yaw = self._portal_entry_clearance_yaw()
             dispatched = self._send_move(
                 agent_id=state.agent_id,
                 goal_pose=target_pose,
-                velocity=min(state.velocity, self.portal_crossing_velocity_mps),
+                velocity=self._portal_motion_velocity(state),
                 orientation=target_yaw,
                 path_points_override=self._portal_entry_waypoints(),
                 constrain_to_path=True,
+                intent_phase="WALK_TO_ENTRY_CLEARANCE",
             )
             next_phase = "WALK_TO_ENTRY_CLEARANCE"
         else:
             target_pose = list(state.activity_pose)
             target_yaw = float(state.activity_yaw)
-            dispatched = self._send_move(
+            activity_path = self._path_points_for_move(
                 agent_id=state.agent_id,
+                start_pose=state.current_pose,
                 goal_pose=target_pose,
-                velocity=state.velocity,
-                orientation=target_yaw,
             )
+            if activity_path is None:
+                dispatched = False
+            else:
+                dispatched = self._send_move(
+                    agent_id=state.agent_id,
+                    goal_pose=target_pose,
+                    velocity=state.velocity,
+                    orientation=target_yaw,
+                    path_points_override=activity_path,
+                    intent_phase=state.activity_phase,
+                )
             next_phase = state.activity_phase
         if not dispatched:
             self._release_portal(state, "activation path rejected")
@@ -1356,9 +1620,7 @@ class ToiletDirectorNode(Node):
         state.reached_deadline = self._estimate_arrival_deadline(
             state.current_pose,
             target_pose,
-            min(state.velocity, self.portal_crossing_velocity_mps)
-            if self.portal is not None
-            else state.velocity,
+            self._portal_motion_velocity(state) if use_portal else state.velocity,
             now=now,
         )
         state.aligned_at_target = False
@@ -1401,10 +1663,9 @@ class ToiletDirectorNode(Node):
         path_points_override: list[list[float]] | None = None,
         constrain_to_path: bool = False,
         preserve_nominal_path: bool = False,
+        intent_phase: str | None = None,
         done_callback=None,
     ) -> bool:
-        request = MovePed.Request()
-        nav = NavPed()
         path_points = []
         if path_points_override is not None:
             path_points = self._dedupe_waypoints(path_points_override)
@@ -1418,18 +1679,29 @@ class ToiletDirectorNode(Node):
             )
             if path_points is None:
                 return False
-        nav.path = agent_id
-        nav.goal_pose = [float(x) for x in goal_pose]
-        nav.path_points_flat = _flatten_path_points(path_points)
-        nav.loop_path = False
-        nav.velocity = float(velocity)
-        nav.orientation = float(orientation)
-        nav.stop = bool(stop)
-        nav.constrain_to_path = bool(constrain_to_path)
-        nav.use_direct_pose = bool(use_direct_pose)
-        if direct_pose is not None:
-            nav.direct_pose = [float(x) for x in direct_pose]
         runtime_state = self._runtime_agents.get(agent_id)
+        command = MotionCommand(
+            agent_id=agent_id,
+            goal_pose=tuple(float(value) for value in goal_pose),
+            path_points=tuple(
+                tuple(float(value) for value in point[:3])
+                for point in path_points
+            ),
+            velocity=float(velocity),
+            orientation=float(orientation),
+            stop=bool(stop),
+            constrain_to_path=bool(constrain_to_path),
+            use_direct_pose=bool(use_direct_pose),
+            direct_pose=(
+                None
+                if direct_pose is None
+                else tuple(float(value) for value in direct_pose)
+            ),
+            phase=str(
+                intent_phase
+                or (runtime_state.current_phase if runtime_state is not None else "")
+            ),
+        )
         if (
             runtime_state is not None
             and path_points
@@ -1441,12 +1713,32 @@ class ToiletDirectorNode(Node):
                 [list(runtime_state.current_pose), *path_points]
             )
             runtime_state.nominal_goal = [float(x) for x in goal_pose]
-        request.nav_list = [nav]
-        future = self._move_client.call_async(request)
-        if done_callback is None:
-            future.add_done_callback(lambda fut, current_agent=agent_id: self._move_done_cb(current_agent, fut))
-        else:
-            future.add_done_callback(done_callback)
+        callback = (
+            done_callback
+            if done_callback is not None
+            else lambda fut, current_agent=agent_id: self._move_done_cb(
+                current_agent,
+                fut,
+            )
+        )
+        future = self.motion_backend.send(command, callback)
+        motion_intent = self._build_motion_intent(
+            agent_id=agent_id,
+            goal_pose=list(command.goal_pose),
+            path_points=path_points,
+            velocity=command.velocity,
+            orientation=command.orientation,
+            stop=command.stop,
+            use_direct_pose=command.use_direct_pose,
+            constrain_to_path=command.constrain_to_path,
+            intent_phase=intent_phase,
+        )
+        future.add_done_callback(
+            lambda fut, payload=motion_intent: self._publish_motion_intent_if_accepted(
+                payload,
+                fut,
+            )
+        )
         return True
 
     @staticmethod
@@ -1463,6 +1755,14 @@ class ToiletDirectorNode(Node):
     def _portal_entry_waypoints(self) -> list[list[float]]:
         if self.portal is None:
             return []
+        if self.motion_backend_name == "hunav":
+            return self._dedupe_waypoints(
+                [
+                    self.portal["outside"],
+                    self.portal["inside"],
+                    self._hunav_portal_clearance_pose(),
+                ]
+            )
         return self._dedupe_waypoints(
             [
                 self.portal["outside"],
@@ -1471,6 +1771,26 @@ class ToiletDirectorNode(Node):
                 self.portal["inside_staging"],
             ]
         )
+
+    def _hunav_portal_clearance_pose(self) -> list[float]:
+        """Extend the portal axis indoors instead of forcing a lateral staging turn."""
+        if self.portal is None:
+            return [0.0, 0.0, self.walk_plane_z]
+        pose = self.portal["corridor"].clear_pose("entering")
+        pose[2] = float(self.walk_plane_z)
+        return pose
+
+    def _portal_staging_pose(self) -> list[float]:
+        if self.portal is None:
+            return [0.0, 0.0, self.walk_plane_z]
+        if self.motion_backend_name == "hunav":
+            return self._hunav_portal_clearance_pose()
+        return list(self.portal["inside_staging"])
+
+    def _portal_motion_velocity(self, state: RuntimeAgent) -> float:
+        if self.motion_backend_name == "hunav":
+            return float(state.velocity)
+        return min(float(state.velocity), self.portal_crossing_velocity_mps)
 
     def _entry_portal_recovery_path(self, state: RuntimeAgent) -> list[list[float]]:
         if self.portal is None:
@@ -1490,12 +1810,31 @@ class ToiletDirectorNode(Node):
         return self._path_points_for_move(
             agent_id=state.agent_id,
             start_pose=state.current_pose,
-            goal_pose=self.portal["inside_staging"],
+            goal_pose=self._portal_staging_pose(),
+        )
+
+    def _uses_portal_controller(self) -> bool:
+        return (
+            self.portal is not None
+            and (
+                self.motion_backend_name != "hunav"
+                or self.hunav_use_portal_controller
+            )
         )
 
     def _exiting_portal_path(self, state: RuntimeAgent) -> list[list[float]]:
         if self.portal is None:
             return [list(state.exit_pose or state.current_pose)]
+        if self.motion_backend_name == "hunav":
+            return remaining_polyline_waypoints(
+                [
+                    self._hunav_portal_clearance_pose(),
+                    self.portal["inside"],
+                    self.portal["outside"],
+                    list(state.exit_pose or self.portal["outside"]),
+                ],
+                state.current_pose,
+            )
         return remaining_polyline_waypoints(
             [
                 self.portal["inside"],
@@ -1517,7 +1856,7 @@ class ToiletDirectorNode(Node):
         if self.portal is None:
             return 0.0
         inside = self.portal["inside"]
-        staging = self.portal["inside_staging"]
+        staging = self._portal_staging_pose()
         return math.atan2(float(staging[1]) - float(inside[1]), float(staging[0]) - float(inside[0]))
 
     def _acquire_portal(self, state: RuntimeAgent, direction: str, now: float) -> bool:
@@ -1582,7 +1921,21 @@ class ToiletDirectorNode(Node):
         )
         self._request_despawn(state, reason=f"{phase} motion recovery exhausted")
 
+    def _director_stall_recovery_enabled(self, agent_id: str) -> bool:
+        capability = getattr(
+            self.motion_backend,
+            "allows_director_stall_recovery",
+            None,
+        )
+        if capability is None:
+            return True
+        return bool(capability(agent_id))
+
     def _recover_motion_if_stalled(self, state: RuntimeAgent, now: float) -> None:
+        if not self._director_stall_recovery_enabled(state.agent_id):
+            state.motion_last_motion_at = float(now)
+            state.motion_last_pose = list(state.current_pose)
+            return
         tracked_phases = {"WALK_TO_URINAL", "QUEUEING", "WALK_TO_EXIT_STAGING"}
         if state.portal_direction is not None or state.current_phase not in tracked_phases:
             return
@@ -1642,7 +1995,7 @@ class ToiletDirectorNode(Node):
         if self._send_move(
             agent_id=state.agent_id,
             goal_pose=state.target_pose,
-            velocity=min(state.velocity, self.portal_crossing_velocity_mps),
+            velocity=self._portal_motion_velocity(state),
             orientation=state.target_yaw,
             path_points_override=recovery_path,
             constrain_to_path=True,
@@ -1656,6 +2009,10 @@ class ToiletDirectorNode(Node):
             )
 
     def _recover_portal_if_stalled(self, state: RuntimeAgent, now: float) -> None:
+        if not self._director_stall_recovery_enabled(state.agent_id):
+            state.portal_last_motion_at = float(now)
+            state.portal_last_pose = list(state.current_pose)
+            return
         if self.portal is None or state.portal_direction is None:
             return
         if guard_block_requires_wait(state.guard_block_reason) and state.guard_blocked:
@@ -1713,45 +2070,18 @@ class ToiletDirectorNode(Node):
         start_pose: list[float],
         goal_pose: list[float],
     ) -> list[list[float]] | None:
-        if self.path_planner is None:
-            self.get_logger().error(f"{agent_id} has no voxel planner; refusing unsafe direct motion.")
-            return None
-        dynamic_obstacles = self._dynamic_obstacles(time.monotonic())
-        try:
-            points = self.path_planner.plan(
-                start_pose,
-                goal_pose,
-                z=self.walk_plane_z,
-                dynamic_obstacles=dynamic_obstacles,
+        if self.route_provider is None:
+            self.get_logger().error(
+                f"{agent_id} has no global route provider; refusing unsafe direct motion."
             )
-        except PathPlanningError as exc:
-            if dynamic_obstacles:
-                try:
-                    self.path_planner.plan(start_pose, goal_pose, z=self.walk_plane_z)
-                except PathPlanningError:
-                    pass
-                else:
-                    now = time.monotonic()
-                    if now - self._dynamic_path_wait_log.get(agent_id, 0.0) >= 2.0:
-                        self._dynamic_path_wait_log[agent_id] = now
-                        self.get_logger().warning(
-                            f"{agent_id} voxel route is temporarily blocked by the robot; "
-                            "waiting for a safe replan."
-                        )
-                    return None
-            self.get_logger().error(f"{agent_id} voxel path planning failed; motion rejected: {exc}")
             return None
-        except Exception as exc:
-            self.get_logger().error(f"{agent_id} voxel planner error; motion rejected: {exc}")
-            return None
-        if not points:
-            self.get_logger().error(f"{agent_id} voxel planner returned an empty path; motion rejected.")
-            return None
-        self.get_logger().info(
-            f"{agent_id} voxel path: start={start_pose[:3]}, goal={goal_pose[:3]}, "
-            f"points={len(points)}, dynamic_obstacles={len(dynamic_obstacles)}"
+        return self.route_provider.plan(
+            RouteRequest(
+                agent_id=agent_id,
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+            )
         )
-        return points
 
     def _advance_state_machine(self):
         if not self._bootstrapped:
@@ -1804,6 +2134,7 @@ class ToiletDirectorNode(Node):
                     velocity=state.velocity,
                     orientation=state.activity_yaw,
                     path_points_override=activity_path,
+                    intent_phase=state.activity_phase,
                 ):
                     continue
                 self._release_portal(state, "reached indoor entry staging")
@@ -1834,6 +2165,7 @@ class ToiletDirectorNode(Node):
                     goal_pose=target_pose,
                     velocity=state.velocity,
                     orientation=target_yaw,
+                    intent_phase="WALK_TO_URINAL",
                 ):
                     continue
                 state.current_phase = "WALK_TO_URINAL"
@@ -1852,34 +2184,61 @@ class ToiletDirectorNode(Node):
                 continue
 
             if state.current_phase == "WALK_TO_URINAL":
-                state.current_phase = "USING_URINAL"
-                service_duration = (
-                    min_service if min_service >= max_service else self._rng.uniform(min_service, max_service)
-                )
-                state.service_deadline = now + service_duration
-                self.get_logger().info(
-                    f"{state.agent_id} started using {state.resource_id} for ~{service_duration:.1f}s"
-                )
+                if self.motion_backend_name == "hunav":
+                    state.current_phase = "FINAL_ALIGN_URINAL"
+                    state.final_alignment_started_at = 0.0
+                    self.get_logger().info(
+                        f"{state.agent_id} reached {state.resource_id}; waiting for final yaw alignment."
+                    )
+                    continue
+                self._begin_urinal_service(state, now, min_service, max_service)
+                continue
+
+            if state.current_phase == "FINAL_ALIGN_URINAL":
+                if not self._urinal_final_alignment_complete(state, now):
+                    continue
+                if not self._send_move(
+                    agent_id=state.agent_id,
+                    goal_pose=state.current_pose,
+                    velocity=0.0,
+                    orientation=state.target_yaw,
+                    stop=True,
+                    intent_phase="USING_URINAL",
+                ):
+                    continue
+                self._begin_urinal_service(state, now, min_service, max_service)
                 continue
 
             if state.current_phase == "USING_URINAL":
                 exit_pose = list(state.exit_pose or state.current_pose)
                 exit_yaw = float(state.exit_yaw)
-                staging_path = self._exit_staging_path(state)
-                if staging_path is None:
+                use_exit_portal = self._uses_portal_controller()
+                move_target = self._portal_staging_pose() if use_exit_portal else exit_pose
+                move_path = (
+                    self._exit_staging_path(state)
+                    if use_exit_portal
+                    else self._path_points_for_move(
+                        agent_id=state.agent_id,
+                        start_pose=state.current_pose,
+                        goal_pose=exit_pose,
+                    )
+                )
+                if move_path is None:
                     continue
+                next_phase = "WALK_TO_EXIT_STAGING" if use_exit_portal else "EXITING"
                 if not self._send_move(
                     agent_id=state.agent_id,
-                    goal_pose=self.portal["inside_staging"] if self.portal is not None else exit_pose,
+                    goal_pose=move_target,
                     velocity=state.velocity,
-                    orientation=self._portal_exit_yaw() if self.portal is not None else exit_yaw,
-                    path_points_override=staging_path,
+                    orientation=self._portal_exit_yaw() if use_exit_portal else exit_yaw,
+                    path_points_override=move_path,
+                    intent_phase=next_phase,
                 ):
                     continue
                 promoted = self.resources.release(state.agent_id, state.resource_id)
-                state.current_phase = "WALK_TO_EXIT_STAGING" if self.portal is not None else "EXITING"
-                state.target_pose = list(self.portal["inside_staging"]) if self.portal is not None else exit_pose
-                state.target_yaw = self._portal_exit_yaw() if self.portal is not None else exit_yaw
+                state.current_phase = next_phase
+                state.target_pose = move_target
+                state.target_yaw = self._portal_exit_yaw() if use_exit_portal else exit_yaw
                 state.reached_deadline = self._estimate_arrival_deadline(
                     state.current_pose,
                     state.target_pose,
@@ -1889,7 +2248,9 @@ class ToiletDirectorNode(Node):
                 state.aligned_at_target = False
                 state.target_reached = False
                 self.get_logger().info(
-                    f"{state.agent_id} leaving {state.resource_id} for exit staging; next queued={promoted}"
+                    f"{state.agent_id} leaving {state.resource_id} for "
+                    f"{'exit staging' if use_exit_portal else 'direct walkable-map exit'}; "
+                    f"next queued={promoted}"
                 )
                 continue
 
@@ -1902,10 +2263,11 @@ class ToiletDirectorNode(Node):
                 if not self._send_move(
                     agent_id=state.agent_id,
                     goal_pose=exit_pose,
-                    velocity=min(state.velocity, self.portal_crossing_velocity_mps),
+                    velocity=self._portal_motion_velocity(state),
                     orientation=exit_yaw,
                     path_points_override=self._exiting_portal_path(state),
                     constrain_to_path=True,
+                    intent_phase="EXITING",
                 ):
                     self._release_portal(state, "exit crossing command rejected")
                     continue
@@ -1944,6 +2306,41 @@ class ToiletDirectorNode(Node):
         anchor = time.monotonic() if now is None else float(now)
         return anchor + max(1.0, _planar_distance(start_pose, target_pose) / max(float(velocity), 1e-3) + 1.0)
 
+    def _begin_urinal_service(
+        self,
+        state: RuntimeAgent,
+        now: float,
+        min_service: float,
+        max_service: float,
+    ) -> None:
+        state.current_phase = "USING_URINAL"
+        service_duration = (
+            min_service if min_service >= max_service else self._rng.uniform(min_service, max_service)
+        )
+        state.service_deadline = now + service_duration
+        self.get_logger().info(
+            f"{state.agent_id} started using {state.resource_id} for ~{service_duration:.1f}s"
+        )
+
+    def _urinal_final_alignment_complete(self, state: RuntimeAgent, now: float) -> bool:
+        if not self._has_live_pose(state, now):
+            return False
+        yaw = state.current_yaw
+        if yaw is None or not math.isfinite(float(yaw)):
+            return False
+        yaw_error = math.atan2(
+            math.sin(float(state.target_yaw) - float(yaw)),
+            math.cos(float(state.target_yaw) - float(yaw)),
+        )
+        stationary = float(state.current_speed_mps) <= self.urinal_final_alignment_max_speed_mps
+        if abs(yaw_error) > self.urinal_final_yaw_tolerance_rad or not stationary:
+            state.final_alignment_started_at = 0.0
+            return False
+        if state.final_alignment_started_at <= 0.0:
+            state.final_alignment_started_at = now
+            return False
+        return (now - state.final_alignment_started_at) >= self.urinal_final_alignment_stable_sec
+
     def _has_live_pose(self, state: RuntimeAgent, now: float) -> bool:
         return state.last_pose_update > 0.0 and (now - state.last_pose_update) <= self.pose_stale_sec
 
@@ -1959,20 +2356,46 @@ class ToiletDirectorNode(Node):
             threshold = float(self.portal_staging_arrival_tolerance_m)
         else:
             threshold = float(self.arrival_tolerance_m)
+        arrival_source = "geometric tolerance"
         if self._has_live_pose(state, now):
             distance = _planar_distance(state.current_pose, state.target_pose)
             portal_entry_complete = (
                 state.current_phase == "WALK_TO_ENTRY_CLEARANCE"
                 and self.portal is not None
-                and portal_inside_plane_reached(
-                    current_pose=state.current_pose,
-                    inside_pose=self.portal["inside"],
-                    staging_pose=self.portal["inside_staging"],
-                    lateral_tolerance_m=self.portal["release_tolerance_m"],
+                and (
+                    self.portal["corridor"].cleared(
+                        state.current_pose,
+                        "entering",
+                        lateral_margin_m=self.portal["release_tolerance_m"],
+                    )
+                    if self.motion_backend_name == "hunav"
+                    else portal_inside_plane_reached(
+                        current_pose=state.current_pose,
+                        inside_pose=self.portal["inside"],
+                        staging_pose=self.portal["inside_staging"],
+                        lateral_tolerance_m=self.portal["release_tolerance_m"],
+                    )
                 )
             )
-            if distance > threshold and not portal_entry_complete:
+            backend_settled = bool(
+                self.motion_backend.is_goal_settled(
+                    state.agent_id,
+                    state.current_pose,
+                    state.target_pose,
+                )
+            )
+            requires_backend_settlement = (
+                self.motion_backend_name == "hunav"
+                and state.current_phase == "WALK_TO_URINAL"
+            )
+            if requires_backend_settlement and not backend_settled:
                 return False
+            if distance > threshold and not portal_entry_complete and not backend_settled:
+                return False
+            if backend_settled and distance > threshold:
+                arrival_source = "motion-backend settled handshake"
+            elif portal_entry_complete and distance > threshold:
+                arrival_source = "portal inside-plane crossing"
             state.target_reached = True
         else:
             if not self.allow_eta_fallback:
@@ -1991,37 +2414,31 @@ class ToiletDirectorNode(Node):
         align_pose = list(state.current_pose)
         self.get_logger().info(
             f"{state.agent_id} aligned at {state.current_phase}: pose={align_pose}, target={state.target_pose}, "
-            f"yaw={state.target_yaw:.3f}"
+            f"yaw={state.target_yaw:.3f}, source={arrival_source}"
         )
         return True
 
     def _people_cb(self, msg):
         try:
-            people = getattr(msg, "people", None) or getattr(msg, "pedestrians", None)
-            if not people:
-                return
             observed_at = time.monotonic()
-            for person in people:
-                reliability = getattr(person, "reliability", 1.0)
-                if reliability is not None and float(reliability) <= 0.0:
-                    continue
-                identifier = getattr(person, "stage_prefix", None) or getattr(person, "name", None) or getattr(
-                    person, "id", None
-                )
-                state = self._lookup_runtime_agent(identifier)
+            for observation in observations_from_message(msg, observed_at=observed_at):
+                state = self._lookup_runtime_agent(observation.identifier)
                 if state is None:
                     continue
-                pose_field = getattr(person, "pose", None) or getattr(person, "position", None)
-                xyz = self._extract_xyz_from_field(pose_field)
-                if xyz is None:
-                    continue
+                xyz = list(observation.position)
                 if not state.activated:
                     if state.activation_requested and state.activation_pose_applied:
                         self._confirm_activation_pose(state, xyz, observed_at)
                     continue
                 if not self._accept_live_pose_update(state, xyz, observed_at):
                     continue
-                self._apply_guard_feedback(state, person, observed_at)
+                self._apply_guard_feedback(state, observation.metadata, observed_at)
+                state.current_yaw = self._metadata_yaw(observation.metadata)
+                if observation.velocity is not None:
+                    state.current_speed_mps = math.hypot(
+                        float(observation.velocity[0]),
+                        float(observation.velocity[1]),
+                    )
                 if state.portal_direction is not None:
                     observation = classify_motion_observation(
                         previous_pose=state.portal_last_pose,
@@ -2057,6 +2474,16 @@ class ToiletDirectorNode(Node):
         except Exception as exc:
             self.get_logger().debug(f"Failed to process pedestrian pose update: {exc}")
 
+    @staticmethod
+    def _metadata_yaw(metadata) -> float | None:
+        if str(metadata.get("yaw_valid", "false")).lower() != "true":
+            return None
+        try:
+            yaw = float(metadata["yaw_rad"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return yaw if math.isfinite(yaw) else None
+
     def _confirm_activation_pose(
         self,
         state: RuntimeAgent,
@@ -2090,10 +2517,7 @@ class ToiletDirectorNode(Node):
             f"{self.activation_settle_sec:.2f}s."
         )
 
-    def _apply_guard_feedback(self, state: RuntimeAgent, person, observed_at: float) -> None:
-        names = list(getattr(person, "tagnames", []) or [])
-        values = list(getattr(person, "tags", []) or [])
-        metadata = {str(name): str(value) for name, value in zip(names, values)}
+    def _apply_guard_feedback(self, state: RuntimeAgent, metadata, observed_at: float) -> None:
         blocked = metadata.get("guard_blocked", "false").lower() == "true"
         if not blocked:
             if state.guard_blocked:
@@ -2169,31 +2593,28 @@ class ToiletDirectorNode(Node):
                 return candidate
         return None
 
-    @staticmethod
-    def _extract_xyz_from_field(field) -> list[float] | None:
-        if field is None:
-            return None
-        if hasattr(field, "x") and hasattr(field, "y") and hasattr(field, "z"):
-            return [float(field.x), float(field.y), float(field.z)]
-        inner = getattr(field, "position", None)
-        if inner is not None and hasattr(inner, "x") and hasattr(inner, "y") and hasattr(inner, "z"):
-            return [float(inner.x), float(inner.y), float(inner.z)]
-        pose = getattr(field, "pose", None)
-        if pose is not None:
-            inner_pose = getattr(pose, "position", None)
-            if inner_pose is not None and hasattr(inner_pose, "x") and hasattr(inner_pose, "y") and hasattr(
-                inner_pose, "z"
-            ):
-                return [float(inner_pose.x), float(inner_pose.y), float(inner_pose.z)]
-        return None
-
-
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--semantics", default=_default_config_path("toilet_semantics.yaml"))
     parser.add_argument("--benchmark", default=_default_config_path("toilet_benchmark.yaml"))
     parser.add_argument("--spawn-service", default="/isaac/spawn_pedestrian")
     parser.add_argument("--move-service", default="/isaac/move_pedestrians")
+    parser.add_argument(
+        "--motion-backend",
+        choices=("isaac_people", "hunav"),
+        default="",
+        help="Override motion_backend.type from the benchmark YAML.",
+    )
+    parser.add_argument(
+        "--hunav-namespace",
+        default="",
+        help="Namespace containing HuNav compute_agents/reset_agents services.",
+    )
+    parser.add_argument(
+        "--no-start-hunav-manager",
+        action="store_true",
+        help="Connect to an already-running HuNav manager instead of starting one.",
+    )
     parser.add_argument("--initial-agents", type=int, default=1)
     parser.add_argument("--character-name", default="original_female_adult_business_02")
     parser.add_argument("--character-pool", default="")
@@ -2217,27 +2638,56 @@ def main(args=None):
         if name.strip()
     ]
 
+    benchmark = _load_yaml(parsed.benchmark)
+    motion_cfg = dict(benchmark.get("motion_backend", {}) or {})
+    motion_backend_name = str(
+        parsed.motion_backend or motion_cfg.get("type", "isaac_people")
+    ).strip().lower()
+    hunav_namespace = str(
+        parsed.hunav_namespace
+        or motion_cfg.get("hunav_namespace", "/toilet_hunav_takeover")
+    ).strip()
+    if hunav_namespace and not hunav_namespace.startswith("/"):
+        hunav_namespace = "/" + hunav_namespace
+    manager = None
+    if motion_backend_name == "hunav" and not parsed.no_start_hunav_manager:
+        from .hunav_phase0_smoke import ManagedHuNavProcess
+
+        log_dir = Path("/tmp/toilet_hunav_takeover")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        manager = ManagedHuNavProcess(
+            hunav_namespace,
+            log_dir / f"hunav_manager_{os.getpid()}.log",
+        )
+        manager.start()
+
     rclpy.init(args=ros_args)
-    node = ToiletDirectorNode(
-        semantics_path=parsed.semantics,
-        benchmark_path=parsed.benchmark,
-        spawn_service=parsed.spawn_service,
-        move_service=parsed.move_service,
-        initial_agents=parsed.initial_agents,
-        character_name=parsed.character_name,
-        character_pool=character_pool or None,
-        profile_name=parsed.profile,
-        target_resource_ids=parsed.target_resource,
-        status_topic=parsed.status_topic,
-    )
+    node = None
     try:
+        node = ToiletDirectorNode(
+            semantics_path=parsed.semantics,
+            benchmark_path=parsed.benchmark,
+            spawn_service=parsed.spawn_service,
+            move_service=parsed.move_service,
+            initial_agents=parsed.initial_agents,
+            character_name=parsed.character_name,
+            character_pool=character_pool or None,
+            profile_name=parsed.profile,
+            target_resource_ids=parsed.target_resource,
+            status_topic=parsed.status_topic,
+            motion_backend_name=motion_backend_name,
+            hunav_namespace=hunav_namespace,
+        )
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        if manager is not None:
+            manager.stop()
 
 
 if __name__ == "__main__":

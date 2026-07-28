@@ -3,6 +3,7 @@ import unittest
 
 from toilet_benchmark.semantic_rules import (
     PlacementRule,
+    PortalCorridor,
     QueueRule,
     build_queue_poses,
     classify_motion_observation,
@@ -13,6 +14,47 @@ from toilet_benchmark.semantic_rules import (
 
 
 class TestSemanticRules(unittest.TestCase):
+    def setUp(self):
+        self.portal = PortalCorridor(
+            outside=(-3.8, -0.9, 0.0),
+            inside=(-2.24, -0.9, 0.0),
+            half_width_m=0.45,
+            clearance_m=0.40,
+        )
+
+    def test_portal_corridor_derives_straight_entry_goal_beyond_inside_plane(self):
+        goal = self.portal.traversal_goal("entering")
+
+        self.assertAlmostEqual(goal[0], -1.84)
+        self.assertAlmostEqual(goal[1], -0.9)
+        self.assertAlmostEqual(self.portal.yaw, 0.0)
+
+    def test_portal_corridor_separates_clear_plane_from_locomotion_stop_goal(self):
+        goal = self.portal.traversal_goal("entering", overshoot_m=0.35)
+
+        self.assertAlmostEqual(goal[0], -1.49)
+        self.assertAlmostEqual(goal[1], -0.9)
+
+    def test_portal_corridor_does_not_complete_at_center_or_inside_point(self):
+        self.assertFalse(self.portal.cleared([-3.0, -0.9, 0.0], "entering"))
+        self.assertFalse(self.portal.cleared([-2.24, -0.9, 0.0], "entering"))
+
+    def test_portal_corridor_completes_after_clear_plane(self):
+        self.assertTrue(self.portal.cleared([-1.83, -0.9, 0.0], "entering"))
+        self.assertTrue(self.portal.cleared([-4.21, -0.9, 0.0], "exiting"))
+
+    def test_portal_corridor_rejects_pose_beyond_plane_but_outside_door_width(self):
+        self.assertFalse(self.portal.cleared([-1.80, -0.30, 0.0], "entering"))
+
+    def test_portal_corridor_validates_geometry(self):
+        with self.assertRaises(ValueError):
+            PortalCorridor(
+                outside=(0.0, 0.0, 0.0),
+                inside=(0.0, 0.0, 0.0),
+                half_width_m=0.5,
+                clearance_m=0.2,
+            )
+
     def test_portal_entry_accepts_root_at_indoor_plane_before_short_turn(self):
         self.assertTrue(
             portal_inside_plane_reached(

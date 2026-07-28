@@ -27,6 +27,9 @@ install(
   PROGRAMS
     scripts/toilet_director_node
     scripts/manual_collection_node
+    scripts/hunav_phase0_smoke
+    scripts/hunav_isaac_mirror
+    scripts/walkable_map_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 
