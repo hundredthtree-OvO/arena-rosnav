@@ -201,6 +201,25 @@ class TestVoxelPathPlanner(unittest.TestCase):
         self.assertNotIn((4, 2), cells)
         self.assertTrue(any(cell[1] != 2 for cell in cells[1:-1]))
 
+    def test_any_angle_search_connects_visible_non_neighbor_cells(self):
+        path = self._write_map([], grid_bounds=[0, 8, 0, 5])
+        planner = VoxelPathPlanner.from_file(
+            VoxelPathPlannerConfig(
+                map_path=path,
+                agent_radius_m=0.0,
+                simplify=False,
+                any_angle=True,
+            )
+        )
+
+        points = planner.plan(
+            [0.5, 0.5, 0.0],
+            [8.5, 5.5, 0.0],
+            z=0.0,
+        )
+
+        self.assertEqual(points, [[8.5, 5.5, 0.0]])
+
     def test_exact_goal_append_does_not_cross_dynamic_obstacle(self):
         path = self._write_map([], grid_bounds=[0, 8, 0, 4])
         planner = VoxelPathPlanner.from_file(

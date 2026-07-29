@@ -93,6 +93,27 @@ class TestRobotProximityReactionController(unittest.TestCase):
             second.update(agent=_agent(), robot=_robot(0.5), now=1.0).reaction,
         )
 
+    def test_geometry_override_latches_yielding_for_current_encounter(self):
+        controller = RobotProximityReactionController(
+            {
+                "mode": "fixed",
+                "reaction": "regular",
+                "trigger": {"distance_m": 1.0},
+            },
+            seed=42,
+        )
+        controller.update(agent=_agent(), robot=_robot(0.7), now=1.0)
+
+        controller.force_reaction("yielding")
+        decision = controller.update(
+            agent=_agent(),
+            robot=_robot(0.6),
+            now=2.0,
+        )
+
+        self.assertEqual(decision.reaction, "yielding")
+        self.assertEqual(decision.speed_scale, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

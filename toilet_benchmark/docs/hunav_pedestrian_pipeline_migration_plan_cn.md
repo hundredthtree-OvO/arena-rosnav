@@ -286,6 +286,41 @@ director:
 当前状态（2026-07-27）：静态地图导出与只读校验已完成，HuNav takeover 已切换到
 walkable-map global router。
 
+当前优先工作（2026-07-28）：先收敛单行人的静态穿模与 regular 绕行，再继续多人共享
+world state。实现顺序固定为：
+
+1. 限制 route lookahead 投影窗口与单 tick 进度增量，禁止偏离后吸附到后续折线段。
+2. 对 HuNav 输出执行 walkable configuration-space 扫掠检查；该层只裁剪非法静态穿越，
+   不重新启用旧 voxel guard。
+3. regular 遇到阻塞机器人时生成临时侧向绕行目标，并在一次 encounter 内锁定绕行侧；
+   绕过后恢复原 route lookahead。
+4. hard safety 继续作为最后防线，不能替代第 3 步的连续绕行决策。
+
+2026-07-28 现场日志复核后调整：
+
+- 删除“当前位置到旧 lookahead 的短程 REJOIN”。A* 路径合法不代表 HuNav 社会力输出会
+  严格跟踪 waypoint；原实现会与 hard safety 构成反复截停。
+- 正常跟踪改为沿全局折线回退查找当前可见的最远前向点，禁止 lookahead 直线切过拐角。
+- regular 绕行期间继续用实际位姿更新全局 route projection；侧向点完成后，从实际位置
+  重新 A* 到最终语义目标，旧 lookahead 不再被保留到行人身后。
+- HuNav 清空局部 goals 不再直接视作阶段完成；必须满足最终目标几何距离，否则重建全局
+  路线继续运动。
+- walkable A* 提高 preferred-clearance 代价，并恢复原本失效的近墙短段简化限制，避免
+  路线只满足最小 footprint 后贴着拐角通过。
+
+失败记录：不能把 walkable map 的密集占据单元中心直接写入 HuNav `closest_obs`。HuNav
+社会力会累加同一墙面上的多个采样，在窄门外形成错误的向后合力。静态地图当前只作为
+全局 route 和无主动推力的 swept-step hard safety；后续若需要静态局部势场，必须先提取
+稀疏边界线段或距离场梯度，不能复用原始占据中心。
+
+本阶段验收条件：
+
+- 实际位移很小时 route progress 不发生跨段跳跃。
+- 任一 external-motion step 不跨越 walkable map 的占据或膨胀边界。
+- 静止机器人阻挡名义路线时，regular 行人锁定一侧绕行，不先回头且不左右抖动。
+- 机器人驶离后恢复同一条全局 route，不生成穿墙捷径。
+- 小便池终端对齐、yielding freeze 和 Isaac AnimGraph 动画保持现有行为。
+
 - bridge 新增 `/isaac/export_walkable_map`，使用 Isaac Sim 4.5 官方
   `isaacsim.asset.gen.omap` 从 PhysX collision geometry 生成地图。
 - 导出期间排除 scene root 外的机器人、Characters 和 debug collision，输出 JSON、PGM、
@@ -335,6 +370,13 @@ walkable-map global router。
 3. 调用 `/compute_agents`。
 4. 将返回的 pose、velocity、yaw 写入 Isaac mirror。
 5. 发布统一 pedestrian state 供 director 和 recorder 使用。
+
+全局 route 当前由 clearance-aware Theta* 生成。每次阶段开始、freeze rebase、路线不可见
+或局部绕行耗尽时，允许从当前真实位置重新规划；重规划频率限制为最高 `1 Hz`。机器人当前
+位置和短时域预测位置只在这些事件发生时写入临时动态层，避免每个 HuNav tick 重跑全局路线。
+
+HuNav 输出之后只保留 hard safety。此前实验性的 `LocalVelocityCorridorSelector` 会在行人
+已经偏出走廊后拒绝所有无法一步返回阈值内的短步，并与绕行 waypoint 互相冲突，现已删除。
 
 约束：
 
@@ -492,8 +534,12 @@ stalled_agents: []
 
 1. 实现 USD 静态 prim 到 walkable map 的离线导出与可视化校验，覆盖门外入口、五个小便池 interaction region 和出口。
 2. 用新 map router 替换 HuNav takeover 当前收到的 voxel route，并记录 map hash、route 和 seed。
-3. 接入 Isaac PhysX shape sweep 作为静态短时域 hard safety，验证不会在合法 anchor 冻结。
-4. 单行人通过后，再实现共享 HuNav world state 与多行人 portal capacity。
+3. 单行人 live Isaac 验证动态 Theta*：机器人偏向原路线一侧时，应选择 clearance 更高的
+   替代路线；机器人移开后不应立即切回旧路线。
+4. 若 HuNav 局部反应仍无法稳定执行 Theta* route，再引入带时域碰撞预测的
+   velocity-obstacle/ORCA 层，而不是继续叠加 waypoint/corridor 裁剪器。
+5. 接入 Isaac PhysX shape sweep 作为静态短时域 hard safety，验证不会在合法 anchor 冻结。
+6. 单行人通过后，再实现共享 HuNav world state 与多行人 portal capacity。
 
 ## 8. 明确不做
 

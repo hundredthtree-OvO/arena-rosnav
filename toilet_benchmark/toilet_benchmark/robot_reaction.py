@@ -62,6 +62,11 @@ class RobotProximityReactionController:
         self._reaction = None
         self._release_since = 0.0
 
+    def force_reaction(self, reaction: str) -> None:
+        """Override and latch the current encounter after feasibility checks."""
+        self._reaction = self._validated_reaction(str(reaction).strip().lower())
+        self._release_since = 0.0
+
     def update(
         self,
         *,

@@ -1,6 +1,10 @@
 import unittest
 
-from toilet_benchmark.route_provider import RouteRequest, VoxelRouteProvider
+from toilet_benchmark.route_provider import (
+    RouteRequest,
+    VoxelRouteProvider,
+    WalkableMapRouteProvider,
+)
 from toilet_benchmark.voxel_path_planner import PathPlanningError
 
 
@@ -99,6 +103,28 @@ class TestVoxelRouteProvider(unittest.TestCase):
 
         self.assertIsNone(points)
         self.assertIn("no route", logger.error_messages[0])
+
+    def test_walkable_provider_passes_dynamic_robot_obstacles(self):
+        planner = _Planner([[[1.0, 2.0, 0.0]]])
+        planner.scene_fingerprint = "fingerprint"
+        logger = _Logger()
+        provider = WalkableMapRouteProvider(
+            planner=planner,
+            walk_plane_z=0.0,
+            dynamic_obstacles=lambda now: [(3.0, 4.0, 0.4)],
+            logger=logger,
+            clock=lambda: 10.0,
+        )
+
+        points = provider.plan(
+            RouteRequest("toilet_agent_01", [0.0, 0.0, 0.0], [1.0, 2.0, 0.0])
+        )
+
+        self.assertEqual(points, [[1.0, 2.0, 0.0]])
+        self.assertEqual(
+            planner.calls[0][2]["dynamic_obstacles"],
+            [(3.0, 4.0, 0.4)],
+        )
 
 
 if __name__ == "__main__":

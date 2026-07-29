@@ -427,6 +427,11 @@ class ToiletDirectorNode(Node):
             10,
         )
         self._setup_path_planner()
+        if (
+            self.motion_backend_name == "hunav"
+            and isinstance(self.path_planner, WalkableMapPlanner)
+        ):
+            self.motion_backend.set_walkable_planner(self.path_planner)
 
         self.get_logger().info(
             "Loaded toilet benchmark configs: "
@@ -568,6 +573,12 @@ class ToiletDirectorNode(Node):
                     max_segment_length_m=float(
                         planner_cfg.get("walkable_max_segment_length_m", 1.50)
                     ),
+                    constrained_segment_length_m=float(
+                        planner_cfg.get(
+                            "walkable_constrained_segment_length_m",
+                            0.40,
+                        )
+                    ),
                     preferred_clearance_m=float(
                         planner_cfg.get("walkable_preferred_clearance_m", 0.40)
                     ),
@@ -584,6 +595,7 @@ class ToiletDirectorNode(Node):
                 planner=planner,
                 walk_plane_z=self.walk_plane_z,
                 logger=self.get_logger(),
+                dynamic_obstacles=self._dynamic_obstacles,
             )
             if self.portal is not None:
                 portal_path = self._portal_entry_waypoints()

@@ -70,12 +70,15 @@ path_planner:
   walkable_max_expansions: 30000
   walkable_simplify: true
   walkable_max_segment_length_m: 1.50
-  walkable_preferred_clearance_m: 0.40
-  walkable_clearance_cost_weight: 3.0
+  # Near walls/corners, retain denser A* points instead of simplifying them
+  # into a long diagonal that merely clears the inflated footprint.
+  walkable_constrained_segment_length_m: 0.40
+  walkable_preferred_clearance_m: 0.55
+  walkable_clearance_cost_weight: 8.0
   walkable_turn_cost_weight: 0.25
-  # Keep A* deterministic. The robot is handled as an execution-time yield
-  # condition rather than a global replanning obstacle.
-  robot_obstacle_mode: static_route
+  # Global replans sample the current and short-horizon predicted robot
+  # footprint. Continuous robot motion remains a local-planner concern.
+  robot_obstacle_mode: dynamic_replan
   voxel_map_path: /home/stardust/resources/arena_ws/arena_assets/collision_configs/shenxinfu_841837.voxel.json.gz
   z_min: 0.05
   z_max: 1.2
@@ -110,13 +113,46 @@ motion_backend:
     robot_odom_topic: /odom
     state_timeout_sec: 0.5
     external_timeout_sec: 0.35
+    # Reject stale HuNav references after a freeze/rebase before they can
+    # become a visible teleport.
+    max_hunav_step_speed_factor: 2.0
+    max_hunav_step_min_m: 0.03
+    # Event-driven global replans are rate-limited; HuNav still runs at 10 Hz.
+    global_replan_min_interval_sec: 1.5
+    # Preserve the last safe lookahead through brief map/pose jitter rather
+    # than freezing on a single failed visibility check.
+    route_visibility_grace_sec: 0.5
+    # Reuse a nearby forward lookahead when replacing a global route so the
+    # local controller does not receive an abrupt heading reset.
+    route_splice_max_cross_track_m: 0.35
     agent_radius_m: 0.30
     # Keep HuNav's terminal condition tighter than the director's normal
     # tolerance. The backend separately reports its settled state.
     goal_radius_m: 0.12
     lookahead_distance_m: 0.80
+    # Reject projection onto a nearby but topologically later route segment.
+    lookahead_projection_window_m: 1.50
+    lookahead_progress_slack_m: 0.15
+    lookahead_max_cross_track_m: 0.80
+    # The one-shot regular-avoidance waypoint is consumed within this radius;
+    # it is separate from final semantic-goal arrival.
+    local_waypoint_tolerance_m: 0.22
     settled_arrival_tolerance_m: 0.35
+    # Position arrival starts terminal alignment; settlement is reported only
+    # after live Isaac yaw and speed remain within these limits.
+    terminal_align_yaw_tolerance_rad: 0.15
+    terminal_align_max_speed_mps: 0.05
+    terminal_align_stable_sec: 0.40
+    # Moving robots retain the conservative full-body envelope. A stationary
+    # robot uses a tighter envelope so visual free space is not rejected early.
     robot_radius_m: 0.45
+    stationary_robot_radius_m: 0.36
+    stationary_robot_linear_speed_threshold_mps: 0.05
+    stationary_robot_angular_speed_threshold_rps: 0.10
+    # Oriented body footprint used by social passing-corridor evaluation.
+    # The circular radii above remain the final conservative hard-safety layer.
+    robot_footprint_half_length_m: 0.36
+    robot_footprint_half_width_m: 0.27
     behavior:
       social_force_factor: 5.0
       goal_force_factor: 2.0
@@ -125,26 +161,64 @@ motion_backend:
     robot_proximity_reaction:
       enabled: true
       mode: fixed
-      reaction: yielding
+      reaction: regular
       trigger:
-        distance_m: 0.85
+        # Start social avoidance before the hard-contact envelope is reached.
+        distance_m: 1.10
         time_to_collision_sec: 1.5
         front_half_angle_deg: 180.0
       release:
-        distance_m: 0.50
+        distance_m: 1.25
         stable_sec: 0.8
       reactions:
         yielding:
           speed_scale: 0.0
+          weight: 0.55
         impatient:
           speed_scale: 1.35
+          weight: 0.05
         regular:
           speed_scale: 1.0
+          weight: 0.40
+    # Regular pedestrians choose one walkable side of a blocking robot and
+    # keep that side until the encounter is over.
+    regular_avoidance:
+      enabled: true
+      trigger_distance_m: 1.10
+      side_clearance_m: 0.10
+      forward_offset_m: 0.55
+      release_distance_m: 1.25
+      # Score the complete temporary corridor against the static map and a
+      # constant-velocity robot prediction before selecting a passing side.
+      prediction_horizon_sec: 1.50
+      sample_spacing_m: 0.10
+      min_dynamic_clearance_m: 0.01
+      # Keep the lateral part of HuNav's social response, but do not let the
+      # radial robot force turn a passing maneuver into a retreat.
+      suppress_backward_motion: true
+      # Weighted behavior remains active in open space. If both passing sides
+      # fail the same walkable-map test, latch yielding for this encounter.
+      geometry_override_enabled: true
+      narrow_space_fallback: yielding
+      # Do not cancel a latched passing corridor on one noisy prediction tick.
+      active_route_infeasible_confirm_ticks: 4
+      stall_timeout_sec: 2.0
+      stall_progress_epsilon_m: 0.03
+      # One local recovery is allowed before dynamic Theta* or yielding.
+      max_recovery_attempts: 1
     safety:
       enabled: true
       clearance_m: 0.01
       contact_epsilon_m: 0.0001
       max_iterations: 8
+      # When a static sweep is blocked, search bounded left/right directions
+      # and retain the candidate that advances toward the current route.
+      static_projection_enabled: true
+      static_projection_max_deflection_deg: 80.0
+      static_projection_angle_step_deg: 20.0
+      # A clipped near-zero step must not turn the character toward numerical
+      # left/right alternatives on every HuNav tick.
+      constrained_yaw_speed_threshold_mps: 0.12
     visualization:
       enabled: true
       frame_id: map

@@ -101,21 +101,33 @@ class VoxelRouteProvider:
 
 
 class WalkableMapRouteProvider:
-    """Plan deterministic static routes without dynamic local obstacles."""
+    """Plan walkable-map routes with an event-sampled dynamic robot layer."""
 
-    def __init__(self, *, planner, walk_plane_z: float, logger):
+    def __init__(
+        self,
+        *,
+        planner,
+        walk_plane_z: float,
+        logger,
+        dynamic_obstacles: Callable[[float], list[DynamicObstacle]] = lambda _now: [],
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._planner = planner
         self._walk_plane_z = float(walk_plane_z)
         self._logger = logger
+        self._dynamic_obstacles = dynamic_obstacles
+        self._clock = clock
 
     def plan(self, request: RouteRequest) -> list[list[float]] | None:
         start_pose = list(request.start_pose)
         goal_pose = list(request.goal_pose)
+        obstacles = self._dynamic_obstacles(self._clock())
         try:
             points = self._planner.plan(
                 start_pose,
                 goal_pose,
                 z=self._walk_plane_z,
+                dynamic_obstacles=obstacles,
             )
         except PathPlanningError as exc:
             reason = str(exc).replace("voxel", "walkable-map")
@@ -136,6 +148,7 @@ class WalkableMapRouteProvider:
         self._logger.info(
             f"{request.agent_id} walkable-map route: start={start_pose[:3]}, "
             f"goal={goal_pose[:3]}, points={len(points)}, "
+            f"dynamic_obstacles={len(obstacles)}, "
             f"fingerprint={self._planner.scene_fingerprint[:12]}, "
             f"route={[[round(float(value), 3) for value in point] for point in points]}"
         )

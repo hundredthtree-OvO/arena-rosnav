@@ -1,7 +1,11 @@
+import time
 import unittest
+
+from hunav_msgs.msg import Agent
 
 from toilet_benchmark.hunav_motion_backend import HuNavMotionBackend
 from toilet_benchmark.motion_backend import MotionCommand
+from toilet_benchmark.polyline_lookahead import PolylineLookaheadTracker
 from toilet_benchmark.robot_reaction import (
     ReactionDecision,
     RobotProximityReactionController,
@@ -26,13 +30,46 @@ class _Logger:
     def error(self, message):
         pass
 
+    def warning(self, message):
+        pass
 
-def _walking_command(agent_id="toilet_agent_01"):
+
+class _WalkablePlanner:
+    def __init__(self, *, segment_free=False, clearance=None, route_filter=None):
+        self.segment_free = segment_free
+        self.clearance = clearance
+        self.route_filter = route_filter
+        self.plan_calls = []
+
+    def polyline_is_free(self, points):
+        if self.route_filter is not None:
+            return bool(self.route_filter(points))
+        return self.segment_free
+
+    def plan(self, start, goal, *, z=0.0, dynamic_obstacles=None):
+        self.plan_calls.append((start, goal, z, dynamic_obstacles))
+        return [[0.25, 0.35, z], [goal[0], goal[1], z]]
+
+    def clearance_at(self, point):
+        if self.clearance is not None:
+            return float(self.clearance(point))
+        return 1.0
+
+    def clip_step(self, start, goal):
+        if self.segment_free:
+            return goal, 1.0, False
+        return start, 0.0, True
+
+    resolution = 0.1
+
+
+def _walking_command(agent_id="toilet_agent_01", *, orientation=0.0):
     return MotionCommand(
         agent_id=agent_id,
         goal_pose=[1.0, 0.0, 0.0],
         path_points=[[0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
         velocity=0.6,
+        orientation=orientation,
     )
 
 
@@ -47,17 +84,76 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._active_generation = 0
         self.backend._settled_generation = 0
         self.backend._settled_agent_id = ""
+        self.backend._terminal_align_active = False
+        self.backend._terminal_align_stable_since = 0.0
+        self.backend._terminal_align_yaw_tolerance_rad = 0.15
+        self.backend._terminal_align_max_speed_mps = 0.05
+        self.backend._terminal_align_stable_sec = 0.4
         self.backend._settled_arrival_tolerance_m = 0.35
         self.backend._lookahead_distance_m = 0.80
+        self.backend._lookahead_projection_window_m = 1.50
+        self.backend._lookahead_progress_slack_m = 0.15
+        self.backend._lookahead_max_cross_track_m = 0.80
         self.backend._lookahead_tracker = None
         self.backend._lookahead_target = None
+        self.backend._last_visible_route_target = None
+        self.backend._route_visibility_lost_since = 0.0
+        self.backend._route_visibility_grace_sec = 0.5
+        self.backend._route_splice_max_cross_track_m = 0.35
+        self.backend._walkable_planner = None
+        self.backend._constrained_yaw_speed_threshold_mps = 0.12
+        self.backend._static_projection_enabled = True
+        self.backend._static_projection_max_deflection_deg = 80.0
+        self.backend._static_projection_angle_step_deg = 20.0
+        self.backend._regular_avoidance_enabled = True
+        self.backend._avoidance_trigger_distance_m = 1.40
+        self.backend._avoidance_side_clearance_m = 0.18
+        self.backend._avoidance_forward_offset_m = 0.30
+        self.backend._avoidance_release_distance_m = 1.60
+        self.backend._avoidance_prediction_horizon_sec = 1.50
+        self.backend._avoidance_sample_spacing_m = 0.10
+        self.backend._avoidance_min_dynamic_clearance_m = 0.01
+        self.backend._avoidance_suppress_backward_motion = True
+        self.backend._avoidance_geometry_override_enabled = True
+        self.backend._avoidance_narrow_space_fallback = "yielding"
+        self.backend._avoidance_active_route_infeasible_confirm_ticks = 4
+        self.backend._avoidance_active_route_infeasible_ticks = 0
+        self.backend._avoidance_stall_timeout_sec = 2.0
+        self.backend._avoidance_stall_progress_epsilon_m = 0.03
+        self.backend._avoidance_max_recovery_attempts = 1
+        self.backend._avoidance_recovery_attempts = 0
+        self.backend._avoidance_side = 0
+        self.backend._avoidance_target = None
+        self.backend._avoidance_encounter_active = False
+        self.backend._last_avoidance_candidates = ()
+        self.backend._local_route_mode = None
+        self.backend._local_route_points = []
+        self.backend._local_route_index = 0
+        self.backend._local_route_best_distance = None
+        self.backend._local_route_last_progress_at = 0.0
+        self.backend._avoidance_failed_side = 0
+        self.backend._local_waypoint_tolerance_m = 0.22
+        self.backend._static_hold_yaw = None
+        self.backend._static_clear_ticks = 0
+        self.backend._last_global_replan_at = 0.0
+        self.backend._global_replan_min_interval_sec = 1.0
+        self.backend._pending_rebase_replan = False
         self.backend._yield_hold_yaw = None
         self.backend._last_external_motion_mode = 0
         self.backend._agent_radius = 0.30
+        self.backend._robot_radius = 0.45
+        self.backend._stationary_robot_radius = 0.36
+        self.backend._stationary_robot_linear_speed_threshold_mps = 0.05
+        self.backend._stationary_robot_angular_speed_threshold_rps = 0.10
+        self.backend._robot_footprint_half_length_m = 0.36
+        self.backend._robot_footprint_half_width_m = 0.27
         self.backend._goal_radius = 0.12
         self.backend._behavior = {}
         self.backend._external_timeout_sec = 0.35
+        self.backend._max_hunav_step_speed_factor = 2.0
+        self.backend._max_hunav_step_min_m = 0.03
         self.backend._external_future = None
+        self.backend._actual = {}
         self.backend._reaction_controller = RobotProximityReactionController(
             {"enabled": False},
             seed=42,
@@ -70,6 +166,9 @@ class TestHuNavMotionBackend(unittest.TestCase):
             ttc_sec=None,
         )
         self.backend._route_publisher = None
+        self.backend._robot = None
+        self.backend._route_hold_active = False
+        self.backend._route_hold_yaw = None
 
     def test_walking_command_is_accepted_without_forwarding_isaac_path(self):
         callback_results = []
@@ -202,6 +301,833 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._record_motion_mode(1, actual, target_yaw=1.2)
 
         self.assertEqual(self.backend._last_external_motion_mode, 1)
+
+    def test_terminal_alignment_does_not_settle_before_yaw_converges(self):
+        self.backend.send(_walking_command(orientation=3.14159))
+        self.backend._begin_terminal_alignment()
+        actual = {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+        }
+        self.backend._actual["toilet_agent_01"] = actual
+
+        self.backend._tick_terminal_alignment(actual)
+
+        self.assertEqual(self.backend._settled_generation, 0)
+        self.assertTrue(self.backend._terminal_align_active)
+        self.assertEqual(
+            self.backend._isaac.commands[-1].external_motion_mode,
+            2,
+        )
+
+    def test_terminal_alignment_retries_after_busy_external_request(self):
+        self.backend.send(_walking_command(orientation=3.14159))
+        self.backend._begin_terminal_alignment()
+        busy = __import__("concurrent.futures").futures.Future()
+        self.backend._external_future = busy
+        actual = {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+        }
+        self.backend._actual["toilet_agent_01"] = actual
+
+        self.backend._tick_terminal_alignment(actual)
+        self.assertEqual(self.backend._isaac.commands, [])
+        self.assertTrue(self.backend._terminal_align_active)
+
+        busy.set_result(type("Result", (), {"ret": True})())
+        self.backend._external_future = None
+        self.backend._tick_terminal_alignment(actual)
+
+        self.assertEqual(len(self.backend._isaac.commands), 1)
+        self.assertEqual(
+            self.backend._isaac.commands[0].external_motion_mode,
+            2,
+        )
+
+    def test_terminal_alignment_settles_only_after_stable_live_pose(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._begin_terminal_alignment()
+        self.backend._terminal_align_stable_since = (
+            time.monotonic() - self.backend._terminal_align_stable_sec - 0.1
+        )
+        actual = {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+        }
+        self.backend._actual["toilet_agent_01"] = actual
+
+        self.backend._tick_terminal_alignment(actual)
+
+        self.assertEqual(
+            self.backend._settled_generation,
+            self.backend._generation,
+        )
+        self.assertFalse(self.backend._terminal_align_active)
+
+    def test_regular_avoidance_latches_one_side_of_blocking_robot(self):
+        self.backend.send(_walking_command())
+        self.backend._reaction_decision = ReactionDecision(
+            state="REGULAR_TO_ROBOT",
+            reaction="regular",
+            speed_scale=1.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "received_at": __import__("time").monotonic(),
+        }
+        nominal = type(
+            "Target",
+            (),
+            {"x": 1.0, "y": 0.0},
+        )()
+
+        first = self.backend._start_regular_avoidance((0.0, 0.0), nominal)
+        second = self.backend._active_local_route_goal((0.1, 0.0))
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first[1], 0.0)
+        self.assertEqual(self.backend._local_route_mode, "AVOIDANCE")
+        self.assertEqual(len(self.backend._local_route_points), 2)
+
+    def test_regular_avoidance_prefers_wider_static_corridor(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            clearance=lambda point: 1.0 if point[1] > 0.0 else 0.20,
+        )
+        self.backend._reaction_decision = ReactionDecision(
+            state="REGULAR_TO_ROBOT",
+            reaction="regular",
+            speed_scale=1.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        self.backend._start_regular_avoidance(
+            (0.0, 0.0),
+            type("Target", (), {"x": 1.0, "y": 0.0})(),
+        )
+
+        self.assertEqual(self.backend._avoidance_side, 1)
+        self.assertGreater(self.backend._avoidance_target[1], 0.0)
+
+    def test_regular_avoidance_uses_predicted_robot_motion(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        self.backend._reaction_decision = ReactionDecision(
+            state="REGULAR_TO_ROBOT",
+            reaction="regular",
+            speed_scale=1.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.40,
+            "received_at": time.monotonic(),
+        }
+
+        self.backend._start_regular_avoidance(
+            (0.0, 0.0),
+            type("Target", (), {"x": 1.0, "y": 0.0})(),
+        )
+
+        self.assertEqual(self.backend._avoidance_side, -1)
+        self.assertLess(self.backend._avoidance_target[1], 0.0)
+
+    def test_regular_avoidance_rejects_blocked_side_corridor(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            route_filter=lambda points: not any(
+                float(point[1]) > 0.05 for point in points[1:]
+            ),
+        )
+        self.backend._reaction_decision = ReactionDecision(
+            state="REGULAR_TO_ROBOT",
+            reaction="regular",
+            speed_scale=1.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        self.backend._start_regular_avoidance(
+            (0.0, 0.0),
+            type("Target", (), {"x": 1.0, "y": 0.0})(),
+        )
+
+        self.assertEqual(self.backend._avoidance_side, -1)
+        rejected = [
+            item
+            for item in self.backend._last_avoidance_candidates
+            if item.side == 1
+        ]
+        self.assertEqual(rejected[0].reason, "static corridor blocked")
+
+    def test_regular_avoidance_releases_after_robot_is_passed(self):
+        self.backend.send(_walking_command())
+        self.backend._reaction_decision = ReactionDecision(
+            state="REGULAR_TO_ROBOT",
+            reaction="regular",
+            speed_scale=1.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "received_at": __import__("time").monotonic(),
+        }
+        nominal = type("Target", (), {"x": 1.0, "y": 0.0})()
+        self.backend._start_regular_avoidance((0.0, 0.0), nominal)
+        self.backend._local_route_mode = None
+        self.backend._local_route_points = []
+
+        goal = self.backend._start_regular_avoidance(
+            (1.0, 0.0),
+            type("Target", (), {"x": 2.0, "y": 0.0})(),
+        )
+
+        self.assertIsNone(goal)
+        self.assertIsNone(self.backend._avoidance_target)
+        self.assertFalse(self.backend._avoidance_encounter_active)
+
+    def test_reaction_release_cancels_avoidance_and_rejoins_global_route(self):
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        self.backend.send(
+            MotionCommand(
+                agent_id="toilet_agent_01",
+                goal_pose=[2.0, 0.0, 0.0],
+                path_points=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+                velocity=0.6,
+            )
+        )
+        actual = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "vy": 0.0}
+        self.backend._initialize_lookahead(actual)
+        self.backend._avoidance_encounter_active = True
+        self.backend._avoidance_side = 1
+        self.backend._avoidance_target = (0.8, 0.9)
+        self.backend._set_local_route("AVOIDANCE", [self.backend._avoidance_target])
+        self.backend._reaction_decision = ReactionDecision(
+            state="WALKING",
+            reaction=None,
+            speed_scale=1.0,
+            distance_m=1.0,
+            ttc_sec=None,
+        )
+        agent = self.backend._build_agent(actual)
+
+        self.backend._update_lookahead_goal(agent, 0.1, 0.0)
+
+        self.assertIsNone(self.backend._local_route_mode)
+        self.assertIsNone(self.backend._avoidance_target)
+        self.assertFalse(self.backend._avoidance_encounter_active)
+        self.assertEqual(len(self.backend._walkable_planner.plan_calls), 1)
+        self.assertNotAlmostEqual(agent.goals[0].position.y, 0.9)
+
+    def test_fixed_regular_does_not_relatch_after_reaction_release(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._reaction_controller = RobotProximityReactionController(
+            {
+                "enabled": True,
+                "mode": "fixed",
+                "reaction": "regular",
+            },
+            seed=12345,
+        )
+        self.backend._reaction_decision = ReactionDecision(
+            state="WALKING",
+            reaction=None,
+            speed_scale=1.0,
+            distance_m=0.9,
+            ttc_sec=None,
+        )
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "received_at": time.monotonic(),
+        }
+        nominal = type("Target", (), {"x": 1.0, "y": 0.0})()
+
+        goal = self.backend._start_regular_avoidance((0.0, 0.0), nominal)
+
+        self.assertIsNone(goal)
+        self.assertIsNone(self.backend._local_route_mode)
+        self.assertIsNone(self.backend._avoidance_target)
+        self.assertFalse(self.backend._avoidance_encounter_active)
+
+    def test_regular_avoidance_removes_backward_but_keeps_lateral_motion(self):
+        self.backend._avoidance_encounter_active = True
+        self.backend._avoidance_target = (1.0, 0.0)
+
+        projected = self.backend._suppress_backward_avoidance_step(
+            (0.0, 0.0),
+            (-0.1, 0.2),
+        )
+
+        self.assertAlmostEqual(projected[0], 0.0)
+        self.assertAlmostEqual(projected[1], 0.2)
+
+    def test_narrow_space_overrides_regular_reaction_with_yielding(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+        self.backend._reaction_controller = RobotProximityReactionController(
+            {
+                "enabled": True,
+                "mode": "fixed",
+                "reaction": "regular",
+                "trigger": {"distance_m": 1.0},
+            },
+            seed=42,
+        )
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        self.backend._update_robot_reaction(
+            {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.3, "vy": 0.0}
+        )
+
+        self.assertEqual(
+            self.backend._reaction_decision.state,
+            "YIELDING_TO_ROBOT",
+        )
+        self.assertEqual(self.backend._reaction_controller.reaction, "yielding")
+
+    def test_active_avoidance_remains_latched_when_prediction_temporarily_fails(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+        self.backend._reaction_controller = RobotProximityReactionController(
+            {
+                "enabled": True,
+                "mode": "fixed",
+                "reaction": "regular",
+                "trigger": {"distance_m": 1.0},
+            },
+            seed=42,
+        )
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "wz": 0.0,
+            "received_at": time.monotonic(),
+        }
+        self.backend._avoidance_encounter_active = True
+        self.backend._avoidance_side = 1
+        self.backend._avoidance_target = (1.0, 0.8)
+        self.backend._set_local_route("AVOIDANCE", [(1.0, 0.8)])
+        actual = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.3, "vy": 0.0}
+
+        for expected_ticks in range(1, 6):
+            self.backend._update_robot_reaction(actual)
+            self.assertEqual(
+                self.backend._reaction_decision.state,
+                "REGULAR_TO_ROBOT",
+            )
+            self.assertEqual(
+                self.backend._avoidance_active_route_infeasible_ticks,
+                expected_ticks,
+            )
+
+        self.assertEqual(self.backend._local_route_mode, "AVOIDANCE")
+
+    def test_hunav_step_is_clipped_to_commanded_speed_envelope(self):
+        self.backend.send(_walking_command())
+        previous = Agent()
+        proposed = Agent()
+        proposed.position.position.x = 3.0
+
+        clipped = self.backend._clip_hunav_step(previous, proposed, 0.1)
+
+        self.assertTrue(clipped)
+        self.assertAlmostEqual(proposed.position.position.x, 0.12)
+        self.assertAlmostEqual(proposed.linear_vel, 1.2)
+
+    def test_stalled_avoidance_yields_after_recovery_is_exhausted(self):
+        from toilet_benchmark.hunav_motion_backend import AvoidanceCandidate
+
+        candidate = AvoidanceCandidate(
+            side=1,
+            target=(1.0, 0.5),
+            waypoints=((1.0, 0.5),),
+            accepted=True,
+            reason="accepted",
+            static_clearance_m=0.5,
+            dynamic_clearance_m=0.2,
+            path_length_m=1.2,
+            forward_progress_m=1.0,
+            turn_angle_rad=0.2,
+        )
+        self.backend.send(_walking_command())
+        self.backend._robot = {"x": 0.8, "y": 0.0}
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 1.0, "y": 0.0},
+        )()
+        self.backend._avoidance_side = 1
+        self.backend._avoidance_encounter_active = True
+        self.backend._avoidance_recovery_attempts = 1
+        self.backend._avoidance_candidates = (
+            lambda *_args: (True, [candidate], 0.8)
+        )
+
+        recovered = self.backend._recover_stalled_avoidance((0.0, 0.0))
+
+        self.assertEqual(recovered, (0.0, 0.0))
+        self.assertFalse(self.backend._avoidance_encounter_active)
+        self.assertEqual(self.backend._reaction_controller.reaction, "yielding")
+
+    def test_yield_release_discards_shadow_and_schedules_hunav_rebase(self):
+        class _ReleaseController:
+            reaction = None
+
+            def update(self, **_kwargs):
+                return ReactionDecision(
+                    state="WALKING",
+                    reaction=None,
+                    speed_scale=1.0,
+                    distance_m=1.2,
+                    ttc_sec=None,
+                    transition="YIELDING_TO_ROBOT->WALKING",
+                )
+
+        self.backend.send(_walking_command())
+        self.backend._reaction_controller = _ReleaseController()
+        self.backend._reaction_decision = ReactionDecision(
+            state="YIELDING_TO_ROBOT",
+            reaction="yielding",
+            speed_scale=0.0,
+            distance_m=0.8,
+            ttc_sec=1.0,
+        )
+        self.backend._shadow = object()
+        self.backend._active_generation = self.backend._generation
+        self.backend._lookahead_tracker = object()
+        self.backend._lookahead_target = object()
+
+        self.backend._update_robot_reaction(
+            {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "vy": 0.0}
+        )
+
+        self.assertIsNone(self.backend._shadow)
+        self.assertEqual(self.backend._active_generation, 0)
+        self.assertIsNone(self.backend._lookahead_tracker)
+        self.assertIsNone(self.backend._lookahead_target)
+        self.assertTrue(self.backend._pending_rebase_replan)
+
+    def test_dynamic_replan_uses_current_and_predicted_robot_pose(self):
+        import time
+
+        self.backend._avoidance_prediction_horizon_sec = 1.5
+        self.backend._robot = {
+            "x": 1.0,
+            "y": 2.0,
+            "yaw": 0.0,
+            "vx": 0.4,
+            "vy": -0.2,
+            "wz": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        obstacles = self.backend._dynamic_replan_obstacles()
+
+        self.assertEqual(len(obstacles), 2)
+        self.assertAlmostEqual(obstacles[0][0], 1.0)
+        self.assertAlmostEqual(obstacles[1][0], 1.6)
+        self.assertAlmostEqual(obstacles[1][1], 1.7)
+
+    def test_dynamic_replan_rejects_a_route_that_starts_backward(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner()
+        self.backend._walkable_planner.plan = (
+            lambda *_args, **_kwargs: [
+                [-0.40, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ]
+        )
+        self.backend._robot = {
+            "x": 0.4,
+            "y": 0.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "wz": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        replanned = self.backend._replan_to_final_goal(
+            (0.0, 0.0),
+            reason="test",
+            force=True,
+        )
+
+        self.assertFalse(replanned)
+        self.assertIsNone(self.backend._lookahead_tracker)
+
+    def test_completed_avoidance_keeps_encounter_latched(self):
+        self.backend.send(_walking_command())
+        self.backend._avoidance_encounter_active = True
+        self.backend._avoidance_side = 1
+        self.backend._avoidance_target = (0.5, 0.2)
+        self.backend._local_route_mode = "AVOIDANCE"
+        self.backend._local_route_points = [(0.0, 0.0)]
+        self.backend._local_route_index = 0
+        self.backend._replan_to_final_goal = lambda *_args, **_kwargs: True
+
+        goal = self.backend._active_local_route_goal((0.0, 0.0))
+
+        self.assertIsNone(goal)
+        self.assertTrue(self.backend._avoidance_encounter_active)
+        self.assertEqual(self.backend._avoidance_side, 0)
+
+    def test_successful_global_recovery_keeps_encounter_latched(self):
+        self.backend.send(_walking_command())
+        self.backend._avoidance_encounter_active = True
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 0.8, "y": 0.0},
+        )()
+        self.backend._replan_to_final_goal = lambda *_args, **_kwargs: True
+
+        goal = self.backend._replan_or_yield_after_avoidance((0.0, 0.0))
+
+        self.assertEqual(goal, (0.8, 0.0))
+        self.assertTrue(self.backend._avoidance_encounter_active)
+
+    def test_candidate_scoring_ignores_millimetric_margin_advantage(self):
+        from toilet_benchmark.hunav_motion_backend import AvoidanceCandidate
+
+        short = AvoidanceCandidate(
+            side=-1,
+            target=(1.0, -0.5),
+            waypoints=((1.0, -0.5),),
+            accepted=True,
+            reason="accepted",
+            static_clearance_m=0.40,
+            dynamic_clearance_m=0.100,
+            path_length_m=1.60,
+            forward_progress_m=1.40,
+            turn_angle_rad=0.20,
+        )
+        long = AvoidanceCandidate(
+            side=1,
+            target=(1.0, 0.5),
+            waypoints=((1.0, 0.5),),
+            accepted=True,
+            reason="accepted",
+            static_clearance_m=1.00,
+            dynamic_clearance_m=0.103,
+            path_length_m=2.40,
+            forward_progress_m=1.40,
+            turn_angle_rad=0.60,
+        )
+
+        selected = min(
+            (short, long),
+            key=lambda item: self.backend._avoidance_candidate_sort_key(
+                item,
+                preferred_side=1,
+            ),
+        )
+
+        self.assertEqual(selected.side, -1)
+
+    def test_stationary_robot_uses_smaller_hard_safety_radius(self):
+        stationary = {
+            "vx": 0.01,
+            "vy": 0.0,
+            "wz": 0.01,
+        }
+        moving = {
+            "vx": 0.20,
+            "vy": 0.0,
+            "wz": 0.0,
+        }
+
+        self.assertAlmostEqual(
+            self.backend._effective_robot_radius(stationary),
+            0.36,
+        )
+        self.assertAlmostEqual(
+            self.backend._effective_robot_radius(moving),
+            0.45,
+        )
+
+    def test_visible_route_target_keeps_short_required_corner(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            route_filter=lambda points: (
+                0.09
+                <= float(points[-1][0])
+                <= 0.14
+            ),
+        )
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (0.10, 0.10), (0.50, 0.10)],
+            lookahead_m=0.80,
+        )
+        nominal = self.backend._lookahead_tracker.update(0.0, 0.0)
+
+        visible = self.backend._visible_route_target((0.0, 0.0), nominal)
+
+        self.assertGreater(visible.target_progress_m, 0.09)
+        self.assertLess(visible.target_progress_m, 0.15)
+        self.assertFalse(self.backend._route_hold_active)
+
+    def test_no_visible_route_target_latches_explicit_yaw_hold(self):
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (0.5, 0.0)],
+            lookahead_m=0.80,
+        )
+        nominal = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._last_global_replan_at = time.monotonic()
+        self.backend._route_visibility_lost_since = time.monotonic() - 1.0
+
+        visible = self.backend._visible_route_target((0.0, 0.0), nominal)
+
+        self.assertEqual((visible.x, visible.y), (0.0, 0.0))
+        self.assertTrue(self.backend._route_hold_active)
+
+    def test_transient_visibility_loss_keeps_last_target_without_freezing(self):
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (1.0, 0.0)],
+            lookahead_m=0.80,
+        )
+        nominal = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._last_visible_route_target = nominal
+        self.backend._last_global_replan_at = time.monotonic()
+
+        visible = self.backend._visible_route_target((0.0, 0.0), nominal)
+
+        self.assertEqual((visible.x, visible.y), (nominal.x, nominal.y))
+        self.assertFalse(self.backend._route_hold_active)
+        self.assertGreater(self.backend._route_visibility_lost_since, 0.0)
+
+    def test_route_rebuild_splices_nearby_previous_lookahead(self):
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (2.0, 0.0)],
+            lookahead_m=0.80,
+        )
+        previous = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._lookahead_target = previous
+        self.backend._last_visible_route_target = previous
+
+        rebuilt = self.backend._reset_lookahead_route(
+            (0.2, 0.0),
+            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            reason="test splice",
+        )
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(self.backend._lookahead_tracker._points[1], (0.8, 0.0))
+
+    def test_route_splice_discards_new_route_points_behind_splice(self):
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (2.0, 0.0)],
+            lookahead_m=0.80,
+        )
+        previous = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._last_visible_route_target = previous
+
+        self.backend._reset_lookahead_route(
+            (0.2, 0.0),
+            [[0.3, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            reason="test splice trim",
+        )
+
+        self.assertEqual(
+            self.backend._lookahead_tracker._points,
+            [(0.2, 0.0), (0.8, 0.0), (1.0, 0.0), (2.0, 0.0)],
+        )
+
+    def test_oriented_robot_footprint_reduces_lateral_avoidance_offset(self):
+        robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "wz": 0.0,
+        }
+
+        along_route = self.backend._robot_support_radius(robot, (1.0, 0.0))
+        across_route = self.backend._robot_support_radius(robot, (0.0, 1.0))
+
+        self.assertAlmostEqual(along_route, 0.36)
+        self.assertAlmostEqual(across_route, 0.27)
+        self.assertLess(
+            self.backend._agent_radius
+            + across_route
+            + self.backend._avoidance_side_clearance_m,
+            self.backend._agent_radius
+            + self.backend._stationary_robot_radius
+            + self.backend._avoidance_side_clearance_m,
+        )
+
+    def test_open_space_keeps_sampled_regular_reaction(self):
+        import time
+
+        self.backend.send(_walking_command())
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        self.backend._reaction_controller = RobotProximityReactionController(
+            {
+                "enabled": True,
+                "mode": "fixed",
+                "reaction": "regular",
+                "trigger": {"distance_m": 1.0},
+            },
+            seed=42,
+        )
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._robot = {
+            "x": 0.8,
+            "y": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "received_at": time.monotonic(),
+        }
+
+        self.backend._update_robot_reaction(
+            {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.3, "vy": 0.0}
+        )
+
+        self.assertEqual(
+            self.backend._reaction_decision.state,
+            "REGULAR_TO_ROBOT",
+        )
+
+    def test_blocked_lookahead_uses_visibility_grace_before_hold(self):
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+        self.backend.send(
+            MotionCommand(
+                agent_id="toilet_agent_01",
+                goal_pose=[2.0, 0.0, 0.0],
+                path_points=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+                velocity=0.6,
+            )
+        )
+        actual = {"x": 0.0, "y": 0.0, "yaw": 0.0, "vx": 0.0, "vy": 0.0}
+        self.backend._initialize_lookahead(actual)
+        agent = self.backend._build_agent(actual)
+
+        self.backend._update_lookahead_goal(agent, 0.0, 0.0)
+
+        self.assertIsNone(self.backend._local_route_mode)
+        self.assertAlmostEqual(agent.goals[0].position.x, 0.8)
+        self.assertAlmostEqual(agent.goals[0].position.y, 0.0)
+        self.assertFalse(self.backend._route_hold_active)
+        self.assertEqual(len(self.backend._walkable_planner.plan_calls), 1)
+
+    def test_static_clip_latches_yaw_until_motion_is_clear(self):
+        previous = Agent()
+        previous.yaw = 1.2
+        clipped = Agent()
+
+        self.backend._apply_motion_yaw(
+            previous,
+            clipped,
+            {"static_clip": True, "robot_contacts": 0, "static_contacts": 0},
+            0.0,
+        )
+        self.assertAlmostEqual(clipped.yaw, 1.2)
+
+        changed_feedback = Agent()
+        changed_feedback.yaw = -1.0
+        clipped_again = Agent()
+        self.backend._apply_motion_yaw(
+            changed_feedback,
+            clipped_again,
+            {"static_clip": True, "robot_contacts": 0, "static_contacts": 0},
+            0.0,
+        )
+        self.assertAlmostEqual(clipped_again.yaw, 1.2)
+
+        for _ in range(3):
+            self.backend._apply_motion_yaw(
+                changed_feedback,
+                Agent(),
+                {"static_clip": False, "robot_contacts": 0, "static_contacts": 0},
+                0.0,
+            )
+        self.assertIsNone(self.backend._static_hold_yaw)
 
 
 if __name__ == "__main__":

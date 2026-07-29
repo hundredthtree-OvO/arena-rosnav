@@ -32,6 +32,7 @@ class VoxelPathPlannerConfig:
     preferred_clearance_m: float = 0.50
     clearance_cost_weight: float = 4.0
     turn_cost_weight: float = 0.35
+    any_angle: bool = False
 
 
 def _open_json_maybe_gz(path: str | Path):
@@ -350,16 +351,41 @@ class VoxelPathPlanner:
                     continue
                 if not self.is_free(neighbor, dynamic_blocked=dynamic_blocked):
                     continue
+                predecessor = current
                 new_cost = (
                     current_cost
                     + step_cost
                     + self._clearance_cost(neighbor, dynamic_clearance)
                     + self._turn_cost(came_from.get(current), current, neighbor)
                 )
+                parent = came_from.get(current)
+                if (
+                    self.config.any_angle
+                    and parent is not None
+                    and self._line_is_free(
+                        parent,
+                        neighbor,
+                        dynamic_blocked=dynamic_blocked,
+                    )
+                ):
+                    line_cells = list(_supercover_cells(parent, neighbor))
+                    average_clearance_cost = sum(
+                        self._clearance_cost(cell, dynamic_clearance)
+                        for cell in line_cells[1:]
+                    ) / max(1, len(line_cells) - 1)
+                    distance = _cell_distance(parent, neighbor)
+                    parent_cost = (
+                        cost_so_far[parent]
+                        + distance * (1.0 + average_clearance_cost)
+                        + self._turn_cost(came_from.get(parent), parent, neighbor)
+                    )
+                    if parent_cost < new_cost:
+                        predecessor = parent
+                        new_cost = parent_cost
                 if new_cost >= cost_so_far.get(neighbor, math.inf):
                     continue
                 cost_so_far[neighbor] = new_cost
-                came_from[neighbor] = current
+                came_from[neighbor] = predecessor
                 priority = new_cost + _cell_distance(neighbor, goal)
                 heapq.heappush(open_heap, (priority, new_cost, neighbor))
         return []
@@ -437,9 +463,15 @@ class VoxelPathPlanner:
             anchor_index = best_index
         return simplified
 
-    def _line_is_free(self, start: GridCell, goal: GridCell) -> bool:
+    def _line_is_free(
+        self,
+        start: GridCell,
+        goal: GridCell,
+        *,
+        dynamic_blocked: set[GridCell] | None = None,
+    ) -> bool:
         for cell in _supercover_cells(start, goal):
-            if not self.is_free(cell):
+            if not self.is_free(cell, dynamic_blocked=dynamic_blocked):
                 return False
         return True
 

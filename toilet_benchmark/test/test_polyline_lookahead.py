@@ -52,6 +52,61 @@ class TestPolylineLookaheadTracker(unittest.TestCase):
         self.assertAlmostEqual(target.x, -3.8)
         self.assertAlmostEqual(target.y, -0.91)
 
+    def test_nearby_future_segment_cannot_jump_route_progress(self):
+        tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [0.5, 0.0], [0.5, 0.4], [0.0, 0.4]],
+            lookahead_m=0.5,
+            progress_slack_m=0.10,
+        )
+        tracker.update(0.0, 0.0)
+
+        target = tracker.update(0.05, 0.35)
+
+        self.assertLessEqual(target.progress_m, 0.46)
+        self.assertTrue(target.progress_limited)
+
+    def test_large_cross_track_error_holds_progress(self):
+        tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [3.0, 0.0]],
+            lookahead_m=0.5,
+            max_cross_track_m=0.4,
+        )
+        tracker.update(0.0, 0.0)
+
+        target = tracker.update(1.0, 1.0)
+
+        self.assertEqual(target.progress_m, 0.0)
+        self.assertGreater(target.cross_track_error_m, 0.4)
+
+    def test_small_existing_progress_keeps_current_segment_when_pose_moves_back(self):
+        tracker = PolylineLookaheadTracker(
+            [[-3.8, -0.91], [-2.325, -0.825], [-0.825, -0.825]],
+            lookahead_m=0.8,
+        )
+        tracker.update(-3.7998, -0.9098)
+
+        target = tracker.update(-4.035, -0.968)
+
+        self.assertLess(target.cross_track_error_m, 0.30)
+        self.assertLess(target.progress_m, 0.01)
+
+    def test_target_at_progress_keeps_tracker_progress_monotonic(self):
+        tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0]],
+            lookahead_m=0.8,
+        )
+        nominal = tracker.update(0.6, 0.0)
+
+        visible = tracker.target_at_progress(
+            0.9,
+            cross_track_error_m=nominal.cross_track_error_m,
+            progress_limited=nominal.progress_limited,
+        )
+
+        self.assertAlmostEqual(visible.progress_m, 0.6)
+        self.assertAlmostEqual(visible.target_progress_m, 0.9)
+        self.assertAlmostEqual(visible.x, 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()
