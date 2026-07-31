@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass
-class DirectedAgentState:
-    agent_id: str
-    status: str
-    goal_pose: list[float]
-    velocity: float
+from .domain.agent import DirectedAgentState
 
 
 class HunavAdapter:

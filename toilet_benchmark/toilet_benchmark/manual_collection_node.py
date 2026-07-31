@@ -22,6 +22,7 @@ from std_msgs.msg import String
 from std_srvs.srv import SetBool
 
 from .collection_scenarios import ScenarioSelection, ScenarioSelector, load_manual_collection_config
+from .domain.events import decode_json_payload
 from .episode_recorder import EpisodeRecorder
 
 
@@ -245,11 +246,7 @@ class ManualCollectionNode(Node):
         self._latest_odom_at = time.monotonic()
 
     def _event_payload(self, message: String) -> dict:
-        try:
-            value = json.loads(message.data)
-            return value if isinstance(value, dict) else {"value": value}
-        except Exception:
-            return {"raw": str(message.data)}
+        return decode_json_payload(message.data)
 
     def _hard_guard_cb(self, message: String) -> None:
         if self._state != "RUNNING":

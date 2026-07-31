@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import math
@@ -13,7 +14,7 @@ import time
 from typing import Any, Mapping
 
 from geometry_msgs.msg import Point, Pose, PoseStamped
-from hunav_msgs.msg import Agent, AgentBehavior, Agents
+from hunav_msgs.msg import Agent, Agents
 from hunav_msgs.srv import ComputeAgents, ResetAgents
 from nav_msgs.msg import Odometry, Path
 from people_msgs.msg import People
@@ -29,6 +30,13 @@ from .motion_backend import (
     MotionCommand,
 )
 from .polyline_lookahead import LookaheadTarget, PolylineLookaheadTracker
+from .motion.hunav import (
+    build_hunav_behavior,
+    describe_hunav_behavior,
+    HuNavServiceClient,
+    HuNavRuntimeRegistry,
+    RUNTIME_FIELDS,
+)
 from .robot_reaction import ReactionDecision, RobotProximityReactionController
 
 
@@ -76,7 +84,9 @@ def _yaw_from_quaternion(orientation) -> float:
 
 
 class HuNavMotionBackend:
-    """Own one pedestrian's continuous motion and stream it into Isaac."""
+    """Own a shared HuNav world and stream each pedestrian into Isaac."""
+
+    _RUNTIME_FIELDS = RUNTIME_FIELDS
 
     def __init__(
         self,
@@ -107,8 +117,24 @@ class HuNavMotionBackend:
             0.005,
             float(self._config.get("max_hunav_step_min_m", 0.03)),
         )
-        self._agent_radius = max(
-            0.01, float(self._config.get("agent_radius_m", 0.30))
+        legacy_agent_radius = float(self._config.get("agent_radius_m", 0.30))
+        self._social_radius = max(
+            0.01,
+            float(self._config.get("social_radius_m", legacy_agent_radius)),
+        )
+        self._planning_radius = max(
+            0.01,
+            float(self._config.get("planning_radius_m", legacy_agent_radius)),
+        )
+        self._hard_radius = max(
+            0.01,
+            float(self._config.get("hard_radius_m", legacy_agent_radius)),
+        )
+        # Backward-compatible alias for tests and integrations that inspect it.
+        self._agent_radius = self._social_radius
+        self._max_compute_dt_sec = max(
+            1.0 / self._compute_hz,
+            float(self._config.get("max_compute_dt_sec", 0.20)),
         )
         self._goal_radius = max(
             0.01, float(self._config.get("goal_radius_m", 0.20))
@@ -229,8 +255,38 @@ class HuNavMotionBackend:
         self._avoidance_side_clearance_m = max(
             0.05, float(avoidance.get("side_clearance_m", 0.18))
         )
+        self._avoidance_min_dynamic_clearance_m = max(
+            0.0,
+            float(avoidance.get("min_dynamic_clearance_m", 0.01)),
+        )
+        configured_clearances = avoidance.get(
+            "clearance_samples_m",
+            [self._avoidance_side_clearance_m, 0.06, 0.02],
+        )
+        self._avoidance_clearance_samples_m = tuple(
+            sorted(
+                {
+                    max(
+                        self._avoidance_min_dynamic_clearance_m,
+                        float(value),
+                    )
+                    for value in configured_clearances
+                },
+                reverse=True,
+            )
+        )
         self._avoidance_forward_offset_m = max(
             0.0, float(avoidance.get("forward_offset_m", 0.30))
+        )
+        configured_forward_offsets = avoidance.get(
+            "forward_offset_samples_m",
+            [
+                self._avoidance_forward_offset_m,
+                self._avoidance_forward_offset_m + 0.20,
+            ],
+        )
+        self._avoidance_forward_offset_samples_m = tuple(
+            sorted({max(0.0, float(value)) for value in configured_forward_offsets})
         )
         self._avoidance_release_distance_m = max(
             self._avoidance_trigger_distance_m,
@@ -243,10 +299,6 @@ class HuNavMotionBackend:
         self._avoidance_sample_spacing_m = max(
             0.02,
             float(avoidance.get("sample_spacing_m", 0.10)),
-        )
-        self._avoidance_min_dynamic_clearance_m = max(
-            0.0,
-            float(avoidance.get("min_dynamic_clearance_m", 0.01)),
         )
         self._avoidance_suppress_backward_motion = bool(
             avoidance.get("suppress_backward_motion", True)
@@ -270,6 +322,30 @@ class HuNavMotionBackend:
         self._avoidance_narrow_space_fallback = str(
             avoidance.get("narrow_space_fallback", "yielding")
         ).strip().lower()
+        pedestrian_yield = dict(avoidance.get("pedestrian_yield", {}) or {})
+        self._pedestrian_yield_enabled = bool(
+            pedestrian_yield.get("enabled", True)
+        )
+        self._pedestrian_yield_trigger_distance_m = max(
+            0.1,
+            float(pedestrian_yield.get("trigger_distance_m", 0.95)),
+        )
+        self._pedestrian_yield_release_distance_m = max(
+            self._pedestrian_yield_trigger_distance_m,
+            float(pedestrian_yield.get("release_distance_m", 1.10)),
+        )
+        self._pedestrian_yield_side_clearance_m = max(
+            0.0,
+            float(pedestrian_yield.get("side_clearance_m", 0.08)),
+        )
+        self._pedestrian_yield_release_ticks = max(
+            1,
+            int(pedestrian_yield.get("release_confirm_ticks", 5)),
+        )
+        self._pedestrian_yield_forward_offset_m = max(
+            0.1,
+            float(pedestrian_yield.get("forward_offset_m", 0.45)),
+        )
         self._avoidance_max_recovery_attempts = max(
             0,
             int(avoidance.get("max_recovery_attempts", 1)),
@@ -332,12 +408,10 @@ class HuNavMotionBackend:
                 1,
             )
 
-        self._compute_client = node.create_client(
-            ComputeAgents, f"{self._namespace}/compute_agents"
-        )
-        self._reset_client = node.create_client(
-            ResetAgents, f"{self._namespace}/reset_agents"
-        )
+        self._hunav_client = HuNavServiceClient(node, self._namespace)
+        # Keep aliases while legacy tests and diagnostics still inspect them.
+        self._compute_client = self._hunav_client.compute
+        self._reset_client = self._hunav_client.reset
         node.create_subscription(
             People,
             str(self._config.get("state_topic", "/isaac/pedestrian_states")),
@@ -362,16 +436,19 @@ class HuNavMotionBackend:
         self._reset_generation = 0
         self._compute_future = None
         self._compute_generation = 0
-        self._compute_previous = None
         self._external_future = None
+        self._external_request_token = 0
         self._safety_robot_previous = None
         self._last_state_wait_log = 0.0
         self._last_diagnostic_log = 0.0
-        self._last_compute_at = 0.0
+        self._native_behavior_profile_by_agent: dict[str, str] = {}
+        self._native_behavior_response_state_by_agent: dict[str, int] = {}
+        self._last_native_behavior_signature: tuple[object, ...] | None = None
         self._settled_generation = 0
         self._settled_agent_id = ""
         self._terminal_align_active = False
         self._terminal_align_stable_since = 0.0
+        self._frozen_present = False
         self._lookahead_tracker: PolylineLookaheadTracker | None = None
         self._lookahead_target: LookaheadTarget | None = None
         self._last_visible_route_target: LookaheadTarget | None = None
@@ -397,6 +474,8 @@ class HuNavMotionBackend:
         self._last_global_replan_at = 0.0
         self._pending_rebase_replan = False
         self._yield_hold_yaw: float | None = None
+        self._pedestrian_yield_blocker: str | None = None
+        self._pedestrian_yield_clear_ticks = 0
         self._route_hold_active = False
         self._route_hold_yaw: float | None = None
         self._last_external_motion_mode = 0
@@ -412,6 +491,9 @@ class HuNavMotionBackend:
         self._hold_diagnostic_path = (
             diagnostic_dir / f"director_hold_{os.getpid()}.jsonl"
         )
+        self._behavior_event_path = (
+            diagnostic_dir / f"hunav_behavior_events_{os.getpid()}.jsonl"
+        )
         self._logger.info(
             f"HuNav motion backend configured: namespace={self._namespace}, "
             f"compute_hz={self._compute_hz:.1f}, external_timeout_sec="
@@ -421,8 +503,141 @@ class HuNavMotionBackend:
             f", robot_reaction_mode={self._reaction_controller.mode}"
             f", robot_hard_safety={self._safety_enabled}, "
             f"rviz_visualization={self._visualization_enabled}, "
-            f"hold_diagnostics={self._hold_diagnostic_path}"
+            f"hold_diagnostics={self._hold_diagnostic_path}, "
+            f"behavior_events={self._behavior_event_path}"
         )
+        self._runtime_registry = HuNavRuntimeRegistry()
+        self._commands: dict[str, MotionCommand] = {}
+        self._runtime_template = deepcopy(self._runtime_registry.capture(self))
+        self._runtime_states: dict[str, dict[str, object]] = {}
+        self._runtime_agent_id: str | None = None
+        self._runtime_registry.runtime_states = self._runtime_states
+        self._runtime_registry.commands = self._commands
+        self._runtime_registry._active_agent_id = self._runtime_agent_id
+        self._batch_generation = 0
+        self._active_batch_generation = 0
+        self._batch_shadow: Agents | None = None
+        self._compute_previous_by_id: dict[str, Agent] = {}
+        self._last_batch_compute_at = 0.0
+        self._agent_numeric_ids: dict[str, int] = {}
+        self._runtime_incarnations: dict[str, int] = {}
+        self._eligible_agent_ids: tuple[str, ...] = ()
+        self._active_batch_agent_ids: tuple[str, ...] = ()
+        self._reset_agent_ids: tuple[str, ...] = ()
+        self._compute_agent_ids: tuple[str, ...] = ()
+        self._compute_runtime_generations: dict[str, int] = {}
+        self._batch_warmup_pending = False
+
+    def _ensure_runtime_storage(self) -> None:
+        """Initialize session storage for tests that construct the class manually."""
+        if not hasattr(self, "_runtime_template"):
+            self._runtime_template = {}
+            self._runtime_registry = HuNavRuntimeRegistry()
+            self._runtime_states = {}
+            self._runtime_agent_id = None
+            self._commands = {}
+            self._runtime_template = self._runtime_registry.capture(self)
+        elif not isinstance(getattr(self, "_runtime_registry", None), HuNavRuntimeRegistry):
+            self._runtime_registry = HuNavRuntimeRegistry()
+        self._runtime_registry.runtime_states = self._runtime_states
+        self._runtime_registry.commands = self._commands
+        self._runtime_registry._active_agent_id = self._runtime_agent_id
+        if not hasattr(self, "_batch_generation"):
+            self._batch_generation = 0
+        if not hasattr(self, "_active_batch_generation"):
+            self._active_batch_generation = 0
+        if not hasattr(self, "_batch_shadow"):
+            self._batch_shadow = None
+        if not hasattr(self, "_compute_previous_by_id"):
+            self._compute_previous_by_id = {}
+        if not hasattr(self, "_last_batch_compute_at"):
+            self._last_batch_compute_at = 0.0
+        if not hasattr(self, "_agent_numeric_ids"):
+            self._agent_numeric_ids = {}
+        if not hasattr(self, "_runtime_incarnations"):
+            self._runtime_incarnations = {}
+        if not hasattr(self, "_eligible_agent_ids"):
+            self._eligible_agent_ids = ()
+        if not hasattr(self, "_active_batch_agent_ids"):
+            self._active_batch_agent_ids = ()
+        if not hasattr(self, "_reset_agent_ids"):
+            self._reset_agent_ids = ()
+        if not hasattr(self, "_compute_agent_ids"):
+            self._compute_agent_ids = ()
+        if not hasattr(self, "_compute_runtime_generations"):
+            self._compute_runtime_generations = {}
+        if not hasattr(self, "_batch_warmup_pending"):
+            self._batch_warmup_pending = False
+
+    def _capture_runtime(self) -> dict[str, object]:
+        return self._runtime_registry.capture(self)
+
+    def _store_active_runtime(self) -> None:
+        self._runtime_registry.capture_active(self)
+
+    def _load_runtime(self, agent_id: str) -> None:
+        self._runtime_registry.restore(self, str(agent_id))
+        self._runtime_agent_id = str(agent_id)
+
+    @contextmanager
+    def _runtime_context(self, agent_id: str):
+        """Temporarily expose one session through the legacy helper fields."""
+        self._ensure_runtime_storage()
+        try:
+            with self._runtime_registry.context(self, str(agent_id)):
+                self._runtime_agent_id = str(agent_id)
+                yield
+        finally:
+            self._runtime_agent_id = self._runtime_registry.active_agent_id()
+
+    def _create_runtime(self, agent_id: str) -> None:
+        agent_id = str(agent_id)
+        config = getattr(self, "_config", {}) or {}
+        self._runtime_incarnations[agent_id] = (
+            self._runtime_incarnations.get(agent_id, 0) + 1
+        )
+        reaction_seed = int(config.get("reaction_seed", 12345))
+        reaction_seed += self._numeric_agent_id(agent_id) * 1009
+
+        def initializer(_owner, state, reaction_seed=reaction_seed, config=None):
+            del _owner, config
+            state["_reaction_controller"] = RobotProximityReactionController(
+                getattr(self, "_config", {}).get("robot_proximity_reaction", {}) or {},
+                seed=reaction_seed,
+            )
+            state["_reaction_decision"] = ReactionDecision(
+                state="WALKING",
+                reaction=None,
+                speed_scale=1.0,
+                distance_m=None,
+                ttc_sec=None,
+            )
+            state["_command"] = None
+            state["_shadow"] = None
+            state["_generation"] = 0
+            state["_active_generation"] = 0
+            state["_hunav_active"] = False
+            state["_settled_generation"] = 0
+            state["_settled_agent_id"] = ""
+            state["_frozen_present"] = False
+            state["_external_request_token"] = 0
+        self._runtime_registry.create(
+            self,
+            agent_id,
+            reaction_seed=reaction_seed,
+            runtime_initializer=initializer,
+            configure={},
+        )
+
+    def _select_runtime(self, agent_id: str | None) -> None:
+        self._runtime_registry.select(self, None if agent_id is None else str(agent_id))
+        self._runtime_agent_id = self._runtime_registry.active_agent_id()
+
+    def _numeric_agent_id(self, agent_id: str) -> int:
+        agent_id = str(agent_id)
+        if agent_id not in self._agent_numeric_ids:
+            self._agent_numeric_ids[agent_id] = len(self._agent_numeric_ids) + 1
+        return self._agent_numeric_ids[agent_id]
 
     def set_walkable_planner(self, planner) -> None:
         """Share the director's immutable static map with local HuNav safety."""
@@ -445,59 +660,107 @@ class HuNavMotionBackend:
         """HuNav owns local waiting and recovery for an active route."""
         return False
 
-    def send(self, command: MotionCommand, done_callback=None):
-        if command.stop or command.use_direct_pose:
-            if self._command is not None and self._command.agent_id == command.agent_id:
-                self._command = None
-                self._shadow = None
+    def register_agents(self, commands) -> None:
+        """Create sessions for pre-spawned pedestrians without activating HuNav."""
+        self._ensure_runtime_storage()
+        added = []
+        for command in commands:
+            agent_id = str(command.agent_id)
+            if agent_id in self._runtime_states:
+                continue
+            self._create_runtime(agent_id)
+            with self._runtime_context(agent_id):
                 self._generation += 1
+                self._command = command
+                self._frozen_present = True
+                self._active_generation = 0
                 self._settled_generation = 0
                 self._settled_agent_id = ""
-                self._reset_terminal_alignment()
-                self._lookahead_tracker = None
-                self._lookahead_target = None
-                self._last_visible_route_target = None
-                self._route_visibility_lost_since = 0.0
-                self._pending_rebase_replan = False
-                self._reset_local_route()
-                self._reset_robot_reaction()
+            added.append(agent_id)
+        if not added:
+            return
+        self._logger.info(
+            "HuNav pre-registered inactive pedestrian sessions: "
+            f"added={added}, total={len(self._runtime_states)}"
+        )
+
+    def send(self, command: MotionCommand, done_callback=None):
+        self._ensure_runtime_storage()
+        agent_id = str(command.agent_id)
+        if command.use_direct_pose:
             return self._isaac.send(command, done_callback)
 
-        if self._command is not None and self._command.agent_id != command.agent_id:
-            self._logger.error(
-                f"HuNav Phase 1 backend rejected {command.agent_id}; "
-                f"{self._command.agent_id} already owns the motion authority."
-            )
-            return self._completed_future(
-                accepted=False,
-                done_callback=done_callback,
-            )
-
-        self._generation += 1
-        self._command = command
-        self._shadow = None
-        self._active_generation = 0
-        self._settled_generation = 0
-        self._settled_agent_id = ""
-        self._reset_terminal_alignment()
-        self._lookahead_tracker = None
-        self._lookahead_target = None
-        self._last_visible_route_target = None
-        self._route_visibility_lost_since = 0.0
-        self._pending_rebase_replan = False
-        self._reset_local_route()
-        self._reset_robot_reaction()
+        membership_changed = agent_id not in self._runtime_states
+        if membership_changed:
+            self._create_runtime(agent_id)
+        activated_now = False
+        with self._runtime_context(agent_id):
+            if not command.stop and not self._hunav_active:
+                self._hunav_active = True
+                activated_now = True
+            self._generation += 1
+            self._command = command
+            self._shadow = None
+            self._frozen_present = bool(command.stop)
+            self._active_generation = 0
+            self._settled_generation = 0
+            self._settled_agent_id = ""
+            self._reset_terminal_alignment()
+            self._lookahead_tracker = None
+            self._lookahead_target = None
+            self._last_visible_route_target = None
+            self._route_visibility_lost_since = 0.0
+            self._pending_rebase_replan = False
+            self._reset_local_route()
+            self._reset_robot_reaction()
+            generation = self._generation
+        if membership_changed or activated_now:
+            self._batch_generation += 1
+            self._active_batch_generation = 0
+            self._batch_shadow = None
         self._safety_robot_previous = None
         self._logger.info(
             f"HuNav motion queued for {command.agent_id}: "
-            f"generation={self._generation}, phase={command.phase or 'UNSPECIFIED'}, "
+            f"generation={generation}, phase={command.phase or 'UNSPECIFIED'}, "
             f"goals={len(command.path_points)}, velocity={command.velocity:.2f}, "
             f"final_yaw={command.orientation:.3f}"
         )
         self._publish_route(command)
+        self._select_runtime(agent_id)
+        if command.stop:
+            return self._isaac.send(command, done_callback)
         return self._completed_future(
             accepted=True,
             done_callback=done_callback,
+        )
+
+    def remove_agent(self, agent_id: str) -> None:
+        """Forget one pedestrian only when the scene lifecycle removes it."""
+        self._ensure_runtime_storage()
+        agent_id = str(agent_id)
+        if agent_id not in self._runtime_states:
+            return
+        self._runtime_registry.remove(self, agent_id)
+        self._native_behavior_profile_by_agent.pop(agent_id, None)
+        self._native_behavior_response_state_by_agent.pop(agent_id, None)
+        self._batch_generation += 1
+        self._active_batch_generation = 0
+        self._active_batch_agent_ids = ()
+        self._batch_shadow = None
+        self._batch_warmup_pending = False
+        self._eligible_agent_ids = tuple(
+            item for item in self._eligible_agent_ids if item != agent_id
+        )
+        active_agent_id = self._runtime_registry.active_agent_id()
+        if active_agent_id is None:
+            self._runtime_agent_id = None
+            self._command = None
+            self._shadow = None
+            self._select_runtime(next(iter(self._runtime_states), None))
+        else:
+            self._runtime_agent_id = active_agent_id
+        self._logger.info(
+            f"HuNav removed {agent_id} from the shared pedestrian world."
         )
 
     def is_goal_settled(
@@ -507,12 +770,18 @@ class HuNavMotionBackend:
         target_pose,
     ) -> bool:
         """Expose HuNav goal consumption without weakening geometric sanity checks."""
-        if (
-            self._command is None
-            or str(agent_id) != self._settled_agent_id
-            or str(agent_id) != self._command.agent_id
-            or self._settled_generation != self._generation
-        ):
+        self._ensure_runtime_storage()
+        agent_id = str(agent_id)
+        if agent_id not in self._runtime_states:
+            return False
+        with self._runtime_context(agent_id):
+            settled = (
+                self._command is not None
+                and agent_id == self._settled_agent_id
+                and agent_id == self._command.agent_id
+                and self._settled_generation == self._generation
+            )
+        if not settled:
             return False
         try:
             distance = math.hypot(
@@ -590,59 +859,159 @@ class HuNavMotionBackend:
         return actual
 
     def _tick(self) -> None:
-        if self._command is None:
+        self._ensure_runtime_storage()
+        if not self._runtime_states:
             return
-        if (
-            self._settled_generation == self._generation
-            and self._settled_agent_id == self._command.agent_id
-        ):
-            return
-        actual = self._actual_for_command()
-        self._update_robot_reaction(actual)
-        if self._terminal_align_active:
-            if actual is not None:
-                self._tick_terminal_alignment(actual)
-            return
-        if self._reaction_decision.reaction == "yielding":
-            if actual is not None:
-                self._send_yield_hold(actual)
+        has_computable_agent = False
+        eligible_agent_ids = []
+        for agent_id in tuple(self._runtime_states):
+            with self._runtime_context(agent_id):
+                if self._command is None:
+                    continue
+                if not self._hunav_active:
+                    continue
+                actual = self._actual_for_command()
+                if actual is None:
+                    now = time.monotonic()
+                    if now - getattr(self, "_last_state_wait_log", 0.0) >= 2.0:
+                        self._last_state_wait_log = now
+                        self._logger.warning(
+                            "HuNav shared world is excluding an agent without "
+                            f"a fresh Isaac pose: {agent_id}."
+                        )
+                    continue
+                eligible_agent_ids.append(agent_id)
+                if self._frozen_present:
+                    continue
+                if (
+                    self._settled_generation == self._generation
+                    and self._settled_agent_id == self._command.agent_id
+                ):
+                    continue
+                if self._update_pedestrian_corridor_yield(actual):
+                    self._send_yield_hold(actual)
+                    continue
+                self._update_robot_reaction(actual)
+                if self._terminal_align_active:
+                    if actual is not None:
+                        self._tick_terminal_alignment(actual)
+                    continue
+                if self._reaction_decision.reaction == "yielding":
+                    if actual is not None:
+                        self._send_yield_hold(actual)
+                    continue
+                if self._route_hold_active:
+                    if actual is not None:
+                        self._send_route_hold(actual)
+                    continue
+                has_computable_agent = True
+        self._eligible_agent_ids = tuple(eligible_agent_ids)
+        if not has_computable_agent:
             return
         if self._reset_future is not None or self._compute_future is not None:
+            if self._reset_future is not None:
+                self._refresh_existing_motion_during_reset()
             return
-        if self._active_generation != self._generation or self._shadow is None:
+        if (
+            self._active_batch_generation != self._batch_generation
+            or self._batch_shadow is None
+            or self._active_batch_agent_ids != self._eligible_agent_ids
+        ):
             self._dispatch_reset()
             return
         self._dispatch_compute()
 
-    def _dispatch_reset(self) -> None:
-        actual = self._actual_for_command()
-        if actual is None:
-            now = time.monotonic()
-            if now - self._last_state_wait_log >= 2.0:
-                self._last_state_wait_log = now
-                self._logger.warning(
-                    f"HuNav motion is waiting for a fresh Isaac state for "
-                    f"{self._command.agent_id}."
+    def _refresh_existing_motion_during_reset(self) -> None:
+        """Keep existing Isaac references alive while HuNav rebuilds its roster."""
+        for agent_id in self._active_batch_agent_ids:
+            if agent_id not in self._runtime_states:
+                continue
+            with self._runtime_context(agent_id):
+                if (
+                    self._command is None
+                    or self._frozen_present
+                    or self._terminal_align_active
+                    or self._route_hold_active
+                    or self._reaction_decision.reaction == "yielding"
+                    or (
+                        self._external_future is not None
+                        and not self._external_future.done()
+                    )
+                ):
+                    continue
+                actual = self._actual_for_command()
+                if actual is None:
+                    continue
+                yaw = actual.get("yaw")
+                if yaw is None or not math.isfinite(float(yaw)):
+                    yaw = float(self._command.orientation)
+                velocity_x = float(actual["vx"])
+                velocity_y = float(actual["vy"])
+                self._dispatch_external_command(
+                    MotionCommand(
+                        agent_id=agent_id,
+                        goal_pose=self._command.goal_pose,
+                        path_points=(),
+                        velocity=math.hypot(velocity_x, velocity_y),
+                        orientation=float(yaw),
+                        direct_pose=(
+                            float(actual["x"]),
+                            float(actual["y"]),
+                            float(actual.get("z", 0.0)),
+                        ),
+                        use_external_motion=True,
+                        external_velocity=(velocity_x, velocity_y, 0.0),
+                        external_timeout_sec=self._external_timeout_sec,
+                        external_motion_mode=0,
+                    )
                 )
-            return
+
+    def _dispatch_reset(self) -> None:
+        self._ensure_runtime_storage()
         agents = Agents()
         agents.header.frame_id = "map"
         agents.header.stamp = self._node.get_clock().now().to_msg()
-        if self._pending_rebase_replan:
-            self._replan_to_final_goal(
-                (float(actual["x"]), float(actual["y"])),
-                reason="freeze release",
-                force=True,
-            )
-            self._pending_rebase_replan = False
-        if self._lookahead_tracker is None:
-            self._initialize_lookahead(actual)
-        agents.agents = [self._build_agent(actual)]
+        built_agents = []
+        reset_agent_ids = []
+        candidate_ids = (
+            self._eligible_agent_ids
+            if self._eligible_agent_ids
+            else tuple(self._runtime_states)
+        )
+        for agent_id in candidate_ids:
+            if agent_id not in self._runtime_states:
+                continue
+            with self._runtime_context(agent_id):
+                actual = self._actual_for_command()
+                if actual is None:
+                    continue
+                if self._pending_rebase_replan:
+                    self._replan_to_final_goal(
+                        (float(actual["x"]), float(actual["y"])),
+                        reason="freeze release",
+                        force=True,
+                    )
+                    self._pending_rebase_replan = False
+                if not self._frozen_present and self._lookahead_tracker is None:
+                    self._initialize_lookahead(actual)
+                built = self._build_agent(actual)
+                local_shadow = Agents()
+                local_shadow.header = agents.header
+                local_shadow.agents = [built]
+                self._shadow = local_shadow
+                built_agents.append(built)
+                reset_agent_ids.append(agent_id)
+        if not built_agents:
+            return
+        if not self._eligible_agent_ids:
+            self._eligible_agent_ids = tuple(reset_agent_ids)
+        agents.agents = built_agents
         request = ResetAgents.Request()
         request.current_agents = agents
         request.robot = self._build_robot()
-        self._reset_generation = self._generation
-        self._shadow = agents
+        self._reset_generation = self._batch_generation
+        self._reset_agent_ids = tuple(reset_agent_ids)
+        self._batch_shadow = agents
         self._reset_future = self._reset_client.call_async(request)
         self._reset_future.add_done_callback(self._reset_done)
 
@@ -653,28 +1022,78 @@ class HuNavMotionBackend:
             accepted = bool(future.result().ok)
         except Exception as exc:
             self._logger.error(f"HuNav reset failed: {exc}")
-            self._shadow = None
+            self._batch_shadow = None
             return
-        if not accepted or generation != self._generation or self._command is None:
-            self._shadow = None
+        if (
+            not accepted
+            or generation != self._batch_generation
+            or not self._runtime_states
+            or self._reset_agent_ids != self._eligible_agent_ids
+        ):
+            self._batch_shadow = None
             return
-        self._active_generation = generation
-        self._last_compute_at = time.monotonic()
+        self._active_batch_generation = generation
+        self._active_batch_agent_ids = self._reset_agent_ids
+        self._batch_warmup_pending = True
+        self._last_batch_compute_at = time.monotonic()
+        for agent_id in self._active_batch_agent_ids:
+            with self._runtime_context(agent_id):
+                self._active_generation = self._generation
         self._logger.info(
-            f"HuNav motion authority active for {self._command.agent_id}: "
-            f"generation={generation}"
+            "HuNav shared motion authority active: "
+            f"batch_generation={generation}, "
+            f"agents={len(self._active_batch_agent_ids)}"
         )
 
     def _dispatch_compute(self) -> None:
-        self._synchronize_shadow_to_actual()
-        for agent in self._shadow.agents:
-            self._restore_agent_fields(agent)
-        self._shadow.header.stamp = self._node.get_clock().now().to_msg()
+        agents = Agents()
+        agents.header.frame_id = "map"
+        agents.header.stamp = self._node.get_clock().now().to_msg()
+        current_agents = []
+        compute_agent_ids = []
+        for agent_id in self._active_batch_agent_ids:
+            if agent_id not in self._runtime_states:
+                continue
+            with self._runtime_context(agent_id):
+                if self._shadow is None or not self._shadow.agents:
+                    actual = self._actual_for_command()
+                    if actual is None:
+                        self._active_batch_generation = 0
+                        self._active_batch_agent_ids = ()
+                        return
+                    if (
+                        not self._frozen_present
+                        and self._lookahead_tracker is None
+                    ):
+                        self._initialize_lookahead(actual)
+                    built = self._build_agent(actual)
+                    local_shadow = Agents()
+                    local_shadow.header = agents.header
+                    local_shadow.agents = [built]
+                    self._shadow = local_shadow
+                    self._active_generation = self._generation
+                self._synchronize_shadow_to_actual()
+                agent = self._shadow.agents[0]
+                self._restore_agent_fields(agent)
+                current_agents.append(agent)
+                compute_agent_ids.append(agent_id)
+        if not current_agents:
+            return
+        agents.agents = current_agents
         request = ComputeAgents.Request()
-        request.current_agents = self._shadow
+        request.current_agents = agents
         request.robot = self._build_robot()
-        self._compute_generation = self._generation
-        self._compute_previous = deepcopy(self._shadow.agents[0])
+        self._compute_generation = self._batch_generation
+        self._compute_agent_ids = tuple(compute_agent_ids)
+        self._compute_runtime_generations = {
+            agent_id: int(
+                self._runtime_states[agent_id].get("_generation", 0)
+            )
+            for agent_id in compute_agent_ids
+        }
+        self._compute_previous_by_id = {
+            str(agent.name): deepcopy(agent) for agent in current_agents
+        }
         self._compute_future = self._compute_client.call_async(request)
         self._compute_future.add_done_callback(self._compute_done)
 
@@ -698,30 +1117,162 @@ class HuNavMotionBackend:
         agent.velocity.linear.x = float(actual["vx"])
         agent.velocity.linear.y = float(actual["vy"])
         agent.linear_vel = math.hypot(float(actual["vx"]), float(actual["vy"]))
+        if self._frozen_present:
+            agent.goals = []
+            agent.velocity.linear.x = 0.0
+            agent.velocity.linear.y = 0.0
+            agent.linear_vel = 0.0
+            return
         self._update_lookahead_goal(agent, actual["x"], actual["y"])
 
     def _compute_done(self, future) -> None:
         generation = self._compute_generation
-        previous = self._compute_previous
+        previous_by_id = self._compute_previous_by_id
+        runtime_generations = self._compute_runtime_generations
         self._compute_future = None
-        self._compute_previous = None
+        self._compute_previous_by_id = {}
+        self._compute_runtime_generations = {}
         try:
             updated = future.result().updated_agents
         except Exception as exc:
             self._logger.error(f"HuNav compute failed: {exc}")
             return
         if (
-            self._command is None
-            or generation != self._generation
+            generation != self._batch_generation
             or not updated.agents
-            or previous is None
+            or not previous_by_id
         ):
             return
+        if self._compute_agent_ids != self._eligible_agent_ids:
+            self._active_batch_generation = 0
+            self._active_batch_agent_ids = ()
+            self._batch_shadow = None
+            return
+        expected_ids = set(self._compute_agent_ids)
+        returned_ids = {str(agent.name) for agent in updated.agents}
+        if returned_ids != expected_ids:
+            missing = sorted(expected_ids - returned_ids)
+            unexpected = sorted(returned_ids - expected_ids)
+            self._logger.error(
+                "HuNav compute returned a mismatched shared-world batch: "
+                f"missing={missing}, unexpected={unexpected}; resetting batch."
+            )
+            self._active_batch_generation = 0
+            self._active_batch_agent_ids = ()
+            self._batch_shadow = None
+            return
         now = time.monotonic()
-        dt = max(1e-3, now - self._last_compute_at)
-        self._last_compute_at = now
-        agent = updated.agents[0]
+        dt = min(
+            self._max_compute_dt_sec,
+            max(1e-3, now - self._last_batch_compute_at),
+        )
+        self._last_batch_compute_at = now
+        updated_by_id = {
+            str(agent.name): agent
+            for agent in updated.agents
+            if str(agent.name) in self._runtime_states
+        }
+        if self._batch_warmup_pending:
+            self._batch_warmup_pending = False
+            # ResetAgents may return an integrated pose for every member when
+            # one newly activated pedestrian joins the shared world. Seeding
+            # the next compute from that response makes existing pedestrians
+            # visibly jump. Keep the measured input snapshot for all members;
+            # the following regular compute starts from confirmed Isaac poses.
+            for agent_id, agent in previous_by_id.items():
+                if agent_id not in self._runtime_states:
+                    continue
+                with self._runtime_context(agent_id):
+                    local_shadow = Agents()
+                    if hasattr(updated, "header"):
+                        local_shadow.header = updated.header
+                    local_shadow.agents = [deepcopy(agent)]
+                    self._shadow = local_shadow
+            self._batch_shadow = updated
+            self._logger.info(
+                "HuNav shared world warmup completed without replacing "
+                "existing external-motion references."
+            )
+            return
+        safety_by_id: dict[str, dict[str, object]] = {}
+        for agent_id, agent in updated_by_id.items():
+            if (
+                agent_id in runtime_generations
+                and
+                int(
+                    self._runtime_states[agent_id].get("_generation", 0)
+                )
+                != runtime_generations.get(agent_id)
+            ):
+                continue
+            previous = previous_by_id.get(agent_id)
+            if previous is None:
+                continue
+            with self._runtime_context(agent_id):
+                profile = str(getattr(self._command, "behavior", "regular"))
+                self._native_behavior_profile_by_agent[agent_id] = profile
+                self._native_behavior_response_state_by_agent[agent_id] = int(
+                    getattr(agent.behavior, "state", 0)
+                )
+                if (
+                    self._frozen_present
+                    or self._reaction_decision.reaction == "yielding"
+                ):
+                    continue
+                self._clip_hunav_step(previous, agent, dt)
+                safety_by_id[agent_id] = self._apply_hard_safety(
+                    previous,
+                    agent,
+                    dt,
+                )
+
+        self._apply_batch_pedestrian_safety(
+            previous_by_id,
+            updated_by_id,
+            safety_by_id,
+            dt,
+        )
+
+        for agent_id, agent in updated_by_id.items():
+            if (
+                agent_id in runtime_generations
+                and
+                int(
+                    self._runtime_states[agent_id].get("_generation", 0)
+                )
+                != runtime_generations.get(agent_id)
+            ):
+                continue
+            previous = previous_by_id.get(agent_id)
+            if previous is None:
+                continue
+            with self._runtime_context(agent_id):
+                self._finish_computed_agent(
+                    previous,
+                    agent,
+                    safety_by_id.get(agent_id, {"enabled": False}),
+                )
+        self._batch_shadow = updated
+
+    def _finish_computed_agent(
+        self,
+        previous: Agent,
+        agent: Agent,
+        safety: Mapping[str, object],
+    ) -> None:
         terminal_align = False
+        if self._frozen_present:
+            return
+        if (
+            self._settled_generation == self._generation
+            and self._settled_agent_id == self._command.agent_id
+        ):
+            return
+        if self._terminal_align_active:
+            actual = self._actual_for_command()
+            if actual is not None:
+                self._tick_terminal_alignment(actual)
+            return
         if self._reaction_decision.reaction == "yielding":
             actual = self._actual_for_command()
             if actual is not None:
@@ -732,8 +1283,21 @@ class HuNavMotionBackend:
             if actual is not None:
                 self._send_route_hold(actual)
             return
-        self._clip_hunav_step(previous, agent, dt)
-        safety = self._apply_hard_safety(previous, agent, dt)
+        terminal_pose = self._terminal_capture_pose()
+        if terminal_pose is not None:
+            agent.position.position.x = float(terminal_pose["x"])
+            agent.position.position.y = float(terminal_pose["y"])
+            agent.goals = []
+            agent.velocity.linear.x = 0.0
+            agent.velocity.linear.y = 0.0
+            agent.linear_vel = 0.0
+            agent.yaw = float(self._command.orientation)
+            terminal_align = True
+            self._begin_terminal_alignment()
+            self._set_runtime_shadow(agent)
+            self._publish_live_diagnostics(previous, agent, safety)
+            self._send_external_motion(agent, terminal_align=True)
+            return
         if agent.goals:
             speed = math.hypot(
                 float(agent.velocity.linear.x),
@@ -750,7 +1314,7 @@ class HuNavMotionBackend:
                     float(agent.position.position.x),
                     float(agent.position.position.y),
                 )
-                self._shadow = updated
+                self._set_runtime_shadow(agent)
                 self._publish_live_diagnostics(previous, agent, safety)
                 self._send_external_motion(agent)
                 return
@@ -770,7 +1334,7 @@ class HuNavMotionBackend:
                     reason="HuNav consumed goal before geometric arrival",
                 ):
                     self._update_lookahead_goal(agent, *position)
-                    self._shadow = updated
+                    self._set_runtime_shadow(agent)
                     self._publish_live_diagnostics(previous, agent, safety)
                     self._send_external_motion(agent)
                     return
@@ -782,7 +1346,7 @@ class HuNavMotionBackend:
                 agent.velocity.linear.x = 0.0
                 agent.velocity.linear.y = 0.0
                 agent.linear_vel = 0.0
-                self._shadow = updated
+                self._set_runtime_shadow(agent)
                 self._publish_live_diagnostics(previous, agent, safety)
                 self._send_external_motion(agent)
                 return
@@ -792,9 +1356,133 @@ class HuNavMotionBackend:
             agent.yaw = float(self._command.orientation)
             terminal_align = True
             self._begin_terminal_alignment()
-        self._shadow = updated
+        self._set_runtime_shadow(agent)
         self._publish_live_diagnostics(previous, agent, safety)
         self._send_external_motion(agent, terminal_align=terminal_align)
+
+    def _terminal_capture_pose(self) -> Mapping[str, float] | None:
+        """Return the first measured Isaac pose inside the goal envelope."""
+        if (
+            self._command is None
+            or self._lookahead_target is None
+            or not self._lookahead_target.is_final
+        ):
+            return None
+        actual = self._actual_for_command()
+        if actual is None:
+            return None
+        distance = math.hypot(
+            float(actual["x"]) - float(self._command.goal_pose[0]),
+            float(actual["y"]) - float(self._command.goal_pose[1]),
+        )
+        if distance > self._settled_arrival_tolerance_m:
+            return None
+        return actual
+
+    def _set_runtime_shadow(self, agent: Agent) -> None:
+        shadow = Agents()
+        shadow.header.frame_id = "map"
+        shadow.header.stamp = self._node.get_clock().now().to_msg()
+        shadow.agents = [agent]
+        self._shadow = shadow
+
+    def _apply_batch_pedestrian_safety(
+        self,
+        previous_by_id: Mapping[str, Agent],
+        proposed_by_id: Mapping[str, Agent],
+        safety_by_id: dict[str, dict[str, object]],
+        dt: float,
+    ) -> None:
+        if not self._safety_enabled or len(proposed_by_id) < 2:
+            return
+        usable_ids = [
+            agent_id
+            for agent_id in proposed_by_id
+            if agent_id in previous_by_id
+        ]
+        if len(usable_ids) < 2:
+            return
+        numeric_ids = {
+            agent_id: int(proposed_by_id[agent_id].id)
+            for agent_id in usable_ids
+        }
+        fixed_agent_ids = []
+        for agent_id in usable_ids:
+            with self._runtime_context(agent_id):
+                fixed = bool(
+                    self._frozen_present
+                    or self._terminal_align_active
+                    or self._route_hold_active
+                    or self._reaction_decision.reaction == "yielding"
+                    or (
+                        self._settled_generation == self._generation
+                        and self._settled_agent_id == self._command.agent_id
+                    )
+                )
+            if not fixed:
+                continue
+            numeric_id = numeric_ids[agent_id]
+            fixed_agent_ids.append(numeric_id)
+            previous = previous_by_id[agent_id]
+            proposed = proposed_by_id[agent_id]
+            proposed.position.position.x = float(previous.position.position.x)
+            proposed.position.position.y = float(previous.position.position.y)
+            proposed.velocity.linear.x = 0.0
+            proposed.velocity.linear.y = 0.0
+            proposed.linear_vel = 0.0
+        result = project_safe_step(
+            previous={
+                numeric_ids[agent_id]: (
+                    float(previous_by_id[agent_id].position.position.x),
+                    float(previous_by_id[agent_id].position.position.y),
+                )
+                for agent_id in usable_ids
+            },
+            proposed={
+                numeric_ids[agent_id]: (
+                    float(proposed_by_id[agent_id].position.position.x),
+                    float(proposed_by_id[agent_id].position.position.y),
+                )
+                for agent_id in usable_ids
+            },
+            radii={
+                numeric_ids[agent_id]: self._hard_radius
+                for agent_id in usable_ids
+            },
+            robot_previous=(0.0, 0.0),
+            robot_proposed=(0.0, 0.0),
+            robot_radius=0.0,
+            static_obstacles={
+                numeric_ids[agent_id]: () for agent_id in usable_ids
+            },
+            fixed_ids=fixed_agent_ids,
+            config=self._safety_config,
+        )
+        diagnostics = result.diagnostics.to_dict()
+        for agent_id in usable_ids:
+            numeric_id = numeric_ids[agent_id]
+            agent = proposed_by_id[agent_id]
+            previous = previous_by_id[agent_id]
+            safe_x, safe_y = result.positions[numeric_id]
+            agent.position.position.x = float(safe_x)
+            agent.position.position.y = float(safe_y)
+            agent.velocity.linear.x = (
+                safe_x - float(previous.position.position.x)
+            ) / dt
+            agent.velocity.linear.y = (
+                safe_y - float(previous.position.position.y)
+            ) / dt
+            agent.linear_vel = math.hypot(
+                float(agent.velocity.linear.x),
+                float(agent.velocity.linear.y),
+            )
+            safety = safety_by_id.setdefault(agent_id, {"enabled": True})
+            safety["pedestrian_pair_contacts"] = int(
+                diagnostics["pedestrian_pair_contacts"]
+            )
+            safety["pedestrian_pair_intervened"] = bool(
+                numeric_id in diagnostics["constrained_agents"]
+            )
 
     def _begin_terminal_alignment(self) -> None:
         if self._terminal_align_active:
@@ -822,8 +1510,14 @@ class HuNavMotionBackend:
             float(actual.get("vx", 0.0)),
             float(actual.get("vy", 0.0)),
         )
+        position_error = math.hypot(
+            float(actual["x"]) - float(self._command.goal_pose[0]),
+            float(actual["y"]) - float(self._command.goal_pose[1]),
+        )
         now = time.monotonic()
         aligned = (
+            position_error <= self._settled_arrival_tolerance_m
+            and
             abs(yaw_error) <= self._terminal_align_yaw_tolerance_rad
             and speed <= self._terminal_align_max_speed_mps
         )
@@ -864,6 +1558,22 @@ class HuNavMotionBackend:
 
     def _build_agent(self, actual: Mapping[str, float]) -> Agent:
         command = self._command
+        if self._frozen_present:
+            yaw = actual.get("yaw", command.orientation)
+            if yaw is None or not math.isfinite(float(yaw)):
+                yaw = float(command.orientation)
+            agent = Agent()
+            agent.id = self._numeric_agent_id(command.agent_id)
+            agent.type = Agent.PERSON
+            agent.name = command.agent_id
+            agent.group_id = -1
+            _set_agent_pose(agent, actual["x"], actual["y"], float(yaw))
+            agent.velocity.linear.x = 0.0
+            agent.velocity.linear.y = 0.0
+            agent.linear_vel = 0.0
+            agent.goals = []
+            self._restore_agent_fields(agent)
+            return agent
         target = self._lookahead_target
         if target is None:
             self._initialize_lookahead(actual)
@@ -876,7 +1586,7 @@ class HuNavMotionBackend:
                 float(first_goal[0]) - actual["x"],
             )
         agent = Agent()
-        agent.id = 1
+        agent.id = self._numeric_agent_id(command.agent_id)
         agent.type = Agent.PERSON
         agent.name = command.agent_id
         agent.group_id = -1
@@ -1160,36 +1870,34 @@ class HuNavMotionBackend:
 
     def _restore_agent_fields(self, agent: Agent) -> None:
         command = self._command
+        # A pre-registered agent is held by an empty goal list and zero current
+        # velocity. Preserve its future desired speed because HuNav does not
+        # refresh that field when rolling goals are supplied after activation.
         speed_scale = float(self._reaction_decision.speed_scale)
         agent.desired_velocity = float(command.velocity) * speed_scale
-        agent.radius = self._agent_radius
+        agent.radius = self._social_radius
         agent.goal_radius = self._goal_radius
         agent.cyclic_goals = False
         # Dense occupied-cell centers must not be passed to HuNav here: its
         # social-force model sums them and can push an agent out of a doorway.
         # Static legality is enforced after compute by the walkable-map sweep.
         agent.closest_obs = []
-        behavior = AgentBehavior()
-        behavior.type = AgentBehavior.BEH_REGULAR
-        behavior.state = AgentBehavior.BEH_NO_ACTIVE
-        behavior.configuration = AgentBehavior.BEH_CONF_CUSTOM
-        behavior.duration = 0.0
-        behavior.once = False
-        behavior.vel = float(command.velocity) * speed_scale
-        behavior.dist = 1.0
-        behavior.social_force_factor = float(
-            self._behavior.get("social_force_factor", 5.0)
+        behavior_name = getattr(command, "behavior", None)
+        if behavior_name is None:
+            behavior_name = "regular"
+        agent.behavior = build_hunav_behavior(
+            behavior_name=str(behavior_name),
+            command_velocity=float(command.velocity),
+            speed_scale=speed_scale,
+            behavior_config=self._behavior,
         )
-        behavior.goal_force_factor = float(
-            self._behavior.get("goal_force_factor", 2.0)
-        )
-        behavior.obstacle_force_factor = float(
-            self._behavior.get("obstacle_force_factor", 10.0)
-        )
-        behavior.other_force_factor = float(
-            self._behavior.get("other_force_factor", 20.0)
-        )
-        agent.behavior = behavior
+        agent_id = str(command.agent_id)
+        if self._native_behavior_profile_by_agent.get(agent_id) == str(
+            behavior_name
+        ):
+            agent.behavior.state = int(
+                self._native_behavior_response_state_by_agent.get(agent_id, 0)
+            )
 
     def _segment_is_walkable(
         self,
@@ -1611,7 +2319,7 @@ class HuNavMotionBackend:
         robot_forward_support = self._robot_support_radius(robot, tangent)
         robot_lateral_support = self._robot_support_radius(robot, normal_left)
         blocking_radius = (
-            self._agent_radius
+            self._planning_radius
             + robot_lateral_support
             + self._avoidance_side_clearance_m
         )
@@ -1627,41 +2335,70 @@ class HuNavMotionBackend:
         evaluations = []
         for side in (-1, 1):
             normal = (normal_left[0] * side, normal_left[1] * side)
-            entry_forward = max(
-                0.0,
-                min(
-                    self._avoidance_forward_offset_m,
-                    longitudinal - self._agent_radius - robot_forward_support,
-                ),
-            )
-            entry_lateral = lateral + side * blocking_radius
-            entry = (
-                position[0]
-                + tangent[0] * entry_forward
-                + normal_left[0] * entry_lateral,
-                position[1]
-                + tangent[1] * entry_forward
-                + normal_left[1] * entry_lateral,
-            )
-            candidate = (
-                robot_xy[0]
-                + tangent[0] * self._avoidance_forward_offset_m
-                + normal[0] * blocking_radius,
-                robot_xy[1]
-                + tangent[1] * self._avoidance_forward_offset_m
-                + normal[1] * blocking_radius,
-            )
-            route = (
-                position,
-                entry,
-                candidate,
-            )
-            evaluation = self._evaluate_avoidance_candidate(
-                side=side,
-                route=route,
-                tangent=tangent,
-                robot=robot,
-            )
+            side_evaluations = []
+            for clearance in self._avoidance_clearance_samples_m:
+                lateral_radius = (
+                    self._planning_radius
+                    + robot_lateral_support
+                    + float(clearance)
+                )
+                for forward_offset in self._avoidance_forward_offset_samples_m:
+                    entry_forward = max(
+                        0.0,
+                        min(
+                            float(forward_offset),
+                            longitudinal
+                            - self._planning_radius
+                            - robot_forward_support,
+                        ),
+                    )
+                    entry_lateral = lateral + side * lateral_radius
+                    entry = (
+                        position[0]
+                        + tangent[0] * entry_forward
+                        + normal_left[0] * entry_lateral,
+                        position[1]
+                        + tangent[1] * entry_forward
+                        + normal_left[1] * entry_lateral,
+                    )
+                    candidate = (
+                        robot_xy[0]
+                        + tangent[0] * float(forward_offset)
+                        + normal[0] * lateral_radius,
+                        robot_xy[1]
+                        + tangent[1] * float(forward_offset)
+                        + normal[1] * lateral_radius,
+                    )
+                    side_evaluations.append(
+                        self._evaluate_avoidance_candidate(
+                            side=side,
+                            route=(position, entry, candidate),
+                            tangent=tangent,
+                            robot=robot,
+                        )
+                    )
+            accepted = [
+                candidate
+                for candidate in side_evaluations
+                if candidate.accepted
+            ]
+            if accepted:
+                evaluation = min(
+                    accepted,
+                    key=lambda item: self._avoidance_candidate_sort_key(
+                        item,
+                        preferred_side=side,
+                    ),
+                )
+            else:
+                evaluation = max(
+                    side_evaluations,
+                    key=lambda item: (
+                        item.static_clearance_m,
+                        item.dynamic_clearance_m,
+                        -item.path_length_m,
+                    ),
+                )
             evaluations.append(evaluation)
         self._last_avoidance_candidates = tuple(evaluations)
         return (
@@ -1755,7 +2492,7 @@ class HuNavMotionBackend:
             dynamic_clearance = min(
                 dynamic_clearance,
                 self._robot_footprint_clearance(point, predicted_robot)
-                - self._agent_radius,
+                - self._planning_radius,
             )
         accepted = (
             dynamic_clearance + 1e-9
@@ -1891,7 +2628,7 @@ class HuNavMotionBackend:
             }
             clearance = (
                 self._robot_footprint_clearance(point, predicted_robot)
-                - self._agent_radius
+                - self._planning_radius
             )
             if (
                 clearance + 1e-9
@@ -1943,6 +2680,7 @@ class HuNavMotionBackend:
         static_clipped = bool(safety.get("static_clip", False))
         constrained = bool(
             safety.get("robot_contacts", 0)
+            or safety.get("pedestrian_pair_contacts", 0)
             or safety.get("static_contacts", 0)
             or static_clipped
         )
@@ -1969,6 +2707,246 @@ class HuNavMotionBackend:
                 float(agent.velocity.linear.x),
             )
 
+    def _update_pedestrian_corridor_yield(
+        self,
+        actual: Mapping[str, float],
+    ) -> bool:
+        """Hold behind a fixed pedestrian when neither passing side is usable."""
+        if (
+            not self._pedestrian_yield_enabled
+            or self._lookahead_target is None
+            or self._command is None
+        ):
+            return False
+        current_id = str(self._command.agent_id)
+        position = (float(actual["x"]), float(actual["y"]))
+        target = (
+            float(self._lookahead_target.x),
+            float(self._lookahead_target.y),
+        )
+        fixed = self._fixed_pedestrian_positions(current_id)
+        blocker_id = self._pedestrian_yield_blocker
+        if blocker_id is None:
+            blocker_id = self._nearest_blocking_pedestrian(
+                position,
+                target,
+                fixed,
+                self._pedestrian_yield_trigger_distance_m,
+            )
+            if blocker_id is None:
+                return False
+        blocker = fixed.get(blocker_id)
+        passage_available = (
+            blocker is None
+            or self._pedestrian_bypass_available(
+                position,
+                target,
+                blocker,
+                fixed,
+            )
+        )
+        blocker_distance = (
+            math.inf if blocker is None else math.dist(position, blocker)
+        )
+        should_release = (
+            passage_available
+            or blocker_distance > self._pedestrian_yield_release_distance_m
+        )
+        if self._pedestrian_yield_blocker is not None:
+            if should_release:
+                self._pedestrian_yield_clear_ticks += 1
+            else:
+                self._pedestrian_yield_clear_ticks = 0
+            if (
+                self._pedestrian_yield_clear_ticks
+                < self._pedestrian_yield_release_ticks
+            ):
+                self._reaction_decision = ReactionDecision(
+                    state="YIELDING_TO_PEDESTRIAN",
+                    reaction="yielding",
+                    speed_scale=0.0,
+                    distance_m=(
+                        None
+                        if not math.isfinite(blocker_distance)
+                        else blocker_distance
+                    ),
+                    ttc_sec=None,
+                )
+                return True
+            released = self._pedestrian_yield_blocker
+            self._pedestrian_yield_blocker = None
+            self._pedestrian_yield_clear_ticks = 0
+            self._yield_hold_yaw = None
+            self._reaction_decision = ReactionDecision(
+                state="WALKING",
+                reaction=None,
+                speed_scale=1.0,
+                distance_m=None,
+                ttc_sec=None,
+                transition="YIELDING_TO_PEDESTRIAN->WALKING",
+            )
+            self._pending_rebase_replan = True
+            self._active_batch_generation = 0
+            self._logger.info(
+                f"HuNav pedestrian corridor released: agent={current_id}, "
+                f"blocker={released}; remaining route will be rebuilt."
+            )
+            return False
+        if passage_available:
+            return False
+        self._pedestrian_yield_blocker = blocker_id
+        self._pedestrian_yield_clear_ticks = 0
+        self._yield_hold_yaw = self._resolve_hold_yaw(actual)
+        self._reaction_decision = ReactionDecision(
+            state="YIELDING_TO_PEDESTRIAN",
+            reaction="yielding",
+            speed_scale=0.0,
+            distance_m=blocker_distance,
+            ttc_sec=None,
+            transition="WALKING->YIELDING_TO_PEDESTRIAN",
+        )
+        self._active_batch_generation = 0
+        self._logger.info(
+            f"HuNav pedestrian corridor blocked: agent={current_id}, "
+            f"blocker={blocker_id}, distance_m={blocker_distance:.3f}; "
+            "both passing sides are unavailable, holding position."
+        )
+        return True
+
+    def _fixed_pedestrian_positions(
+        self,
+        current_id: str,
+    ) -> dict[str, tuple[float, float]]:
+        now = time.monotonic()
+        fixed: dict[str, tuple[float, float]] = {}
+        for agent_id, state in self._runtime_states.items():
+            if agent_id == current_id:
+                continue
+            command = state.get("_command")
+            is_fixed = bool(
+                state.get("_frozen_present")
+                or state.get("_terminal_align_active")
+                or state.get("_route_hold_active")
+                or (
+                    command is not None
+                    and bool(getattr(command, "stop", False))
+                )
+            )
+            if not is_fixed:
+                continue
+            pose = self._actual.get(agent_id)
+            if (
+                pose is None
+                or now - float(pose.get("received_at", 0.0))
+                > self._state_timeout_sec
+            ):
+                continue
+            fixed[agent_id] = (float(pose["x"]), float(pose["y"]))
+        return fixed
+
+    def _nearest_blocking_pedestrian(
+        self,
+        position: tuple[float, float],
+        target: tuple[float, float],
+        fixed: Mapping[str, tuple[float, float]],
+        trigger_distance_m: float,
+    ) -> str | None:
+        tangent = (target[0] - position[0], target[1] - position[1])
+        tangent_length = math.hypot(*tangent)
+        if tangent_length <= 1e-6:
+            return None
+        tangent = (tangent[0] / tangent_length, tangent[1] / tangent_length)
+        normal = (-tangent[1], tangent[0])
+        corridor_half_width = (
+            2.0 * self._planning_radius
+            + self._pedestrian_yield_side_clearance_m
+        )
+        candidates = []
+        for agent_id, obstacle in fixed.items():
+            relative = (
+                obstacle[0] - position[0],
+                obstacle[1] - position[1],
+            )
+            longitudinal = relative[0] * tangent[0] + relative[1] * tangent[1]
+            lateral = abs(
+                relative[0] * normal[0] + relative[1] * normal[1]
+            )
+            distance = math.hypot(*relative)
+            if (
+                0.0 < longitudinal <= trigger_distance_m
+                and lateral <= corridor_half_width
+            ):
+                candidates.append((distance, agent_id))
+        return min(candidates)[1] if candidates else None
+
+    def _pedestrian_bypass_available(
+        self,
+        position: tuple[float, float],
+        target: tuple[float, float],
+        blocker: tuple[float, float],
+        fixed: Mapping[str, tuple[float, float]],
+    ) -> bool:
+        if self._walkable_planner is None:
+            return True
+        tangent = (target[0] - position[0], target[1] - position[1])
+        tangent_length = math.hypot(*tangent)
+        if tangent_length <= 1e-6:
+            return False
+        tangent = (tangent[0] / tangent_length, tangent[1] / tangent_length)
+        normal_left = (-tangent[1], tangent[0])
+        lateral_offset = (
+            2.0 * self._planning_radius
+            + self._pedestrian_yield_side_clearance_m
+        )
+        rejoin = (
+            blocker[0] + tangent[0] * self._pedestrian_yield_forward_offset_m,
+            blocker[1] + tangent[1] * self._pedestrian_yield_forward_offset_m,
+        )
+        for side in (-1, 1):
+            bypass = (
+                blocker[0] + normal_left[0] * side * lateral_offset,
+                blocker[1] + normal_left[1] * side * lateral_offset,
+            )
+            route = (position, bypass, rejoin)
+            route_points = tuple((x, y, 0.0) for x, y in route)
+            if not self._walkable_planner.polyline_is_free(route_points):
+                continue
+            if self._pedestrian_bypass_dynamic_clear(
+                route,
+                fixed,
+            ):
+                return True
+        return False
+
+    def _pedestrian_bypass_dynamic_clear(
+        self,
+        route: tuple[tuple[float, float], ...],
+        fixed: Mapping[str, tuple[float, float]],
+    ) -> bool:
+        robot = self._robot
+        if (
+            robot is not None
+            and time.monotonic() - float(robot.get("received_at", 0.0)) > 1.0
+        ):
+            robot = None
+        minimum = self._avoidance_min_dynamic_clearance_m
+        for _, point in self._sample_avoidance_route(route):
+            if robot is not None:
+                clearance = (
+                    self._robot_footprint_clearance(point, robot)
+                    - self._planning_radius
+                )
+                if clearance + 1e-9 < minimum:
+                    return False
+            for agent_id, obstacle in fixed.items():
+                clearance = (
+                    math.dist(point, obstacle)
+                    - 2.0 * self._planning_radius
+                )
+                if clearance + 1e-9 < minimum:
+                    return False
+        return True
+
     def _update_robot_reaction(
         self,
         actual: Mapping[str, float] | None,
@@ -1993,22 +2971,20 @@ class HuNavMotionBackend:
             and self._lookahead_target is not None
         ):
             position = (float(actual["x"]), float(actual["y"]))
-            if (
-                self._avoidance_encounter_active
-                and self._local_route_mode == "AVOIDANCE"
-            ):
-                route_feasible = self._active_avoidance_route_is_feasible(
-                    position,
-                    robot,
-                )
-                if route_feasible:
-                    self._avoidance_active_route_infeasible_ticks = 0
-                else:
-                    self._avoidance_active_route_infeasible_ticks += 1
+            if self._avoidance_encounter_active:
+                if self._local_route_mode == "AVOIDANCE":
+                    route_feasible = self._active_avoidance_route_is_feasible(
+                        position,
+                        robot,
+                    )
+                    if route_feasible:
+                        self._avoidance_active_route_infeasible_ticks = 0
+                    else:
+                        self._avoidance_active_route_infeasible_ticks += 1
                 # Once a passing side is latched, temporary loss of predicted
-                # clearance is expected while the pedestrian moves laterally.
-                # Hard safety remains authoritative; waypoint progress recovery
-                # decides whether the local route itself must be rebuilt.
+                # clearance remains expected until the pedestrian has fully
+                # rejoined the global route and cleared the robot envelope.
+                # Hard safety remains authoritative throughout that handoff.
                 should_yield = False
             else:
                 self._avoidance_active_route_infeasible_ticks = 0
@@ -2052,7 +3028,6 @@ class HuNavMotionBackend:
             )
             if previous_state == "YIELDING_TO_ROBOT":
                 self._yield_hold_yaw = None
-                self._last_compute_at = time.monotonic()
                 self._safety_robot_previous = None
                 self._active_generation = 0
                 self._shadow = None
@@ -2152,6 +3127,45 @@ class HuNavMotionBackend:
                 f"Failed to write HuNav hold diagnostic {path}: {exc}"
             )
 
+    def _record_native_behavior_transition(
+        self,
+        behavior_diagnostics: Mapping[str, object],
+    ) -> None:
+        command = getattr(self, "_command", None)
+        signature = (
+            behavior_diagnostics.get("native_type"),
+            behavior_diagnostics.get("state"),
+            int(getattr(self, "_generation", 0)),
+            None if command is None else command.phase,
+        )
+        if signature == getattr(self, "_last_native_behavior_signature", None):
+            return
+        previous = getattr(self, "_last_native_behavior_signature", None)
+        self._last_native_behavior_signature = signature
+        path = getattr(self, "_behavior_event_path", None)
+        if path is None:
+            return
+        payload = {
+            "event": "hunav_behavior_transition",
+            "wall_time": time.time(),
+            "monotonic_time": time.monotonic(),
+            "agent_id": None if command is None else command.agent_id,
+            "generation": int(getattr(self, "_generation", 0)),
+            "phase": None if command is None else command.phase,
+            "profile": behavior_diagnostics.get("profile"),
+            "native_behavior": behavior_diagnostics.get("native_type"),
+            "native_behavior_state": behavior_diagnostics.get("state"),
+            "previous_native_behavior": None if previous is None else previous[0],
+            "previous_native_behavior_state": None if previous is None else previous[1],
+        }
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, sort_keys=True) + "\n")
+        except OSError as exc:
+            self._logger.warning(
+                f"Failed to write HuNav behavior event {path}: {exc}"
+            )
+
     def _send_yield_hold(self, actual: Mapping[str, float]) -> None:
         if self._external_future is not None and not self._external_future.done():
             return
@@ -2181,7 +3195,7 @@ class HuNavMotionBackend:
             external_motion_mode=EXTERNAL_MOTION_FREEZE,
             phase=self._command.phase,
         )
-        self._external_future = self._isaac.send(hold, self._external_done)
+        self._dispatch_external_command(hold)
 
     def _send_route_hold(self, actual: Mapping[str, float]) -> None:
         if self._external_future is not None and not self._external_future.done():
@@ -2215,7 +3229,7 @@ class HuNavMotionBackend:
             external_motion_mode=EXTERNAL_MOTION_FREEZE,
             phase=self._command.phase,
         )
-        self._external_future = self._isaac.send(hold, self._external_done)
+        self._dispatch_external_command(hold)
 
     def _record_motion_mode(
         self,
@@ -2355,7 +3369,7 @@ class HuNavMotionBackend:
                     float(proposed.position.position.y),
                 )
             },
-            radii={agent_id: self._agent_radius},
+            radii={agent_id: self._hard_radius},
             robot_previous=robot_previous,
             robot_proposed=robot_current,
             robot_radius=float(robot.radius) if robot_available else 0.0,
@@ -2522,8 +3536,8 @@ class HuNavMotionBackend:
         body.pose.position.y = float(agent.position.position.y)
         body.pose.position.z = 0.85
         body.pose.orientation.w = 1.0
-        body.scale.x = 2.0 * self._agent_radius
-        body.scale.y = 2.0 * self._agent_radius
+        body.scale.x = 2.0 * self._hard_radius
+        body.scale.y = 2.0 * self._hard_radius
         body.scale.z = 1.7
         body.color.r = 0.1
         body.color.g = 0.85
@@ -2556,6 +3570,11 @@ class HuNavMotionBackend:
         heading.color.a = 0.95
         markers.markers.append(heading)
         self._marker_publisher.publish(markers)
+        behavior_diagnostics = describe_hunav_behavior(
+            getattr(self._command, "behavior", "regular"),
+            agent.behavior,
+        )
+        self._record_native_behavior_transition(behavior_diagnostics)
         message = (
             f"HuNav diagnostics: agent={self._command.agent_id}, generation={self._generation}, "
             f"phase={self._command.phase or 'UNSPECIFIED'}, pose=({agent.position.position.x:.3f},"
@@ -2579,8 +3598,24 @@ class HuNavMotionBackend:
             f"local_route_waypoint={self._local_route_index}/"
             f"{len(self._local_route_points)}, "
             f"static_hold_yaw={self._static_hold_yaw}, "
+            f"behavior_profile={behavior_diagnostics['profile']}, "
+            f"native_behavior={behavior_diagnostics['native_type']}, "
+            f"behavior_configuration={behavior_diagnostics['configuration']}, "
+            f"native_behavior_state={behavior_diagnostics['state']}, "
+            f"behavior_duration={behavior_diagnostics['duration']:.2f}, "
+            f"behavior_once={behavior_diagnostics['once']}, "
+            f"behavior_vel={behavior_diagnostics['vel']:.2f}, "
+            f"behavior_dist={behavior_diagnostics['dist']:.2f}, "
+            f"force_factors=("
+            f"{behavior_diagnostics['social_force_factor']:.2f},"
+            f"{behavior_diagnostics['goal_force_factor']:.2f},"
+            f"{behavior_diagnostics['obstacle_force_factor']:.2f},"
+            f"{behavior_diagnostics['other_force_factor']:.2f}), "
             f"reaction_state={self._reaction_decision.state}, "
+            f"reaction={self._reaction_decision.reaction}, "
             f"robot_contacts={safety.get('robot_contacts', 0)}, "
+            f"pedestrian_pair_contacts="
+            f"{safety.get('pedestrian_pair_contacts', 0)}, "
             f"static_clip={safety.get('static_clip', False)}"
         )
         now = time.monotonic()
@@ -2671,10 +3706,45 @@ class HuNavMotionBackend:
             external_timeout_sec=self._external_timeout_sec,
             external_motion_mode=mode,
         )
+        self._dispatch_external_command(command)
+
+    def _dispatch_external_command(self, command: MotionCommand) -> None:
+        agent_id = str(command.agent_id)
+        self._external_request_token += 1
+        token = self._external_request_token
+        generation = self._generation
+        incarnation = self._runtime_incarnations.get(agent_id, 0)
         self._external_future = self._isaac.send(
             command,
-            self._external_done,
+            lambda future: self._external_done_for(
+                agent_id,
+                incarnation,
+                generation,
+                token,
+                future,
+            ),
         )
+
+    def _external_done_for(
+        self,
+        agent_id: str,
+        incarnation: int,
+        generation: int,
+        token: int,
+        future,
+    ) -> None:
+        if (
+            agent_id not in self._runtime_states
+            or self._runtime_incarnations.get(agent_id) != incarnation
+        ):
+            return
+        with self._runtime_context(agent_id):
+            if (
+                self._generation != generation
+                or self._external_request_token != token
+            ):
+                return
+            self._external_done(future)
 
     def _external_done(self, future) -> None:
         try:

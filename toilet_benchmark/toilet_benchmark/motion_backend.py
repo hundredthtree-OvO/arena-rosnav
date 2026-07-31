@@ -2,39 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
 from isaacsim_msgs.msg import NavPed
 from isaacsim_msgs.srv import MovePed
 
-EXTERNAL_MOTION_LOCOMOTION = 0
-EXTERNAL_MOTION_FREEZE = 1
-EXTERNAL_MOTION_TERMINAL_ALIGN = 2
-
-
-@dataclass(frozen=True)
-class MotionCommand:
-    agent_id: str
-    goal_pose: Sequence[float]
-    path_points: Sequence[Sequence[float]]
-    velocity: float
-    orientation: float = 0.0
-    stop: bool = False
-    use_direct_pose: bool = False
-    direct_pose: Sequence[float] | None = None
-    use_external_motion: bool = False
-    external_velocity: Sequence[float] | None = None
-    external_timeout_sec: float = 0.5
-    external_freeze_pose: bool = False
-    external_motion_mode: int = EXTERNAL_MOTION_LOCOMOTION
-    constrain_to_path: bool = False
-    # Semantic phase is diagnostics-only. Motion backends must not infer FSM
-    # transitions from it.
-    phase: str = ""
+from .domain.task import (
+    EXTERNAL_MOTION_FREEZE,
+    EXTERNAL_MOTION_LOCOMOTION,
+    EXTERNAL_MOTION_TERMINAL_ALIGN,
+    MotionCommand,
+)
 
 
 class MotionBackend(Protocol):
+    def register_agents(self, commands: Sequence[MotionCommand]) -> None:
+        """Register a batch before any member starts moving."""
+        ...
+
     def wait_for_service(self, timeout_sec: float) -> bool:
         ...
 
@@ -58,6 +43,10 @@ class MotionBackend(Protocol):
         """Return whether the director may redispatch a stalled command."""
         ...
 
+    def remove_agent(self, agent_id: str) -> None:
+        """Remove an agent from backend-owned runtime state."""
+        ...
+
 
 def _flatten_path_points(points: Sequence[Sequence[float]]) -> list[float]:
     return [
@@ -76,6 +65,10 @@ class IsaacPeopleBackend:
 
     def wait_for_service(self, timeout_sec: float) -> bool:
         return bool(self._client.wait_for_service(timeout_sec=float(timeout_sec)))
+
+    def register_agents(self, commands: Sequence[MotionCommand]) -> None:
+        """Isaac owns spawned pedestrians directly; no local roster is needed."""
+        return None
 
     def send(
         self,
@@ -109,6 +102,10 @@ class IsaacPeopleBackend:
         if done_callback is not None:
             future.add_done_callback(done_callback)
         return future
+
+    def remove_agent(self, agent_id: str) -> None:
+        """Isaac owns no local per-agent motion state."""
+        return None
 
     def is_goal_settled(
         self,

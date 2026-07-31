@@ -142,6 +142,14 @@ class TestMotionBackend(unittest.TestCase):
             backend.allows_director_stall_recovery("toilet_agent_01")
         )
 
+    def test_isaac_backend_remove_agent_is_a_noop(self):
+        backend = _load_motion_backend_module().IsaacPeopleBackend(
+            _FakeNode(_FakeClient()),
+            "/isaac/move_pedestrians",
+        )
+
+        self.assertIsNone(backend.remove_agent("toilet_agent_01"))
+
     def test_send_converts_command_to_one_move_request_with_flattened_path(self):
         module = _load_motion_backend_module()
         future = _FakeFuture()

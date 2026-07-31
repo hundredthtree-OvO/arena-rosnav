@@ -28,6 +28,12 @@ setup(
         "console_scripts": [
             "toilet_director_node = toilet_benchmark.toilet_director_node:main",
             "manual_collection_node = toilet_benchmark.manual_collection_node:main",
+            "toilet_manifest = toilet_benchmark.episodes.cli:main",
+            "toilet_replay = toilet_benchmark.tracks.replay:main",
+            "toilet_replay_export = toilet_benchmark.tracks.replay_export:main",
+            "toilet_replay_isaac = toilet_benchmark.tracks.replay_isaac:main",
+            "hunav_behavior_matrix = toilet_benchmark.behavior_matrix_runner:main",
+            "pedestrian_diagnostic_recorder = toilet_benchmark.pedestrian_diagnostic_recorder:main",
             "hunav_phase0_smoke = toilet_benchmark.hunav_phase0_smoke:main",
             "hunav_isaac_mirror = toilet_benchmark.hunav_isaac_mirror:main",
             "walkable_map_publisher = toilet_benchmark.walkable_map:main",

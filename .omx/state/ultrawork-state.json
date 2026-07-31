@@ -1,0 +1,17 @@
+{
+  "active": false,
+  "current_phase": "completed",
+  "iteration": 1,
+  "started_at": "2026-07-30T13:35:00+08:00",
+  "task_description": "Run fixed-seed HuNav behavior smoke matrix and prepare candidate manifest plus Replay trajectory schema",
+  "completed_at": "2026-07-30T13:45:30+08:00",
+  "build": "passed",
+  "candidate_manifest": "/tmp/toilet_replay_candidate_manifest.json",
+  "tests": "234 passed",
+  "live_runs": [
+    "/tmp/toilet_pipeline_runs/20260730_132542_regular_disabled",
+    "/tmp/toilet_pipeline_runs/20260730_132806_surprised_disabled",
+    "/tmp/toilet_pipeline_runs/20260730_133720_scared_disabled",
+    "/tmp/toilet_pipeline_runs/20260730_134048_regular_disabled"
+  ]
+}

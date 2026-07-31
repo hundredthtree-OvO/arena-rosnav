@@ -33,7 +33,10 @@ director:
   max_live_pose_jump_m: 3.0
   allow_eta_fallback: false
   exit_when_complete: true
-  initial_spawn_interval_sec: 1.5
+  initial_spawn_interval_sec: 4.0
+  # A trailing pre-spawned pedestrian waits until the previous pedestrian has
+  # cleared the shared entrance, preventing symmetric HuNav repulsion there.
+  initial_activation_clearance_m: 1.20
   serialize_exit_corridor: true
   portal_stall_recovery_sec: 3.0
   portal_max_recovery_attempts: 3
@@ -125,7 +128,14 @@ motion_backend:
     # Reuse a nearby forward lookahead when replacing a global route so the
     # local controller does not receive an abrupt heading reset.
     route_splice_max_cross_track_m: 0.35
-    agent_radius_m: 0.30
+    # HuNav's personal-space envelope remains conservative, while route
+    # feasibility and the final no-overlap guard use the measured body proxy.
+    social_radius_m: 0.30
+    planning_radius_m: 0.26
+    hard_radius_m: 0.26
+    # Bound integration after service/reset pauses so roster changes cannot
+    # turn one delayed HuNav response into a visible position jump.
+    max_compute_dt_sec: 0.20
     # Keep HuNav's terminal condition tighter than the director's normal
     # tolerance. The backend separately reports its settled state.
     goal_radius_m: 0.12
@@ -158,8 +168,25 @@ motion_backend:
       goal_force_factor: 2.0
       obstacle_force_factor: 10.0
       other_force_factor: 20.0
+      # HuNav's surprised BT only remains active while its duration timer is
+      # running. A zero duration falls through to regular navigation.
+      surprised:
+        configuration: custom
+        # Keep the upstream one-shot timer alive for the full encounter. The
+        # BT visibility condition still releases the pedestrian when the robot
+        # leaves, while a short timer would silently fall back to REGULAR.
+        duration: 60.0
+        once: true
+        dist: 1.10
+      scared:
+        configuration: custom
+        # Scared uses the same upstream timer gate as surprised. Zero duration
+        # makes every visible-robot tick fall through to regular navigation.
+        duration: 60.0
+        once: true
+        dist: 1.10
     robot_proximity_reaction:
-      enabled: true
+      enabled: false
       mode: fixed
       reaction: regular
       trigger:
@@ -187,6 +214,10 @@ motion_backend:
       trigger_distance_m: 1.10
       side_clearance_m: 0.10
       forward_offset_m: 0.55
+      # Search conservative to tight safe corridors instead of treating one
+      # fixed lateral offset as proof that an entire side is blocked.
+      clearance_samples_m: [0.10, 0.06, 0.02]
+      forward_offset_samples_m: [0.55, 0.75]
       release_distance_m: 1.25
       # Score the complete temporary corridor against the static map and a
       # constant-velocity robot prediction before selecting a passing side.
@@ -200,6 +231,18 @@ motion_backend:
       # fail the same walkable-map test, latch yielding for this encounter.
       geometry_override_enabled: true
       narrow_space_fallback: yielding
+      # A pedestrian waiting at a semantic resource is a fixed obstacle, not
+      # another social-force participant to push around. If the static map,
+      # robot footprint, and fixed pedestrian jointly close both passing
+      # sides, the approaching pedestrian waits before contact and resumes
+      # only after the corridor is stably available again.
+      pedestrian_yield:
+        enabled: true
+        trigger_distance_m: 0.95
+        release_distance_m: 1.10
+        side_clearance_m: 0.08
+        forward_offset_m: 0.45
+        release_confirm_ticks: 5
       # Do not cancel a latched passing corridor on one noisy prediction tick.
       active_route_infeasible_confirm_ticks: 4
       stall_timeout_sec: 2.0
@@ -230,9 +273,18 @@ hunav_profile:
   regular:
     desired_velocity: [0.9, 1.2]
     behavior_type: REGULAR
+
+  surprised:
+    desired_velocity: [0.9, 1.2]
+    behavior_type: SURPRISED
+
+  scared:
+    desired_velocity: [0.9, 1.2]
+    behavior_type: SCARED
+
   impatient:
-    # desired_velocity: [0.8, 1.1]
-    desired_velocity: [1.1, 1.5]
+    # desired_velocity: [1.1, 1.5]
+    desired_velocity: [0.9, 1.2]
     behavior_type: THREATENING
 
 character_pool:

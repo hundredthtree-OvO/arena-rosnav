@@ -1,8 +1,8 @@
-# HuNav 单行人 Isaac Takeover
+# HuNav Isaac Takeover
 
 ## 当前范围
 
-该模式用于 Phase 1 单行人可视化验证：
+该模式用于单行人回归和 shared-world 多行人可视化验证：
 
 - director 继续负责编排入口、小便池、停留和出口事件。
 - voxel route 暂时继续提供全局参考路径。
@@ -11,10 +11,14 @@
   它每帧以 Isaac 4.5 官方 `list[carb.Float3]` 格式同步 AnimGraph 所需的
   `Action`、`Walk`、`PathPoints`。HuNav 输出作为参考轨迹，正常 root 位移由
   MotionMatching 产生；只有跟踪误差超过 `0.65m` 时才会保护性重定位。
-- 激活和停止使用一次性 direct pose，不与 HuNav 行走同时执行。
+- 激活使用一次性 direct pose，不与 HuNav 行走同时执行。到达小便池后的停止会保留为
+  shared HuNav world 中的零速度固定成员，直到真正退出场景才移除。
 
-当前只支持 `--initial-agents 1`。多人接管要等共享 HuNav world state 与 bottleneck
-coordination 接入后再开放。
+`--initial-agents 1` 用于稳定单人回归；`2` 及以上会让所有 active pedestrians
+共享同一次 HuNav `reset_agents/compute_agents`。当前多人模式仍是实验入口，需重点观察
+狭窄通道会车、一个人停止时另一人继续运动，以及退出后剩余 agent 是否连续。
+后续行人的默认激活间隔为 `4.0s`，可通过
+`config/toilet_benchmark.yaml` 的 `director.initial_spawn_interval_sec` 调整。
 
 ## 编译
 
@@ -44,13 +48,21 @@ python3 scripts/arena_scene_profile.py \
   bridge physx_diff_contact
 ```
 
-终端 2，启动单行人 takeover：
+终端 2，启动单行人回归：
 
 ```bash
 source /home/stardust/resources/arena_ws/install/setup.bash
 ros2 run toilet_benchmark toilet_director_node \
   --motion-backend hunav \
   --initial-agents 1
+```
+
+双行人 shared-world 验证只需把最后一项改为：
+
+```bash
+ros2 run toilet_benchmark toilet_director_node \
+  --motion-backend hunav \
+  --initial-agents 2
 ```
 
 director 默认自动启动独立 namespace 下的 HuNav manager。日志写入：

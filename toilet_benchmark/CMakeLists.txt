@@ -29,6 +29,13 @@ install(
     scripts/manual_collection_node
     scripts/hunav_phase0_smoke
     scripts/hunav_isaac_mirror
+    scripts/hunav_behavior_matrix
+    scripts/hunav_interactive_smoke
+    scripts/toilet_manifest
+    scripts/toilet_replay
+    scripts/toilet_replay_export
+    scripts/toilet_replay_isaac
+    scripts/pedestrian_diagnostic_recorder
     scripts/walkable_map_publisher
   DESTINATION lib/${PROJECT_NAME}
 )

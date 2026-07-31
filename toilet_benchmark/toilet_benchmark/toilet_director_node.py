@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from .hunav_adapter import DirectedAgentState, HunavAdapter
 from .hunav_isaac_mirror_core import build_motion_intent_payload
+from .domain.events import BenchmarkEvent, encode_event_payload
 from .interaction_policy import (
     dynamic_robot_obstacles,
     guard_block_requires_wait,
@@ -264,7 +265,13 @@ class ToiletDirectorNode(Node):
         self.max_live_pose_jump_m = float(director_cfg.get("max_live_pose_jump_m", 3.0))
         self.allow_eta_fallback = bool(director_cfg.get("allow_eta_fallback", False))
         self.exit_when_complete = bool(director_cfg.get("exit_when_complete", True))
-        self.initial_spawn_interval_sec = float(director_cfg.get("initial_spawn_interval_sec", 1.0))
+        self.initial_spawn_interval_sec = float(
+            director_cfg.get("initial_spawn_interval_sec", 4.0)
+        )
+        self.initial_activation_clearance_m = max(
+            0.0,
+            float(director_cfg.get("initial_activation_clearance_m", 1.20)),
+        )
         self.serialize_exit_corridor = bool(director_cfg.get("serialize_exit_corridor", True))
         self.pre_spawn_holding_origin = self._optional_vector3(
             director_cfg.get("pre_spawn_holding_origin")
@@ -377,11 +384,6 @@ class ToiletDirectorNode(Node):
         if self.motion_backend_name == "isaac_people":
             self.motion_backend = IsaacPeopleBackend(self, self.move_service_name)
         elif self.motion_backend_name == "hunav":
-            if self.initial_agents > 1:
-                raise ValueError(
-                    "Phase 1 HuNav takeover currently supports exactly one active "
-                    "pedestrian; use --initial-agents 1."
-                )
             from .hunav_motion_backend import HuNavMotionBackend
 
             hunav_config = hunav_motion_cfg
@@ -451,6 +453,7 @@ class ToiletDirectorNode(Node):
             f"max_live_pose_jump_m={self.max_live_pose_jump_m:.2f}, "
             f"exit_when_complete={self.exit_when_complete}, "
             f"initial_spawn_interval_sec={self.initial_spawn_interval_sec:.2f}, "
+            f"initial_activation_clearance_m={self.initial_activation_clearance_m:.2f}, "
             f"serialize_exit_corridor={self.serialize_exit_corridor}, "
             f"hunav_use_portal_controller={self.hunav_use_portal_controller}, "
             f"portal={self.portal.get('id') if self.portal else None}, "
@@ -1110,6 +1113,7 @@ class ToiletDirectorNode(Node):
             return
         state.despawn_requested = True
         self._pending_despawns.add(state.agent_id)
+        self.motion_backend.remove_agent(state.agent_id)
         request = DeletePrim.Request(name=self._character_root_path(state.agent_id))
         future = self._delete_client.call_async(request)
         future.add_done_callback(lambda fut, agent_id=state.agent_id: self._despawn_done_cb(agent_id, fut))
@@ -1119,14 +1123,13 @@ class ToiletDirectorNode(Node):
     def _publish_status_event(self, event: str, state: RuntimeAgent, **extra) -> None:
         if self._status_publisher is None:
             return
-        payload = {
-            "event": str(event),
-            "agent_id": state.agent_id,
-            "phase": state.current_phase,
-            "resource_id": state.resource_id,
-            **extra,
-        }
-        self._status_publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
+        payload = BenchmarkEvent(
+            event_type=str(event),
+            agent_id=state.agent_id,
+            phase=state.current_phase,
+            payload={"resource_id": state.resource_id, **extra},
+        )
+        self._status_publisher.publish(String(data=encode_event_payload(payload)))
 
     def _portal_motion_metadata(
         self,
@@ -1201,7 +1204,7 @@ class ToiletDirectorNode(Node):
             return
         if not accepted:
             return
-        self._status_publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
+        self._status_publisher.publish(String(data=encode_event_payload(payload)))
 
     def _despawn_done_cb(self, agent_id: str, future):
         self._pending_despawns.discard(agent_id)
@@ -1395,6 +1398,25 @@ class ToiletDirectorNode(Node):
             return
         if now < self._next_initial_spawn_time:
             return
+        next_state = self._runtime_agents.get(self._initial_spawn_queue[0])
+        if next_state is None:
+            self._initial_spawn_queue.pop(0)
+            return
+        entrance_pose = list(
+            self.portal["outside"]
+            if self.portal is not None
+            else next_state.entrance_pose
+        )
+        for state in self._runtime_agents.values():
+            if not state.activated or state.agent_id == next_state.agent_id:
+                continue
+            if not self._has_live_pose(state, now):
+                return
+            if (
+                _planar_distance(state.current_pose, entrance_pose)
+                < self.initial_activation_clearance_m
+            ):
+                return
         agent_id = self._initial_spawn_queue.pop(0)
         state = self._runtime_agents.get(agent_id)
         if state is None:
@@ -1450,12 +1472,25 @@ class ToiletDirectorNode(Node):
         self.get_logger().info(f"Spawn pedestrian response: ret={success}, agents={agent_ids}")
         if success:
             active_ids = []
+            roster_commands = []
             for agent_id in agent_ids:
                 state = self._runtime_agents.get(agent_id)
                 if state is None:
                     continue
                 state.spawned = True
                 active_ids.append(agent_id)
+                roster_commands.append(
+                    MotionCommand(
+                        agent_id=state.agent_id,
+                        goal_pose=tuple(state.current_pose),
+                        path_points=(),
+                        velocity=float(state.velocity),
+                        orientation=float(state.initial_yaw),
+                        stop=True,
+                        phase="PRESPAWN_HOLD",
+                    )
+                )
+            self.motion_backend.register_agents(roster_commands)
             self._queue_initial_activations(active_ids)
         else:
             for agent_id in agent_ids:
@@ -1713,6 +1748,14 @@ class ToiletDirectorNode(Node):
                 intent_phase
                 or (runtime_state.current_phase if runtime_state is not None else "")
             ),
+            behavior=str(
+                self.benchmark.get("hunav_profile", {})
+                .get(
+                    runtime_state.profile_name if runtime_state is not None else self.profile_name,
+                    {},
+                )
+                .get("behavior_type", "REGULAR")
+            ).lower(),
         )
         if (
             runtime_state is not None
@@ -2665,7 +2708,10 @@ def main(args=None):
     if motion_backend_name == "hunav" and not parsed.no_start_hunav_manager:
         from .hunav_phase0_smoke import ManagedHuNavProcess
 
-        log_dir = Path("/tmp/toilet_hunav_takeover")
+        hunav_cfg = dict(motion_cfg.get("hunav", {}) or {})
+        log_dir = Path(
+            str(hunav_cfg.get("diagnostic_log_dir", "/tmp/toilet_hunav_takeover"))
+        ).expanduser()
         log_dir.mkdir(parents=True, exist_ok=True)
         manager = ManagedHuNavProcess(
             hunav_namespace,

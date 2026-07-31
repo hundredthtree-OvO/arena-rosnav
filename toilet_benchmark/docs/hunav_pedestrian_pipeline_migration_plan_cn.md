@@ -2,6 +2,11 @@
 
 日期：2026-07-26
 
+> 文档定位：本文只记录 Interactive Track 的行人运动实现迁移，不再承担完整
+> benchmark 规范。任务范围、Replay/Interactive Track、episode、接口、指标、
+> baseline 和发布门槛统一见 `benchmark_design_cn.md`。历史阶段记录用于解释当前
+> 代码来源，不代表所有方案仍是推荐主链路。
+
 ## 1. 目标
 
 构建一套自然、稳定、可复现、可评估的厕所行人 benchmark，解决当前链路中的主要问题：
@@ -170,7 +175,8 @@ APPROACH_PORTAL
 
 ### Phase 1：建立 Motion Backend 和单一运动权威
 
-当前状态（2026-07-27）：单行人 takeover 已接通，已新增可观测性和机器人几何 hard safety。
+当前状态（2026-07-29）：单行人 takeover 已接通；shared HuNav world 的首个多人切片
+已实现，等待 live Isaac 验证。
 
 - 新增 backend-neutral `MotionCommand` 和 `MotionBackend` protocol。
 - 新增 `IsaacPeopleBackend`，集中负责 `MovePed/NavPed` 构造、service readiness 和异步 callback。
@@ -185,7 +191,14 @@ APPROACH_PORTAL
   连续推进，并通过 external-motion 命令写回 Isaac；激活和停止仍走兼容 adapter。
 - Isaac `Person` 已新增 `external_motion` authority：physics tick 内按最近一次 world
   velocity 平滑推进，超时冻结并切换 Idle，跳过原 People path integrator 和 voxel guard。
-- 当前显式限制为单行人；正式开放多人前仍需 live Isaac 验证以及共享 HuNav world state。
+- backend 已按 agent 隔离 route、reaction、terminal alignment 和 external-motion
+  future，并将所有 active agents 放入同一次 `reset_agents/compute_agents` 请求。
+  行人对行人的几何 hard safety 在批量结果写回 Isaac 前统一投影。正式作为 benchmark
+  默认多人链路前仍需完成 2 至 4 人 live Isaac 验证。
+- `USING_URINAL` 停止不再把角色从 HuNav 世界删除，而是以零速度固定成员参与其他行人的
+  社会力与行人间 hard safety；只有 scene lifecycle 真正退场时才调用 backend removal。
+- 多人默认依次激活间隔调整为 `4.0s`，由
+  `director.initial_spawn_interval_sec` 保持可配置。
 - RViz 诊断发布到 `/toilet_benchmark/hunav/route` 与
   `/toilet_benchmark/hunav/markers`：前者是 director 下发给 HuNav 的语义 route，后者显示
   HuNav tick 参考箭头与 portal corridor。generation、phase、目标 yaw、速度和裁剪状态也写入
@@ -385,10 +398,10 @@ HuNav 输出之后只保留 hard safety。此前实验性的 `LocalVelocityCorri
 - HuNav 每个 tick 接收当前真实状态；不能将整段 HuNav 候选轨迹重新编码成 Isaac `GoTo` 列表。
 - Isaac 角色 yaw 正常由速度方向产生。
 - 只有停止活动状态才使用显式 final yaw。
-- 当前单行人 backend 在每次 director 阶段命令时会重置 HuNav agent。进入多人前必须替换为
-  持续运行的 shared HuNav world：所有 active agents 与机器人每 tick 一起提交给
-  `compute_agents`，阶段变化只更新该 agent 的 route/corridor/semantic goal，不能重建其
-  SFM 和 BT 状态。
+- shared HuNav world 首个切片已实现：所有 active agents 与机器人每 tick 一起提交给
+  `compute_agents`，每名行人的 route、reaction、terminal alignment 和 Isaac 异步状态
+  独立保存。当前 active set 或阶段命令变化时仍会调用一次批量 `reset_agents`；后续需验证
+  HuNavSim 是否保留未变 agent 的 SFM/BT 内部状态，并据此决定是否增加增量更新接口。
 
 验收：
 
