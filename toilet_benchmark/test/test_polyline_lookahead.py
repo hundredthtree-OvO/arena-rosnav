@@ -107,6 +107,20 @@ class TestPolylineLookaheadTracker(unittest.TestCase):
         self.assertAlmostEqual(visible.target_progress_m, 0.9)
         self.assertAlmostEqual(visible.x, 0.9)
 
+    def test_project_to_route_does_not_advance_progress(self):
+        tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [2.0, 0.0]],
+            lookahead_m=0.8,
+        )
+        tracker.update(0.25, 0.0)
+
+        projected_x, projected_y, error = tracker.project_to_route(0.8, 0.5)
+
+        self.assertAlmostEqual(projected_x, 0.8)
+        self.assertAlmostEqual(projected_y, 0.0)
+        self.assertAlmostEqual(error, 0.5)
+        self.assertAlmostEqual(tracker.progress_m, 0.25)
+
 
 if __name__ == "__main__":
     unittest.main()

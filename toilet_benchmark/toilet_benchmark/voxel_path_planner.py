@@ -10,7 +10,7 @@ from typing import Iterable
 
 
 GridCell = tuple[int, int]
-DynamicObstacle = tuple[float, float, float]
+DynamicObstacle = tuple[float, ...]
 
 
 class PathPlanningError(RuntimeError):
@@ -98,7 +98,9 @@ class VoxelPathPlanner:
         z: float = 0.0,
         dynamic_obstacles: Iterable[DynamicObstacle] | None = None,
     ) -> list[list[float]]:
-        dynamic_blocked, dynamic_clearance = self._build_dynamic_layer(dynamic_obstacles or ())
+        dynamic_blocked, dynamic_cost = self._build_dynamic_layer(
+            dynamic_obstacles or ()
+        )
         requested_start_cell = self.world_to_cell(float(start[0]), float(start[1]))
         start_cell = self.nearest_free(requested_start_cell, dynamic_blocked=dynamic_blocked)
         goal_cell = self.nearest_free(
@@ -115,7 +117,7 @@ class VoxelPathPlanner:
             start_cell,
             goal_cell,
             dynamic_blocked=dynamic_blocked,
-            dynamic_clearance=dynamic_clearance,
+            dynamic_cost=dynamic_cost,
         )
         if not cells:
             raise PathPlanningError(f"no voxel path from {start_cell} to {goal_cell}")
@@ -123,7 +125,7 @@ class VoxelPathPlanner:
             cells = self._simplify_cells(
                 cells,
                 dynamic_blocked=dynamic_blocked,
-                dynamic_clearance=dynamic_clearance,
+                dynamic_cost=dynamic_cost,
             )
 
         points = [self.cell_to_world(cell, z=z) for cell in cells[1:]]
@@ -232,6 +234,32 @@ class VoxelPathPlanner:
                     return False
         return True
 
+    def polyline_avoids_raw_obstacles(
+        self,
+        points: Iterable[list[float]],
+        *,
+        allow_out_of_bounds: bool = False,
+    ) -> bool:
+        """Check line of sight against scene geometry without agent inflation."""
+        cells = [
+            self.world_to_cell(float(point[0]), float(point[1]))
+            for point in points
+        ]
+        if not cells:
+            return False
+        for cell in cells:
+            if cell in self.occupied:
+                return False
+            if not allow_out_of_bounds and not self._in_bounds(cell):
+                return False
+        for start, goal in zip(cells, cells[1:]):
+            for cell in _supercover_cells(start, goal):
+                if cell in self.occupied:
+                    return False
+                if not allow_out_of_bounds and not self._in_bounds(cell):
+                    return False
+        return True
+
     def _in_bounds(self, cell: GridCell) -> bool:
         if self.grid_bounds is None:
             return True
@@ -270,18 +298,21 @@ class VoxelPathPlanner:
     def _clearance_cost(
         self,
         cell: GridCell,
-        dynamic_clearance: dict[GridCell, float] | None = None,
+        dynamic_cost: dict[GridCell, float] | None = None,
     ) -> float:
         preferred = max(float(self.config.preferred_clearance_m), float(self.config.agent_radius_m))
         hard = max(0.0, float(self.config.agent_radius_m))
-        clearance = min(
-            self.clearance_m(cell),
-            float((dynamic_clearance or {}).get(cell, math.inf)),
-        )
+        clearance = self.clearance_m(cell)
         if not math.isfinite(clearance) or clearance >= preferred or preferred <= hard + 1e-9:
-            return 0.0
-        normalized = (preferred - max(clearance, hard)) / (preferred - hard)
-        return max(0.0, float(self.config.clearance_cost_weight)) * normalized * normalized
+            static_cost = 0.0
+        else:
+            normalized = (preferred - max(clearance, hard)) / (preferred - hard)
+            static_cost = (
+                max(0.0, float(self.config.clearance_cost_weight))
+                * normalized
+                * normalized
+            )
+        return max(static_cost, float((dynamic_cost or {}).get(cell, 0.0)))
 
     def _turn_cost(self, previous: GridCell | None, current: GridCell, neighbor: GridCell) -> float:
         if previous is None:
@@ -299,10 +330,21 @@ class VoxelPathPlanner:
         obstacles: Iterable[DynamicObstacle],
     ) -> tuple[set[GridCell], dict[GridCell, float]]:
         hard_radius = max(0.0, float(self.config.agent_radius_m))
-        preferred = max(hard_radius, float(self.config.preferred_clearance_m))
         blocked: set[GridCell] = set()
-        clearance_by_cell: dict[GridCell, float] = {}
-        for obstacle_x, obstacle_y, obstacle_radius in obstacles:
+        cost_by_cell: dict[GridCell, float] = {}
+        weight = max(0.0, float(self.config.clearance_cost_weight))
+        for obstacle in obstacles:
+            if len(obstacle) < 3:
+                continue
+            obstacle_x, obstacle_y, obstacle_radius = obstacle[:3]
+            preferred = (
+                hard_radius + max(0.0, float(obstacle[3]))
+                if len(obstacle) >= 4
+                else max(
+                    hard_radius,
+                    float(self.config.preferred_clearance_m),
+                )
+            )
             radius = max(0.0, float(obstacle_radius))
             center = self.world_to_cell(float(obstacle_x), float(obstacle_y))
             search_radius = math.ceil((radius + preferred + self.resolution) / self.resolution)
@@ -318,11 +360,18 @@ class VoxelPathPlanner:
                     )
                     if clearance > preferred + self.resolution:
                         continue
-                    if clearance < clearance_by_cell.get(cell, math.inf):
-                        clearance_by_cell[cell] = clearance
                     if clearance <= hard_radius + 1e-9:
                         blocked.add(cell)
-        return blocked, clearance_by_cell
+                        continue
+                    if preferred <= hard_radius + 1e-9:
+                        continue
+                    normalized = (
+                        preferred - min(clearance, preferred)
+                    ) / (preferred - hard_radius)
+                    cost = weight * normalized * normalized
+                    if cost > cost_by_cell.get(cell, 0.0):
+                        cost_by_cell[cell] = cost
+        return blocked, cost_by_cell
 
     def _astar(
         self,
@@ -330,7 +379,7 @@ class VoxelPathPlanner:
         goal: GridCell,
         *,
         dynamic_blocked: set[GridCell] | None = None,
-        dynamic_clearance: dict[GridCell, float] | None = None,
+        dynamic_cost: dict[GridCell, float] | None = None,
     ) -> list[GridCell]:
         min_x, max_x, min_y, max_y = self._search_bounds(start, goal)
         open_heap: list[tuple[float, float, GridCell]] = []
@@ -355,7 +404,7 @@ class VoxelPathPlanner:
                 new_cost = (
                     current_cost
                     + step_cost
-                    + self._clearance_cost(neighbor, dynamic_clearance)
+                    + self._clearance_cost(neighbor, dynamic_cost)
                     + self._turn_cost(came_from.get(current), current, neighbor)
                 )
                 parent = came_from.get(current)
@@ -370,7 +419,7 @@ class VoxelPathPlanner:
                 ):
                     line_cells = list(_supercover_cells(parent, neighbor))
                     average_clearance_cost = sum(
-                        self._clearance_cost(cell, dynamic_clearance)
+                        self._clearance_cost(cell, dynamic_cost)
                         for cell in line_cells[1:]
                     ) / max(1, len(line_cells) - 1)
                     distance = _cell_distance(parent, neighbor)
@@ -428,7 +477,7 @@ class VoxelPathPlanner:
         cells: list[GridCell],
         *,
         dynamic_blocked: set[GridCell] | None = None,
-        dynamic_clearance: dict[GridCell, float] | None = None,
+        dynamic_cost: dict[GridCell, float] | None = None,
     ) -> list[GridCell]:
         if len(cells) <= 2:
             return cells
@@ -447,11 +496,8 @@ class VoxelPathPlanner:
                     break
                 segment_limit = max_length
                 if preferred_clearance > 0.0 and any(
-                    min(
-                        self.clearance_m(cell),
-                        float((dynamic_clearance or {}).get(cell, math.inf)),
-                    )
-                    < preferred_clearance
+                    self.clearance_m(cell) < preferred_clearance
+                    or float((dynamic_cost or {}).get(cell, 0.0)) > 0.0
                     for cell in line_cells
                 ):
                     segment_limit = constrained_length

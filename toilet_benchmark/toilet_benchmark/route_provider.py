@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
+from .motion import GlobalRouterPort, RoutePlan
 from .voxel_path_planner import PathPlanningError
 
 
@@ -19,8 +20,8 @@ class RouteRequest:
     goal_pose: Sequence[float]
 
 
-class RouteProvider(Protocol):
-    def plan(self, request: RouteRequest) -> list[list[float]] | None:
+class RouteProvider(GlobalRouterPort, Protocol):
+    def plan(self, request: RouteRequest) -> RoutePlan | None:
         ...
 
 
@@ -43,7 +44,7 @@ class VoxelRouteProvider:
         self._clock = clock
         self._dynamic_wait_log: dict[str, float] = {}
 
-    def plan(self, request: RouteRequest) -> list[list[float]] | None:
+    def plan(self, request: RouteRequest) -> RoutePlan | None:
         now = self._clock()
         obstacles = self._dynamic_obstacles(now)
         start_pose = list(request.start_pose)
@@ -82,7 +83,12 @@ class VoxelRouteProvider:
             f"{request.agent_id} voxel path: start={start_pose[:3]}, goal={goal_pose[:3]}, "
             f"points={len(points)}, dynamic_obstacles={len(obstacles)}"
         )
-        return points
+        return RoutePlan.from_points(
+            agent_id=request.agent_id,
+            points=points,
+            planner_id="voxel",
+            dynamic_obstacle_count=len(obstacles),
+        )
 
     def _static_route_exists(
         self,
@@ -118,7 +124,7 @@ class WalkableMapRouteProvider:
         self._dynamic_obstacles = dynamic_obstacles
         self._clock = clock
 
-    def plan(self, request: RouteRequest) -> list[list[float]] | None:
+    def plan(self, request: RouteRequest) -> RoutePlan | None:
         start_pose = list(request.start_pose)
         goal_pose = list(request.goal_pose)
         obstacles = self._dynamic_obstacles(self._clock())
@@ -152,4 +158,10 @@ class WalkableMapRouteProvider:
             f"fingerprint={self._planner.scene_fingerprint[:12]}, "
             f"route={[[round(float(value), 3) for value in point] for point in points]}"
         )
-        return points
+        return RoutePlan.from_points(
+            agent_id=request.agent_id,
+            points=points,
+            planner_id="walkable_map",
+            map_version=str(self._planner.scene_fingerprint),
+            dynamic_obstacle_count=len(obstacles),
+        )

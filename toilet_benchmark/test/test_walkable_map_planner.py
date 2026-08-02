@@ -39,6 +39,22 @@ def _payload(width=8, height=6):
 
 
 class TestWalkableMapPlanner(unittest.TestCase):
+    def test_raw_visibility_is_exposed_for_local_subgoal_selection(self):
+        payload = _payload(width=4, height=4)
+        payload["data"] = [0] * 16
+        payload["data"][1 * 4 + 1] = 100
+        planner = WalkableMapPlanner(
+            payload,
+            WalkableMapPlannerConfig(
+                map_path="unused.json",
+                agent_radius_m=1.1,
+            ),
+        )
+        segment = [[0.25, 0.25, 0.0], [1.25, 0.25, 0.0]]
+
+        self.assertFalse(planner.polyline_is_free(segment))
+        self.assertTrue(planner.polyline_avoids_raw_obstacles(segment))
+
     def _planner(self, payload=None):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -78,11 +94,12 @@ class TestWalkableMapPlanner(unittest.TestCase):
             logger=logger,
         )
 
-        points = provider.plan(
+        plan = provider.plan(
             RouteRequest("agent", [0.25, 0.25, 0.0], [3.75, 0.25, 0.0])
         )
 
-        self.assertIsNotNone(points)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.map_version, "abc123")
         self.assertIn("fingerprint=abc123", logger.info_messages[0])
 
     def test_clip_step_stops_before_crossing_static_wall(self):

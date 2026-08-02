@@ -16,6 +16,48 @@ CONFIG = SafetyConfig(
 
 
 class TestHuNavPhase0Safety(unittest.TestCase):
+    def test_oriented_robot_components_leave_rectangle_corner_free(self):
+        result = project_safe_step(
+            previous={1: (0.16, 0.62)},
+            proposed={1: (0.10, 0.62)},
+            radii={1: 0.26},
+            robot_previous=(0.0, 0.0),
+            robot_proposed=(0.0, 0.0),
+            robot_radius=0.0,
+            robot_components=(
+                ((-0.09, 0.0), (-0.09, 0.0), 0.27),
+                ((0.0, 0.0), (0.0, 0.0), 0.27),
+                ((0.09, 0.0), (0.09, 0.0), 0.27),
+            ),
+            static_obstacles={1: ()},
+            config=CONFIG,
+        )
+
+        self.assertEqual(result.diagnostics.robot_contacts, 0)
+        self.assertAlmostEqual(result.positions[1][0], 0.10)
+        self.assertAlmostEqual(result.positions[1][1], 0.62)
+
+    def test_oriented_robot_components_still_project_true_contact(self):
+        result = project_safe_step(
+            previous={1: (0.0, 0.60)},
+            proposed={1: (0.0, 0.40)},
+            radii={1: 0.26},
+            robot_previous=(0.0, 0.0),
+            robot_proposed=(0.0, 0.0),
+            robot_radius=0.0,
+            robot_components=(
+                ((-0.09, 0.0), (-0.09, 0.0), 0.27),
+                ((0.0, 0.0), (0.0, 0.0), 0.27),
+                ((0.09, 0.0), (0.09, 0.0), 0.27),
+            ),
+            static_obstacles={1: ()},
+            config=CONFIG,
+        )
+
+        self.assertGreater(result.diagnostics.robot_contacts, 0)
+        self.assertEqual(result.diagnostics.residual_violation_count, 0)
+        self.assertGreater(result.positions[1][1], 0.53)
+
     def test_clear_motion_is_unchanged(self):
         result = project_safe_step(
             previous={1: (-1.0, 0.0), 2: (1.0, 1.0)},

@@ -49,11 +49,13 @@ class TestVoxelRouteProvider(unittest.TestCase):
             clock=lambda: 10.0,
         )
 
-        points = provider.plan(
+        plan = provider.plan(
             RouteRequest("toilet_agent_01", [0.0, 0.0, 1.0], [1.0, 2.0, 2.0])
         )
 
-        self.assertEqual(points, [[1.0, 2.0, 0.0]])
+        self.assertEqual(plan.points, ((1.0, 2.0, 0.0),))
+        self.assertEqual(plan.planner_id, "voxel")
+        self.assertEqual(plan.dynamic_obstacle_count, 1)
         self.assertEqual(planner.calls[0][2]["z"], 0.0)
         self.assertEqual(
             planner.calls[0][2]["dynamic_obstacles"],
@@ -116,11 +118,14 @@ class TestVoxelRouteProvider(unittest.TestCase):
             clock=lambda: 10.0,
         )
 
-        points = provider.plan(
+        plan = provider.plan(
             RouteRequest("toilet_agent_01", [0.0, 0.0, 0.0], [1.0, 2.0, 0.0])
         )
 
-        self.assertEqual(points, [[1.0, 2.0, 0.0]])
+        self.assertEqual(plan.points, ((1.0, 2.0, 0.0),))
+        self.assertEqual(plan.planner_id, "walkable_map")
+        self.assertEqual(plan.map_version, "fingerprint")
+        self.assertEqual(plan.dynamic_obstacle_count, 1)
         self.assertEqual(
             planner.calls[0][2]["dynamic_obstacles"],
             [(3.0, 4.0, 0.4)],

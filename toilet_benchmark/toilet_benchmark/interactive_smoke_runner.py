@@ -87,18 +87,18 @@ DYNAMIC_CROSSING_PROFILES: dict[str, DynamicCrossingProfile] = {
         name="crossing_clear",
         reset_pose=(1.0, -0.8, 0.03, math.pi / 2.0),
         post_pose=(4.0, -3.0, 0.03, 0.0),
-        trigger_x=-2.00,
+        trigger_x=-1.50,
         topic="/cmd_vel_gamepad_diff",
         linear_x=0.20,
         motion_sec=3.0,
     ),
     "crossing_conflict": DynamicCrossingProfile(
         name="crossing_conflict",
-        # The pedestrian reaches x=0 roughly 2.5 s after the trigger. Start
-        # close enough that the robot reaches the route during that window.
+        # Calibrated stock People locomotion reaches the crossing more slowly
+        # than its task-level desired speed, so trigger after the doorway.
         reset_pose=(0.0, 0.15, 0.03, math.pi / 2.0),
         post_pose=(4.0, -3.0, 0.03, 0.0),
-        trigger_x=-1.50,
+        trigger_x=-2.00,
         topic="/cmd_vel_gamepad_diff",
         linear_x=0.20,
         motion_sec=5.0,
@@ -120,6 +120,30 @@ SCENARIO_PROFILES: dict[str, ScenarioProfile] = {
         robot_away_pose=(4.0, -3.0, 0.03, 0.0),
         trigger_marker="toilet_agent_01 started using urinal_2",
         release_marker="toilet_agent_01 leaving urinal_2",
+    ),
+    "passable_passage_u1": ScenarioProfile(
+        name="passable_passage_u1",
+        initial_agents=2,
+        target_resource="urinal_3,urinal_1",
+        initial_spawn_interval_sec=40.0,
+        urinal_service_time_sec=(70.0, 70.0),
+        robot_intervention="occupied_passage",
+        robot_blocking_pose=(0.0, 0.0, 0.03, 0.0),
+        robot_away_pose=(4.0, -3.0, 0.03, 0.0),
+        trigger_marker="toilet_agent_01 started using urinal_3",
+        release_marker="toilet_agent_01 leaving urinal_3",
+    ),
+    "passable_passage_u2": ScenarioProfile(
+        name="passable_passage_u2",
+        initial_agents=2,
+        target_resource="urinal_3,urinal_2",
+        initial_spawn_interval_sec=40.0,
+        urinal_service_time_sec=(70.0, 70.0),
+        robot_intervention="occupied_passage",
+        robot_blocking_pose=(0.0, 0.0, 0.03, 0.0),
+        robot_away_pose=(4.0, -3.0, 0.03, 0.0),
+        trigger_marker="toilet_agent_01 started using urinal_3",
+        release_marker="toilet_agent_01 leaving urinal_3",
     ),
 }
 
@@ -144,6 +168,7 @@ def make_benchmark_variant(
     diagnostic_dir: Path,
     reaction_override: bool | None,
     avoidance_override: bool | None = None,
+    local_motion_shadow_override: bool | None = None,
     seed_override: int | None = None,
     scenario_profile: ScenarioProfile | None = None,
 ) -> Mapping:
@@ -158,6 +183,9 @@ def make_benchmark_variant(
     if avoidance_override is not None:
         avoidance = hunav.setdefault("regular_avoidance", {})
         avoidance["enabled"] = bool(avoidance_override)
+    if local_motion_shadow_override is not None:
+        local_motion_shadow = hunav.setdefault("local_motion_shadow", {})
+        local_motion_shadow["enabled"] = bool(local_motion_shadow_override)
     if scenario_profile is not None:
         if scenario_profile.initial_spawn_interval_sec is not None:
             payload.setdefault("director", {})["initial_spawn_interval_sec"] = float(
@@ -188,6 +216,34 @@ def _diagnostic_samples(text: str) -> dict[str, list[dict[str, object]]]:
         r"pedestrian_pair_contacts=(?P<pair_contacts>\d+)"
     )
     for match in pattern.finditer(text):
+        avoidance_match = re.search(
+            r"avoidance_side=([+-]?\d+)",
+            match.group(0),
+        )
+        shadow_enabled_match = re.search(
+            r"local_shadow_enabled=(True|False)",
+            match.group(0),
+        )
+        shadow_feasible_match = re.search(
+            r"local_shadow_feasible=(True|False|None)",
+            match.group(0),
+        )
+        shadow_error_match = re.search(
+            r"local_shadow_velocity_error_mps=([\d.]+)",
+            match.group(0),
+        )
+        shadow_mode_match = re.search(
+            r"local_shadow_behavior_mode=([^, ]+)",
+            match.group(0),
+        )
+        shadow_speed_match = re.search(
+            r"local_shadow_selected_speed_mps=([\d.]+)",
+            match.group(0),
+        )
+        shadow_avoidance_match = re.search(
+            r"local_shadow_avoidance_active=(True|False|None)",
+            match.group(0),
+        )
         sample = {
             "time": float(match.group("time")),
             "generation": int(match.group("generation")),
@@ -197,10 +253,46 @@ def _diagnostic_samples(text: str) -> dict[str, list[dict[str, object]]]:
             "yaw": float(match.group("yaw")),
             "speed": float(match.group("speed")),
             "route_progress": float(match.group("progress")),
+            "avoidance_side": (
+                int(avoidance_match.group(1))
+                if avoidance_match is not None
+                else 0
+            ),
             "behavior_profile": match.group("profile"),
             "native_behavior": match.group("behavior"),
             "native_behavior_state": match.group("behavior_state"),
             "pedestrian_pair_contacts": int(match.group("pair_contacts")),
+            "local_shadow_enabled": (
+                shadow_enabled_match is not None
+                and shadow_enabled_match.group(1) == "True"
+            ),
+            "local_shadow_feasible": (
+                shadow_feasible_match.group(1) == "True"
+                if shadow_feasible_match is not None
+                and shadow_feasible_match.group(1) != "None"
+                else None
+            ),
+            "local_shadow_velocity_error_mps": (
+                float(shadow_error_match.group(1))
+                if shadow_error_match is not None
+                else None
+            ),
+            "local_shadow_behavior_mode": (
+                shadow_mode_match.group(1)
+                if shadow_mode_match is not None
+                else None
+            ),
+            "local_shadow_selected_speed_mps": (
+                float(shadow_speed_match.group(1))
+                if shadow_speed_match is not None
+                else None
+            ),
+            "local_shadow_avoidance_active": (
+                shadow_avoidance_match.group(1) == "True"
+                if shadow_avoidance_match is not None
+                and shadow_avoidance_match.group(1) != "None"
+                else None
+            ),
         }
         samples.setdefault(match.group("agent"), []).append(sample)
     return samples
@@ -246,6 +338,10 @@ def summarize_multi_agent_diagnostics(text: str) -> dict[str, object]:
         route_regressions = 0
         behavior_transitions = 0
         behavior_profile_mismatches = 0
+        avoidance_episode_count = 0
+        avoidance_side_switch_count = 0
+        avoidance_active_sample_count = 0
+        previous_avoidance_side = 0
         previous = None
         previous_behavior = None
         for sample in samples:
@@ -278,7 +374,54 @@ def summarize_multi_agent_diagnostics(text: str) -> dict[str, object]:
             previous_behavior = behavior_key
             if sample["native_behavior"] != sample["behavior_profile"]:
                 behavior_profile_mismatches += 1
+            avoidance_side = int(sample["avoidance_side"])
+            if avoidance_side:
+                avoidance_active_sample_count += 1
+                if previous_avoidance_side == 0:
+                    avoidance_episode_count += 1
+                elif avoidance_side != previous_avoidance_side:
+                    avoidance_side_switch_count += 1
+                previous_avoidance_side = avoidance_side
+            else:
+                previous_avoidance_side = 0
             previous = sample
+
+        shadow_samples = [
+            sample
+            for sample in samples
+            if bool(sample["local_shadow_enabled"])
+            and sample["local_shadow_feasible"] is not None
+        ]
+        shadow_errors = sorted(
+            float(sample["local_shadow_velocity_error_mps"])
+            for sample in shadow_samples
+            if sample["local_shadow_velocity_error_mps"] is not None
+        )
+        shadow_modes: dict[str, int] = {}
+        for sample in shadow_samples:
+            mode = sample["local_shadow_behavior_mode"]
+            if mode is None:
+                continue
+            key = str(mode)
+            shadow_modes[key] = shadow_modes.get(key, 0) + 1
+        shadow_feasible_count = sum(
+            sample["local_shadow_feasible"] is True
+            for sample in shadow_samples
+        )
+        shadow_selected_speeds = [
+            float(sample["local_shadow_selected_speed_mps"])
+            for sample in shadow_samples
+            if sample["local_shadow_selected_speed_mps"] is not None
+        ]
+        shadow_avoidance_count = sum(
+            sample["local_shadow_avoidance_active"] is True
+            for sample in shadow_samples
+        )
+        p95_index = (
+            max(0, math.ceil(0.95 * len(shadow_errors)) - 1)
+            if shadow_errors
+            else 0
+        )
 
         activation_error_m = None
         target = activation_targets.get(agent_id)
@@ -342,8 +485,39 @@ def summarize_multi_agent_diagnostics(text: str) -> dict[str, object]:
             "route_progress_regression_count": route_regressions,
             "behavior_transition_count": behavior_transitions,
             "behavior_profile_mismatch_count": behavior_profile_mismatches,
+            "avoidance_episode_count": avoidance_episode_count,
+            "avoidance_active_sample_count": avoidance_active_sample_count,
+            "avoidance_side_switch_count": avoidance_side_switch_count,
             "pedestrian_pair_contact_samples": sum(
                 int(sample["pedestrian_pair_contacts"]) > 0 for sample in samples
+            ),
+            "local_shadow_sample_count": len(shadow_samples),
+            "local_shadow_feasible_sample_count": shadow_feasible_count,
+            "local_shadow_infeasible_sample_count": (
+                len(shadow_samples) - shadow_feasible_count
+            ),
+            "local_shadow_feasible_ratio": (
+                shadow_feasible_count / len(shadow_samples)
+                if shadow_samples
+                else None
+            ),
+            "local_shadow_velocity_error_mean_mps": (
+                sum(shadow_errors) / len(shadow_errors)
+                if shadow_errors
+                else None
+            ),
+            "local_shadow_velocity_error_p95_mps": (
+                shadow_errors[p95_index] if shadow_errors else None
+            ),
+            "local_shadow_velocity_error_max_mps": (
+                shadow_errors[-1] if shadow_errors else None
+            ),
+            "local_shadow_behavior_modes": dict(sorted(shadow_modes.items())),
+            "local_shadow_avoidance_active_sample_count": shadow_avoidance_count,
+            "local_shadow_selected_speed_mean_mps": (
+                sum(shadow_selected_speeds) / len(shadow_selected_speeds)
+                if shadow_selected_speeds
+                else None
             ),
         }
 
@@ -406,6 +580,14 @@ def summarize_multi_agent_diagnostics(text: str) -> dict[str, object]:
         for item in per_agent.values()
         if item["activation_error_m"] is not None
     ]
+    local_shadow_sample_count = sum(
+        int(item["local_shadow_sample_count"])
+        for item in per_agent.values()
+    )
+    local_shadow_infeasible_sample_count = sum(
+        int(item["local_shadow_infeasible_sample_count"])
+        for item in per_agent.values()
+    )
     return {
         "diagnostic_agent_count": len(samples_by_agent),
         "diagnostic_samples_by_agent": per_agent,
@@ -417,6 +599,214 @@ def summarize_multi_agent_diagnostics(text: str) -> dict[str, object]:
         ),
         "pedestrian_pair_overlap_samples": overlap_samples,
         "simultaneous_stop_duration_sec": simultaneous_stop_duration_sec,
+        "local_shadow_sample_count": local_shadow_sample_count,
+        "local_shadow_infeasible_sample_count": (
+            local_shadow_infeasible_sample_count
+        ),
+        "local_shadow_feasible_ratio": (
+            (local_shadow_sample_count - local_shadow_infeasible_sample_count)
+            / local_shadow_sample_count
+            if local_shadow_sample_count
+            else None
+        ),
+    }
+
+
+def summarize_local_motion_diagnostics(text: str) -> dict[str, object]:
+    """Summarize the backend-neutral E2 takeover diagnostics."""
+
+    number = r"(?:-?(?:\d+(?:\.\d*)?|\.\d+)|inf|nan)"
+    pattern = re.compile(
+        rf"\[(?P<time>\d+\.\d+)\].*Local motion diagnostics: "
+        rf"agent=(?P<agent>[^,]+), phase=(?P<phase>[^,]+), "
+        rf"feasible=(?P<feasible>True|False), "
+        rf"command_speed=(?P<command_speed>{number}), "
+        rf"actual_speed=(?P<actual_speed>{number}), "
+        rf"remaining_m=(?P<remaining>{number}), "
+        rf"static_clearance_m=(?P<static_clearance>{number}), "
+        rf"service_inflight=(?P<service_inflight>True|False), "
+        rf"static_rejected=(?P<static_rejected>\d+), "
+        rf"dynamic_rejected=(?P<dynamic_rejected>\d+)"
+        rf"(?:, dynamic_clearance_m=(?P<dynamic_clearance>{number}))?"
+        rf"(?:, peer_clearance_m=(?P<peer_clearance>{number}))?"
+        rf"(?:, robot_clearance_m=(?P<robot_clearance>{number}))?"
+        rf"(?:, soft_clearance_target_m=(?P<soft_clearance_target>{number}))?"
+        rf"(?:, overlap_recovery_neighbors=(?P<overlap_recovery>\d+))?"
+    )
+    samples_by_agent: dict[str, list[dict[str, object]]] = {}
+    for match in pattern.finditer(text):
+        sample = {
+            "time": float(match.group("time")),
+            "phase": match.group("phase"),
+            "feasible": match.group("feasible") == "True",
+            "command_speed": float(match.group("command_speed")),
+            "actual_speed": float(match.group("actual_speed")),
+            "remaining": float(match.group("remaining")),
+            "static_clearance": float(match.group("static_clearance")),
+            "service_inflight": match.group("service_inflight") == "True",
+            "static_rejected": int(match.group("static_rejected")),
+            "dynamic_rejected": int(match.group("dynamic_rejected")),
+            "dynamic_clearance": (
+                float(match.group("dynamic_clearance"))
+                if match.group("dynamic_clearance") is not None
+                else math.nan
+            ),
+            "peer_clearance": (
+                float(match.group("peer_clearance"))
+                if match.group("peer_clearance") is not None
+                else math.nan
+            ),
+            "robot_clearance": (
+                float(match.group("robot_clearance"))
+                if match.group("robot_clearance") is not None
+                else math.nan
+            ),
+            "soft_clearance_target": (
+                float(match.group("soft_clearance_target"))
+                if match.group("soft_clearance_target") is not None
+                else math.nan
+            ),
+            "overlap_recovery": int(match.group("overlap_recovery") or 0),
+        }
+        samples_by_agent.setdefault(match.group("agent"), []).append(sample)
+
+    per_agent: dict[str, dict[str, object]] = {}
+    all_tracking_errors: list[float] = []
+    all_finite_clearances: list[float] = []
+    all_finite_dynamic_clearances: list[float] = []
+    all_finite_peer_clearances: list[float] = []
+    all_finite_robot_clearances: list[float] = []
+    total_overlap_recovery_samples = 0
+    total_samples = 0
+    total_infeasible = 0
+    total_inflight = 0
+    for agent_id, samples in sorted(samples_by_agent.items()):
+        samples.sort(key=lambda sample: float(sample["time"]))
+        tracking_errors = [
+            abs(float(sample["command_speed"]) - float(sample["actual_speed"]))
+            for sample in samples
+        ]
+        finite_clearances = [
+            float(sample["static_clearance"])
+            for sample in samples
+            if math.isfinite(float(sample["static_clearance"]))
+        ]
+        finite_dynamic_clearances = [
+            float(sample["dynamic_clearance"])
+            for sample in samples
+            if math.isfinite(float(sample["dynamic_clearance"]))
+        ]
+        finite_peer_clearances = [
+            float(sample["peer_clearance"])
+            for sample in samples
+            if math.isfinite(float(sample["peer_clearance"]))
+        ]
+        finite_robot_clearances = [
+            float(sample["robot_clearance"])
+            for sample in samples
+            if math.isfinite(float(sample["robot_clearance"]))
+        ]
+        overlap_recovery_count = sum(
+            int(sample["overlap_recovery"]) > 0 for sample in samples
+        )
+        infeasible_count = sum(not bool(sample["feasible"]) for sample in samples)
+        inflight_count = sum(bool(sample["service_inflight"]) for sample in samples)
+        remaining_regressions = sum(
+            float(current["remaining"]) > float(previous["remaining"]) + 0.05
+            for previous, current in zip(samples, samples[1:])
+            if current["phase"] == previous["phase"]
+        )
+        per_agent[agent_id] = {
+            "sample_count": len(samples),
+            "feasible_sample_count": len(samples) - infeasible_count,
+            "infeasible_sample_count": infeasible_count,
+            "feasible_ratio": (
+                (len(samples) - infeasible_count) / len(samples)
+                if samples
+                else None
+            ),
+            "speed_tracking_error_mean_mps": (
+                sum(tracking_errors) / len(tracking_errors)
+                if tracking_errors
+                else None
+            ),
+            "speed_tracking_error_max_mps": (
+                max(tracking_errors) if tracking_errors else None
+            ),
+            "min_static_clearance_m": (
+                min(finite_clearances) if finite_clearances else None
+            ),
+            "min_dynamic_clearance_m": (
+                min(finite_dynamic_clearances)
+                if finite_dynamic_clearances
+                else None
+            ),
+            "min_peer_clearance_m": (
+                min(finite_peer_clearances) if finite_peer_clearances else None
+            ),
+            "min_robot_clearance_m": (
+                min(finite_robot_clearances) if finite_robot_clearances else None
+            ),
+            "overlap_recovery_sample_count": overlap_recovery_count,
+            "service_inflight_sample_count": inflight_count,
+            "remaining_distance_regression_count": remaining_regressions,
+            "max_static_rejected_candidates": max(
+                int(sample["static_rejected"]) for sample in samples
+            ),
+            "max_dynamic_rejected_candidates": max(
+                int(sample["dynamic_rejected"]) for sample in samples
+            ),
+        }
+        total_samples += len(samples)
+        total_infeasible += infeasible_count
+        total_inflight += inflight_count
+        all_tracking_errors.extend(tracking_errors)
+        all_finite_clearances.extend(finite_clearances)
+        all_finite_dynamic_clearances.extend(finite_dynamic_clearances)
+        all_finite_peer_clearances.extend(finite_peer_clearances)
+        all_finite_robot_clearances.extend(finite_robot_clearances)
+        total_overlap_recovery_samples += overlap_recovery_count
+
+    return {
+        "local_motion_diagnostic_agent_count": len(samples_by_agent),
+        "local_motion_diagnostic_samples_by_agent": per_agent,
+        "local_motion_sample_count": total_samples,
+        "local_motion_infeasible_sample_count": total_infeasible,
+        "local_motion_feasible_ratio": (
+            (total_samples - total_infeasible) / total_samples
+            if total_samples
+            else None
+        ),
+        "local_motion_speed_tracking_error_mean_mps": (
+            sum(all_tracking_errors) / len(all_tracking_errors)
+            if all_tracking_errors
+            else None
+        ),
+        "local_motion_speed_tracking_error_max_mps": (
+            max(all_tracking_errors) if all_tracking_errors else None
+        ),
+        "local_motion_min_static_clearance_m": (
+            min(all_finite_clearances) if all_finite_clearances else None
+        ),
+        "local_motion_min_dynamic_clearance_m": (
+            min(all_finite_dynamic_clearances)
+            if all_finite_dynamic_clearances
+            else None
+        ),
+        "local_motion_min_peer_clearance_m": (
+            min(all_finite_peer_clearances)
+            if all_finite_peer_clearances
+            else None
+        ),
+        "local_motion_min_robot_clearance_m": (
+            min(all_finite_robot_clearances)
+            if all_finite_robot_clearances
+            else None
+        ),
+        "local_motion_overlap_recovery_sample_count": (
+            total_overlap_recovery_samples
+        ),
+        "local_motion_service_inflight_sample_count": total_inflight,
     }
 
 
@@ -455,16 +845,25 @@ def summarize_director_log(text: str, *, exit_code: int) -> dict[str, object]:
         "hard_safety_events": text.count("HuNav hard safety:"),
         "stall_events": text.count("stalled"),
         "recovery_exhausted_events": text.count("exceeded 3"),
+        "scenario_shadow_mismatch_events": text.count(
+            "E1 scenario shadow mismatch:"
+        ),
         "urinal_arrivals": text.count("reached urinal_"),
         "exit_arrivals": text.count("aligned at EXITING"),
     }
     summary.update(summarize_multi_agent_diagnostics(text))
+    summary.update(summarize_local_motion_diagnostics(text))
     return summary
 
 
-def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
+def summarize_visual_envelope_log(
+    path: Path,
+    *,
+    expected_agent_ids: Sequence[str] = (),
+) -> dict[str, object]:
     """Summarize read-only Isaac skeleton-envelope diagnostics."""
 
+    expected_agents = {str(agent_id) for agent_id in expected_agent_ids}
     frame_samples = 0
     agent_samples = 0
     available_samples = 0
@@ -472,6 +871,7 @@ def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
     max_overlap_ratio = 0.0
     overlap_paths: dict[str, int] = {}
     unavailable_reasons: dict[str, int] = {}
+    available_by_agent: dict[str, int] = {}
     consecutive_by_agent: dict[str, int] = {}
     max_consecutive_by_agent: dict[str, int] = {}
 
@@ -480,6 +880,7 @@ def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
             "visual_envelope_frame_samples": 0,
             "visual_envelope_agent_samples": 0,
             "visual_envelope_available_samples": 0,
+            "visual_envelope_available_samples_by_agent": {},
             "visual_envelope_overlap_samples": 0,
             "visual_envelope_max_overlap_ratio": 0.0,
             "visual_envelope_max_consecutive_overlap_samples": 0,
@@ -503,10 +904,15 @@ def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
             agent_id = str(item.get("agent_id", "") or "")
             if not agent_id:
                 continue
+            if expected_agents and agent_id not in expected_agents:
+                continue
             observed_agents.add(agent_id)
             agent_samples += 1
             if bool(item.get("available", False)):
                 available_samples += 1
+                available_by_agent[agent_id] = (
+                    available_by_agent.get(agent_id, 0) + 1
+                )
             else:
                 reason = str(
                     item.get("unavailable_reason", "skeleton_unavailable")
@@ -542,6 +948,9 @@ def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
         "visual_envelope_frame_samples": frame_samples,
         "visual_envelope_agent_samples": agent_samples,
         "visual_envelope_available_samples": available_samples,
+        "visual_envelope_available_samples_by_agent": dict(
+            sorted(available_by_agent.items())
+        ),
         "visual_envelope_overlap_samples": overlap_samples,
         "visual_envelope_max_overlap_ratio": round(max_overlap_ratio, 6),
         "visual_envelope_max_consecutive_overlap_samples": max(
@@ -558,6 +967,45 @@ def summarize_visual_envelope_log(path: Path) -> dict[str, object]:
             )
         ),
     }
+
+
+def apply_visual_envelope_gate(
+    summary: dict[str, object],
+    *,
+    expected_agent_ids: Sequence[str] = (),
+) -> bool:
+    """Require observed animated skeletons and reject any static overlap."""
+
+    frame_samples = int(summary.get("visual_envelope_frame_samples", 0) or 0)
+    available_samples = int(
+        summary.get("visual_envelope_available_samples", 0) or 0
+    )
+    overlap_samples = int(
+        summary.get("visual_envelope_overlap_samples", 0) or 0
+    )
+    available_by_agent = dict(
+        summary.get("visual_envelope_available_samples_by_agent", {}) or {}
+    )
+    missing_agents = sorted(
+        str(agent_id)
+        for agent_id in expected_agent_ids
+        if int(available_by_agent.get(str(agent_id), 0) or 0) <= 0
+    )
+    reasons = []
+    if frame_samples <= 0 or available_samples <= 0:
+        reasons.append("visual_envelope_unavailable")
+    if missing_agents:
+        reasons.append("visual_envelope_agent_missing")
+    if overlap_samples > 0:
+        reasons.append("visual_envelope_overlap")
+    summary["visual_envelope_validated"] = not (
+        frame_samples <= 0 or available_samples <= 0
+    )
+    summary["visual_envelope_collision_free"] = overlap_samples == 0
+    summary["visual_envelope_gate_passed"] = not reasons
+    summary["visual_envelope_failure_reasons"] = reasons
+    summary["visual_envelope_missing_agents"] = missing_agents
+    return not reasons
 
 
 def _active_agent_windows(
@@ -805,6 +1253,7 @@ def summarize_raw_pose_log(
     moving_windows = _moving_agent_windows(director_text)
     samples_by_agent: dict[str, list[dict[str, float]]] = {}
     pair_distances: list[float] = []
+    pair_samples: dict[str, list[dict[str, float | bool]]] = {}
     overlap_frames = 0
     active_frame_times: list[float] = []
 
@@ -856,6 +1305,28 @@ def summarize_raw_pose_log(
                         first["y"] - second["y"],
                     )
                     pair_distances.append(distance)
+                    pair_key = "|".join(sorted((first["agent_id"], second["agent_id"])))
+                    first_moving = any(
+                        start <= stamp and (end is None or stamp <= end)
+                        for start, end in moving_windows.get(first["agent_id"], ())
+                    )
+                    second_moving = any(
+                        start <= stamp and (end is None or stamp <= end)
+                        for start, end in moving_windows.get(second["agent_id"], ())
+                    )
+                    pair_samples.setdefault(pair_key, []).append(
+                        {
+                            "time": stamp,
+                            "distance": distance,
+                            "overlap": distance < float(overlap_distance_m),
+                            "both_stopped": (
+                                first_moving
+                                and second_moving
+                                and math.hypot(first["vx"], first["vy"]) <= 0.05
+                                and math.hypot(second["vx"], second["vy"]) <= 0.05
+                            ),
+                        }
+                    )
                     if distance < float(overlap_distance_m):
                         frame_overlaps += 1
             if frame_overlaps:
@@ -904,6 +1375,34 @@ def summarize_raw_pose_log(
     overlap_duration_sec = None
     if pose_rate_hz is not None and pose_rate_hz > 0.0:
         overlap_duration_sec = overlap_frames / pose_rate_hz
+    pair_metrics: dict[str, dict[str, object]] = {}
+    for pair_key, samples in sorted(pair_samples.items()):
+        samples.sort(key=lambda item: float(item["time"]))
+        overlap_count = sum(bool(item["overlap"]) for item in samples)
+        simultaneous_stop_duration = 0.0
+        previous = None
+        for item in samples:
+            if (
+                previous is not None
+                and bool(previous["both_stopped"])
+                and bool(item["both_stopped"])
+            ):
+                simultaneous_stop_duration += min(
+                    0.25,
+                    max(0.0, float(item["time"]) - float(previous["time"])),
+                )
+            previous = item
+        pair_metrics[pair_key] = {
+            "sample_count": len(samples),
+            "min_distance_m": min(float(item["distance"]) for item in samples),
+            "overlap_frame_count": overlap_count,
+            "overlap_duration_sec": (
+                overlap_count / pose_rate_hz
+                if pose_rate_hz is not None and pose_rate_hz > 0.0
+                else None
+            ),
+            "simultaneous_stop_duration_sec": simultaneous_stop_duration,
+        }
     locomotion_by_agent = {
         agent_id: _locomotion_metrics(
             samples,
@@ -936,6 +1435,14 @@ def summarize_raw_pose_log(
         "raw_pose_pair_overlap_threshold_m": float(overlap_distance_m),
         "raw_pose_pair_overlap_frames": overlap_frames,
         "raw_pose_pair_overlap_duration_sec": overlap_duration_sec,
+        "raw_pose_pair_metrics": pair_metrics,
+        "raw_pose_pair_max_simultaneous_stop_duration_sec": max(
+            (
+                float(metrics["simultaneous_stop_duration_sec"])
+                for metrics in pair_metrics.values()
+            ),
+            default=0.0,
+        ),
         "raw_pose_peer_activation_jump_excess_m": peer_activation_jump_excess,
         "raw_pose_peer_activation_max_jump_excess_m": (
             max(peer_activation_jump_excess.values())
@@ -1384,7 +1891,7 @@ def reset_robot_for_intervention(
 
 def _latest_agent_x(path: Path) -> float | None:
     matches = re.findall(
-        r"HuNav diagnostics:.*?pose=\(([-+]?[0-9]*\.?[0-9]+),",
+        r"(?:HuNav|Local motion) diagnostics:.*?pose=\(([-+]?[0-9]*\.?[0-9]+),",
         _tail(path, 250),
     )
     return float(matches[-1]) if matches else None
@@ -1576,11 +2083,17 @@ def _pose_arg(value: str) -> tuple[float, float, float, float]:
 
 def _robot_intervention_arg(value: str) -> str:
     normalized = str(value).strip().lower().replace("-", "_")
-    allowed = {"none", "crossing", "dynamic_crossing", "occupied_passage"}
+    allowed = {
+        "none",
+        "parked_away",
+        "crossing",
+        "dynamic_crossing",
+        "occupied_passage",
+    }
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(
             "robot intervention must be one of: "
-            "none, crossing, dynamic_crossing, occupied_passage"
+            "none, parked_away, crossing, dynamic_crossing, occupied_passage"
         )
     return normalized
 
@@ -1589,9 +2102,11 @@ def build_commands(
     paths: PipelinePaths,
     *,
     benchmark: Path,
+    motion_backend: str = "hunav",
     behavior: str,
     target_resource: str,
     initial_agents: int,
+    scenario_runtime: str = "source",
 ) -> tuple[list[str], list[str], list[str]]:
     profile_script = paths.arena_isaac / "scripts" / "arena_scene_profile.py"
     bridge = [
@@ -1619,7 +2134,7 @@ def build_commands(
         "--benchmark",
         str(benchmark),
         "--motion-backend",
-        "hunav",
+        str(motion_backend),
         "--profile",
         str(behavior),
         "--initial-agents",
@@ -1629,6 +2144,8 @@ def build_commands(
         item.strip() for item in str(target_resource).split(",") if item.strip()
     ):
         director.extend(["--target-resource", resource_id])
+    if scenario_runtime != "source":
+        director.extend(["--scenario-runtime", scenario_runtime])
     return bridge, spawn, director
 
 
@@ -1645,12 +2162,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Apply a frozen characterization scenario on top of the benchmark YAML.",
     )
     parser.add_argument("--behavior", default="surprised")
+    parser.add_argument(
+        "--motion-backend",
+        choices=("hunav", "local_motion"),
+        default="hunav",
+        help=(
+            "Select the continuous pedestrian motion backend under test; "
+            "the default preserves the existing HuNav smoke workflow."
+        ),
+    )
     parser.add_argument("--reaction", choices=("source", "enabled", "disabled"), default="source")
     parser.add_argument(
         "--legacy-avoidance",
         choices=("source", "enabled", "disabled"),
         default="source",
         help="Override the legacy regular_avoidance layer for native-BT comparisons.",
+    )
+    parser.add_argument(
+        "--local-motion-shadow",
+        choices=("source", "enabled", "disabled"),
+        default="source",
+        help="Override E2-B sampled-RVO comparison without changing motion authority.",
     )
     parser.add_argument(
         "--seed",
@@ -1661,10 +2193,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-resource", default="urinal_1")
     parser.add_argument("--initial-agents", type=int, default=1)
     parser.add_argument(
+        "--scenario-runtime",
+        choices=("source", "legacy", "shadow", "takeover"),
+        default="source",
+        help="Override the director E1 scenario runtime mode.",
+    )
+    parser.add_argument(
         "--robot-intervention",
         type=_robot_intervention_arg,
         default="none",
-        help="Use deterministic reset poses to place, hold, and remove a blocking robot.",
+        help=(
+            "Use deterministic reset poses to park, place, hold, and remove "
+            "a robot during a smoke run."
+        ),
     )
     parser.add_argument("--intervention-trigger-x", type=float, default=-1.20)
     parser.add_argument("--intervention-hold-sec", type=float, default=6.0)
@@ -1774,15 +2315,20 @@ def main(args: Sequence[str] | None = None) -> int:
         diagnostic_dir=run_dir,
         reaction_override=_reaction_override(parsed.reaction),
         avoidance_override=_optional_bool_override(parsed.legacy_avoidance),
+        local_motion_shadow_override=_optional_bool_override(
+            parsed.local_motion_shadow
+        ),
         seed_override=parsed.seed,
         scenario_profile=scenario_profile,
     )
     bridge_cmd, spawn_cmd, director_cmd = build_commands(
         paths,
         benchmark=benchmark_variant,
+        motion_backend=parsed.motion_backend,
         behavior=parsed.behavior,
         target_resource=target_resource,
         initial_agents=initial_agents,
+        scenario_runtime=parsed.scenario_runtime,
     )
     dynamic_crossing_profile, resolved_dynamic_crossing_profile = resolve_dynamic_crossing_profile(
         parsed.dynamic_crossing_profile,
@@ -1795,6 +2341,7 @@ def main(args: Sequence[str] | None = None) -> int:
     )
     metadata = {
         "behavior": parsed.behavior,
+        "motion_backend": parsed.motion_backend,
         "scenario_profile": scenario_profile.name,
         "reaction": parsed.reaction,
         "legacy_avoidance": parsed.legacy_avoidance,
@@ -1802,6 +2349,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "robot_intervention": robot_intervention,
         "target_resource": target_resource,
         "initial_agents": initial_agents,
+        "scenario_runtime": parsed.scenario_runtime,
         "dynamic_crossing": {
             "selected_profile": parsed.dynamic_crossing_profile,
             "resolved_profile": resolved_dynamic_crossing_profile,
@@ -1950,7 +2498,25 @@ def main(args: Sequence[str] | None = None) -> int:
                 "pedestrian diagnostic recorder exited before the director started"
             )
 
-        if robot_intervention == "crossing":
+        if robot_intervention == "parked_away":
+            wait_for_robot_reset_service(env)
+            if not reset_robot_for_intervention(
+                parsed.intervention_away_pose,
+                cwd=paths.workspace,
+                env=env,
+                event_log=intervention_log,
+                event="robot_parked_away_pose_requested",
+            ):
+                raise RuntimeError("robot parked-away intervention was rejected")
+            time.sleep(max(0.0, parsed.intervention_settle_sec))
+            director_code = run_logged(
+                director_cmd,
+                cwd=paths.workspace,
+                env=env,
+                log_path=director_log,
+                timeout_sec=parsed.director_timeout_sec,
+            )
+        elif robot_intervention == "crossing":
             wait_for_robot_reset_service(env)
             if not reset_robot_for_intervention(
                 parsed.intervention_away_pose,
@@ -2020,6 +2586,12 @@ def main(args: Sequence[str] | None = None) -> int:
                 log_path=director_log,
                 timeout_sec=parsed.director_timeout_sec,
             )
+        if diagnostic_recorder is not None:
+            stop_process_group(diagnostic_recorder, timeout_sec=5.0)
+            diagnostic_recorder = None
+        if diagnostic_recorder_stream is not None:
+            diagnostic_recorder_stream.close()
+            diagnostic_recorder_stream = None
         director_text = director_log.read_text(encoding="utf-8", errors="replace")
         summary = summarize_director_log(director_text, exit_code=director_code)
         summary["robot_intervention_events"] = (
@@ -2031,7 +2603,17 @@ def main(args: Sequence[str] | None = None) -> int:
             len(path.read_text(encoding="utf-8", errors="replace").splitlines())
             for path in run_dir.glob("hunav_behavior_events_*.jsonl")
         )
-        summary.update(summarize_visual_envelope_log(visual_envelope_log))
+        expected_agent_ids = tuple(sorted(_activation_times(director_text)))
+        summary.update(
+            summarize_visual_envelope_log(
+                visual_envelope_log,
+                expected_agent_ids=expected_agent_ids,
+            )
+        )
+        visual_envelope_passed = apply_visual_envelope_gate(
+            summary,
+            expected_agent_ids=expected_agent_ids,
+        )
         summary.update(
             summarize_raw_pose_log(
                 raw_pose_log,
@@ -2043,7 +2625,15 @@ def main(args: Sequence[str] | None = None) -> int:
             encoding="utf-8",
         )
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
-        return 0 if director_code == 0 and bool(summary["completed"]) else 1
+        return (
+            0
+            if (
+                director_code == 0
+                and bool(summary["completed"])
+                and visual_envelope_passed
+            )
+            else 1
+        )
     except (RuntimeError, TimeoutError, subprocess.TimeoutExpired) as exc:
         (run_dir / "runner_error.txt").write_text(f"{exc}\n", encoding="utf-8")
         print(f"pipeline failed: {exc}", file=sys.stderr, flush=True)

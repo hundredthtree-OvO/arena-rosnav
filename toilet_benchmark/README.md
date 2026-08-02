@@ -6,6 +6,9 @@ benchmark 已完成。
 
 总体规范和开发阶段以
 [`docs/benchmark_design_cn.md`](docs/benchmark_design_cn.md) 为准。
+完整文档入口见 [`docs/README.md`](docs/README.md)，内部控制权和冻结接口以
+[`pedestrian_ecosystem_architecture_cn.md`](docs/pedestrian_ecosystem_architecture_cn.md)
+为准。
 
 ## 当前边界
 
@@ -14,13 +17,19 @@ arena-isaac
   scene / robot / PhysX / sensors / Isaac character runtime
 
 toilet director
-  entrance / queue / urinal / service / exit semantics
+  current compatibility facade for lifecycle and ROS
+
+scenario runtime / smart objects / agent executive
+  entrance / queue / resource / service / exit intent and events
 
 global router
   static walkable route
 
-HuNav
-  Interactive Track local social motion and behavior tree
+local motion backend
+  HuNav for Interactive social motion; Replay and future ORCA/HRVO share the port
+
+embodiment adapter
+  Isaac AnimGraph now; SMPL-H is an A/B candidate
 
 recorder / evaluator
   dataset recording now; formal evaluator is planned
@@ -55,7 +64,9 @@ takeover 是当前 Interactive Track 的实验主线；它不是 Replay Track，
 | 文档 | 用途 |
 | --- | --- |
 | [`benchmark_design_cn.md`](docs/benchmark_design_cn.md) | Benchmark Card、任务、Track、episode、接口、指标、baseline 和路线图 |
+| [`pedestrian_ecosystem_architecture_cn.md`](docs/pedestrian_ecosystem_architecture_cn.md) | 目的性行人生态、Smart Object、Scenario Runtime、Agent Executive 和冻结接口 |
 | [`code_structure_migration_cn.md`](docs/code_structure_migration_cn.md) | 两条并行开发线的目标结构、共享契约、迁移顺序和删除门槛 |
+| [`motion_backend_evaluation_cn.md`](docs/motion_backend_evaluation_cn.md) | HuNav、ORCA/HRVO、Replay、Isaac AnimGraph 与 SMPL-H 的统一评估门槛 |
 | [`hunav_behavior_characterization_20260730_cn.md`](docs/hunav_behavior_characterization_20260730_cn.md) | S3-A 原生 behavior 固定 seed Isaac 对照与诊断限制 |
 | [`replay_trajectory_schema_cn.md`](docs/replay_trajectory_schema_cn.md) | Replay Track 冻结轨迹的字段、时间基准和可见性草案 |
 | [`manual_collection_cn.md`](docs/manual_collection_cn.md) | 当前人工数据采集配置、启动、有效性和 reset 验收 |
@@ -108,6 +119,29 @@ ros2 run toilet_benchmark toilet_director_node \
   --motion-backend hunav \
   --initial-agents 1
 ```
+
+E2-B 独立局部运动实验不启动 HuNav，可在同一 bridge 上显式运行：
+
+```bash
+ros2 run toilet_benchmark toilet_director_node \
+  --motion-backend local_motion \
+  --initial-agents 1
+```
+
+该入口目前只用于 doorway/crossing/视觉包络 gate，尚未替换默认 backend。
+
+E1 事件内核默认以 `shadow` 运行：它比较新旧阶段和资源归属，但不改变现有运动。完成
+固定 seed 的 shadow smoke 后，可显式验证语义接管：
+
+```bash
+ros2 run toilet_benchmark toilet_director_node \
+  --motion-backend hunav \
+  --scenario-runtime takeover \
+  --initial-agents 1
+```
+
+需要快速回退时使用 `--scenario-runtime legacy`。运行中不应出现
+`E1 scenario shadow mismatch`。
 
 多人属于 Interactive Track 实验入口：
 

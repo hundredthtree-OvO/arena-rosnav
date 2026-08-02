@@ -23,6 +23,7 @@ from rclpy.task import Future
 from visualization_msgs.msg import Marker, MarkerArray
 
 from .hunav_phase0_safety import SafetyConfig, project_safe_step
+from .interaction_policy import oriented_footprint_circles
 from .motion_backend import (
     EXTERNAL_MOTION_FREEZE,
     EXTERNAL_MOTION_TERMINAL_ALIGN,
@@ -37,6 +38,19 @@ from .motion.hunav import (
     HuNavRuntimeRegistry,
     RUNTIME_FIELDS,
 )
+from .motion import (
+    BehaviorPolicyRequest,
+    ContextualBehaviorConfig,
+    ContextualBehaviorPolicy,
+    LocalMotionRequest,
+    RoutePlan,
+    SampledRvoConfig,
+    SampledRvoLocalMotion,
+    GeometrySafetyRequest,
+    SweptEnvelopeGeometrySafety,
+)
+from .domain import AgentSnapshot
+from .motion.swept_envelope import SweptEnvelope, SweptEnvelopeConfig
 from .robot_reaction import ReactionDecision, RobotProximityReactionController
 
 
@@ -101,6 +115,38 @@ class HuNavMotionBackend:
         self._isaac = IsaacPeopleBackend(node, move_service_name)
         self._namespace = "/" + str(namespace).strip().strip("/")
         self._config = dict(config or {})
+        local_motion_shadow = dict(
+            self._config.get("local_motion_shadow", {}) or {}
+        )
+        self._local_motion_shadow_enabled = bool(
+            local_motion_shadow.get("enabled", False)
+        )
+        self._local_motion_shadow = SampledRvoLocalMotion(
+            SampledRvoConfig(
+                time_horizon_sec=float(
+                    local_motion_shadow.get("time_horizon_sec", 2.0)
+                ),
+                neighbor_distance_m=float(
+                    local_motion_shadow.get("neighbor_distance_m", 3.0)
+                ),
+                clearance_m=float(
+                    local_motion_shadow.get("clearance_m", 0.05)
+                ),
+                angular_samples=int(
+                    local_motion_shadow.get("angular_samples", 36)
+                ),
+            )
+        )
+        self._behavior_policy_shadow = ContextualBehaviorPolicy(
+            ContextualBehaviorConfig(
+                conflict_horizon_sec=float(
+                    local_motion_shadow.get("conflict_horizon_sec", 2.0)
+                ),
+                minimum_passing_clearance_m=float(
+                    local_motion_shadow.get("minimum_passing_clearance_m", 0.45)
+                ),
+            )
+        )
         self._compute_hz = max(1.0, float(self._config.get("compute_hz", 10.0)))
         self._state_timeout_sec = max(
             0.05, float(self._config.get("state_timeout_sec", 0.5))
@@ -108,6 +154,14 @@ class HuNavMotionBackend:
         self._external_timeout_sec = max(
             2.0 / self._compute_hz,
             float(self._config.get("external_timeout_sec", 0.35)),
+        )
+        self._external_future_deadline_sec = max(
+            1.0,
+            float(self._config.get("external_future_deadline_sec", 1.0)),
+        )
+        self._external_retry_cooldown_sec = max(
+            0.1,
+            float(self._config.get("external_retry_cooldown_sec", 1.0)),
         )
         self._max_hunav_step_speed_factor = max(
             1.0,
@@ -155,6 +209,16 @@ class HuNavMotionBackend:
             0.10,
             float(self._config.get("lookahead_max_cross_track_m", 0.80)),
         )
+        self._route_corridor_half_width_m = max(
+            self._hard_radius,
+            float(
+                self._config.get(
+                    "route_corridor_half_width_m",
+                    max(self._hard_radius, 0.30),
+                )
+            ),
+        )
+        self._last_route_corridor_limit_m = self._route_corridor_half_width_m
         self._settled_arrival_tolerance_m = max(
             self._goal_radius,
             float(self._config.get("settled_arrival_tolerance_m", 0.35)),
@@ -222,6 +286,18 @@ class HuNavMotionBackend:
                 )
             ),
         )
+        self._robot_stationary_soft_clearance_m = max(
+            0.0,
+            float(self._config.get("robot_stationary_soft_clearance_m", 0.05)),
+        )
+        self._robot_moving_soft_clearance_m = max(
+            self._robot_stationary_soft_clearance_m,
+            float(self._config.get("robot_moving_soft_clearance_m", 0.12)),
+        )
+        self._robot_pose_reset_jump_m = max(
+            0.10,
+            float(self._config.get("robot_pose_reset_jump_m", 0.75)),
+        )
         self._behavior = dict(self._config.get("behavior", {}) or {})
         self._reaction_controller = RobotProximityReactionController(
             self._config.get("robot_proximity_reaction", {}) or {},
@@ -243,6 +319,12 @@ class HuNavMotionBackend:
             contact_epsilon_m=float(safety.get("contact_epsilon_m", 0.0001)),
             max_iterations=int(safety.get("max_iterations", 8)),
         )
+        self._swept_envelope = SweptEnvelope(
+            SweptEnvelopeConfig.from_mapping(
+                safety.get("swept_envelope", {}) or {}
+            )
+        )
+        self._geometry_safety = SweptEnvelopeGeometrySafety(self._swept_envelope)
         self._constrained_yaw_speed_threshold_mps = max(
             0.03,
             float(safety.get("constrained_yaw_speed_threshold_mps", 0.12)),
@@ -367,20 +449,6 @@ class HuNavMotionBackend:
                 )
             ),
         )
-        self._static_projection_enabled = bool(
-            safety.get("static_projection_enabled", True)
-        )
-        self._static_projection_max_deflection_deg = max(
-            0.0,
-            min(
-                89.0,
-                float(safety.get("static_projection_max_deflection_deg", 80.0)),
-            ),
-        )
-        self._static_projection_angle_step_deg = max(
-            5.0,
-            float(safety.get("static_projection_angle_step_deg", 20.0)),
-        )
         self._visualization_enabled = bool(visualization.get("enabled", True))
         self._visualization_frame = str(visualization.get("frame_id", "map"))
         self._diagnostic_log_period_sec = max(
@@ -437,6 +505,9 @@ class HuNavMotionBackend:
         self._compute_future = None
         self._compute_generation = 0
         self._external_future = None
+        self._external_future_started_at = 0.0
+        self._external_retry_after = 0.0
+        self._pending_external_command: MotionCommand | None = None
         self._external_request_token = 0
         self._safety_robot_previous = None
         self._last_state_wait_log = 0.0
@@ -444,6 +515,7 @@ class HuNavMotionBackend:
         self._native_behavior_profile_by_agent: dict[str, str] = {}
         self._native_behavior_response_state_by_agent: dict[str, int] = {}
         self._last_native_behavior_signature: tuple[object, ...] | None = None
+        self._last_local_motion_shadow: dict[str, object] | None = None
         self._settled_generation = 0
         self._settled_agent_id = ""
         self._terminal_align_active = False
@@ -621,6 +693,9 @@ class HuNavMotionBackend:
             state["_settled_agent_id"] = ""
             state["_frozen_present"] = False
             state["_external_request_token"] = 0
+            state["_external_future_started_at"] = 0.0
+            state["_external_retry_after"] = 0.0
+            state["_pending_external_command"] = None
         self._runtime_registry.create(
             self,
             agent_id,
@@ -642,11 +717,24 @@ class HuNavMotionBackend:
     def set_walkable_planner(self, planner) -> None:
         """Share the director's immutable static map with local HuNav safety."""
         self._walkable_planner = planner
+        self._geometry_safety_port().bind(planner)
         self._logger.info(
             "HuNav local static safety attached to walkable map: "
             f"resolution={planner.resolution:.3f}, "
             f"obstacles={planner.occupied_count}"
         )
+
+    def _geometry_safety_port(self) -> SweptEnvelopeGeometrySafety:
+        """Keep legacy test injection compatible while E2 owns the safety port."""
+        envelope = self._swept_envelope
+        safety = getattr(self, "_geometry_safety", None)
+        if safety is None or safety.envelope is not envelope:
+            safety = SweptEnvelopeGeometrySafety(envelope)
+            self._geometry_safety = safety
+        planner = getattr(self, "_walkable_planner", None)
+        if planner is not None:
+            safety.bind(planner)
+        return safety
 
     def wait_for_service(self, timeout_sec: float) -> bool:
         timeout = float(timeout_sec)
@@ -713,6 +801,8 @@ class HuNavMotionBackend:
             self._pending_rebase_replan = False
             self._reset_local_route()
             self._reset_robot_reaction()
+            self._pedestrian_yield_blocker = None
+            self._pedestrian_yield_clear_ticks = 0
             generation = self._generation
         if membership_changed or activated_now:
             self._batch_generation += 1
@@ -866,6 +956,8 @@ class HuNavMotionBackend:
         eligible_agent_ids = []
         for agent_id in tuple(self._runtime_states):
             with self._runtime_context(agent_id):
+                self._expire_stale_external_future()
+                self._flush_pending_external_command()
                 if self._command is None:
                     continue
                 if not self._hunav_active:
@@ -1220,6 +1312,11 @@ class HuNavMotionBackend:
                 ):
                     continue
                 self._clip_hunav_step(previous, agent, dt)
+                self._evaluate_local_motion_shadow(
+                    agent,
+                    updated_by_id,
+                    dt,
+                )
                 safety_by_id[agent_id] = self._apply_hard_safety(
                     previous,
                     agent,
@@ -1253,6 +1350,115 @@ class HuNavMotionBackend:
                     safety_by_id.get(agent_id, {"enabled": False}),
                 )
         self._batch_shadow = updated
+
+    def _evaluate_local_motion_shadow(
+        self,
+        agent: Agent,
+        agents_by_id: Mapping[str, Agent],
+        dt: float,
+    ) -> None:
+        """Compare the candidate local solver without changing HuNav authority."""
+        if (
+            not getattr(self, "_local_motion_shadow_enabled", False)
+            or self._command is None
+        ):
+            return
+        agent_id = str(self._command.agent_id)
+        snapshot = self._snapshot_from_hunav(agent, agent_id)
+        peers = tuple(
+            self._snapshot_from_hunav(peer, str(peer_id))
+            for peer_id, peer in sorted(agents_by_id.items())
+            if str(peer_id) != agent_id
+        )
+        robot = None
+        if self._robot is not None:
+            robot = AgentSnapshot(
+                agent_id="robot",
+                x=float(self._robot["x"]),
+                y=float(self._robot["y"]),
+                z=0.0,
+                yaw=float(self._robot.get("yaw", 0.0)),
+                vx=float(self._robot.get("vx", 0.0)),
+                vy=float(self._robot.get("vy", 0.0)),
+                wz=float(self._robot.get("wz", 0.0)),
+                radius_m=float(self._effective_robot_radius(self._robot)),
+                timestamp_sec=time.monotonic(),
+                source="robot_odom",
+            )
+        target = self._lookahead_target
+        target_xy = (
+            (float(target.x), float(target.y))
+            if target is not None
+            else (
+                float(self._command.goal_pose[0]),
+                float(self._command.goal_pose[1]),
+            )
+        )
+        route = RoutePlan.from_points(
+            agent_id=agent_id,
+            points=(
+                (snapshot.x, snapshot.y, snapshot.z),
+                (target_xy[0], target_xy[1], snapshot.z),
+            ),
+            planner_id="hunav_lookahead_shadow",
+            dynamic_obstacle_count=len(peers) + int(robot is not None),
+        )
+        preferred_speed = max(0.0, float(self._command.velocity))
+        behavior = self._behavior_policy_shadow.decide(
+            BehaviorPolicyRequest(
+                timestamp_sec=time.monotonic(),
+                agent=snapshot,
+                route=route,
+                preferred_speed_mps=preferred_speed,
+                robot=robot,
+                peers=peers,
+                task_phase=str(self._command.phase or ""),
+            )
+        )
+        result = self._local_motion_shadow.step(
+            LocalMotionRequest(
+                timestamp_sec=time.monotonic(),
+                dt_sec=max(1e-3, float(dt)),
+                agent=snapshot,
+                peers=peers,
+                robot=robot,
+                route=route,
+                behavior=behavior,
+                preferred_speed_mps=preferred_speed,
+                route_target_xy=target_xy,
+            )
+        )
+        hunav_velocity = (
+            float(agent.velocity.linear.x),
+            float(agent.velocity.linear.y),
+        )
+        self._last_local_motion_shadow = {
+            "agent_id": agent_id,
+            "feasible": bool(result.feasible),
+            "reason": str(result.reason),
+            "behavior_mode": behavior.mode.value,
+            "sampled_velocity_xy": tuple(result.velocity_xy),
+            "hunav_velocity_xy": hunav_velocity,
+            "velocity_error_mps": math.dist(
+                hunav_velocity,
+                result.velocity_xy,
+            ),
+            **dict(result.diagnostics),
+        }
+
+    def _snapshot_from_hunav(self, agent: Agent, agent_id: str) -> AgentSnapshot:
+        return AgentSnapshot(
+            agent_id=str(agent_id),
+            x=float(agent.position.position.x),
+            y=float(agent.position.position.y),
+            z=float(agent.position.position.z),
+            yaw=float(agent.yaw),
+            vx=float(agent.velocity.linear.x),
+            vy=float(agent.velocity.linear.y),
+            radius_m=float(self._planning_radius),
+            timestamp_sec=time.monotonic(),
+            source="hunav_shadow",
+        )
 
     def _finish_computed_agent(
         self,
@@ -1616,6 +1822,11 @@ class HuNavMotionBackend:
             float(actual["x"]),
             float(actual["y"]),
         )
+        self._log_route_swept_clearance(
+            points,
+            start_yaw=float(actual.get("yaw", 0.0) or 0.0),
+            reason="initial command",
+        )
 
     def _reset_lookahead_route(
         self,
@@ -1649,6 +1860,21 @@ class HuNavMotionBackend:
         )
         self._lookahead_target = self._lookahead_tracker.update(*position)
         self._last_global_replan_at = time.monotonic()
+        actual = self._actual_for_command()
+        actual_yaw = actual.get("yaw") if actual is not None else None
+        start_yaw = (
+            float(actual_yaw)
+            if actual_yaw is not None and math.isfinite(float(actual_yaw))
+            else math.atan2(
+                parsed[0][1] - position[1],
+                parsed[0][0] - position[0],
+            )
+        )
+        self._log_route_swept_clearance(
+            [[position[0], position[1], 0.0], *parsed],
+            start_yaw=start_yaw,
+            reason=reason,
+        )
         self._logger.info(
             f"HuNav global route rebuilt: agent={self._command.agent_id}, "
             f"reason={reason}, points={len(parsed)}, "
@@ -1656,6 +1882,33 @@ class HuNavMotionBackend:
             f"spliced={splice is not None}"
         )
         return True
+
+    def _log_route_swept_clearance(
+        self,
+        points,
+        *,
+        start_yaw: float,
+        reason: str,
+    ) -> None:
+        if self._walkable_planner is None or len(points) < 2:
+            return
+        route = tuple(
+            (float(point[0]), float(point[1]))
+            for point in points
+        )
+        minimum = self._geometry_safety_port().polyline_minimum_clearance(
+            route,
+            start_yaw=float(start_yaw),
+        )
+        message = (
+            f"HuNav global route swept clearance: "
+            f"agent={self._command.agent_id if self._command else 'unknown'}, "
+            f"reason={reason}, minimum_m={minimum:.3f}"
+        )
+        if minimum < -1e-9:
+            self._logger.warning(message)
+        else:
+            self._logger.info(message)
 
     def _route_splice(
         self,
@@ -1790,31 +2043,73 @@ class HuNavMotionBackend:
             return forward_progress >= -0.05
         return True
 
-    def _dynamic_replan_obstacles(self) -> list[tuple[float, float, float]]:
+    def _dynamic_replan_obstacles(self) -> list[tuple[float, ...]]:
+        obstacles: list[tuple[float, ...]] = []
         robot = self._robot
         if (
-            robot is None
-            or time.monotonic() - float(robot["received_at"]) > 1.0
+            robot is not None
+            and time.monotonic() - float(robot["received_at"]) <= 1.0
         ):
-            return []
-        radius = self._effective_robot_radius(robot)
-        obstacles = [(float(robot["x"]), float(robot["y"]), radius)]
-        speed = math.hypot(
-            float(robot.get("vx", 0.0)),
-            float(robot.get("vy", 0.0)),
-        )
-        if speed >= 0.05 and self._avoidance_prediction_horizon_sec > 0.0:
-            obstacles.append(
-                (
-                    float(robot["x"])
-                    + float(robot.get("vx", 0.0))
-                    * self._avoidance_prediction_horizon_sec,
-                    float(robot["y"])
-                    + float(robot.get("vy", 0.0))
-                    * self._avoidance_prediction_horizon_sec,
-                    radius,
+            speed = math.hypot(
+                float(robot.get("vx", 0.0)),
+                float(robot.get("vy", 0.0)),
+            )
+            moving = (
+                speed >= self._stationary_robot_linear_speed_threshold_mps
+                or abs(float(robot.get("wz", 0.0)))
+                >= self._stationary_robot_angular_speed_threshold_rps
+            )
+            soft_clearance = (
+                self._robot_moving_soft_clearance_m
+                if moving
+                else self._robot_stationary_soft_clearance_m
+            )
+            obstacles.extend(
+                oriented_footprint_circles(
+                    x=float(robot["x"]),
+                    y=float(robot["y"]),
+                    yaw=float(robot.get("yaw", 0.0)),
+                    half_length_m=self._robot_footprint_half_length_m,
+                    half_width_m=self._robot_footprint_half_width_m,
+                    soft_clearance_m=soft_clearance,
                 )
             )
+            if moving and self._avoidance_prediction_horizon_sec > 0.0:
+                horizon = self._avoidance_prediction_horizon_sec
+                obstacles.extend(
+                    oriented_footprint_circles(
+                        x=float(robot["x"])
+                        + float(robot.get("vx", 0.0)) * horizon,
+                        y=float(robot["y"])
+                        + float(robot.get("vy", 0.0)) * horizon,
+                        yaw=float(robot.get("yaw", 0.0))
+                        + float(robot.get("wz", 0.0)) * horizon,
+                        half_length_m=self._robot_footprint_half_length_m,
+                        half_width_m=self._robot_footprint_half_width_m,
+                        soft_clearance_m=self._robot_moving_soft_clearance_m,
+                    )
+                )
+        current_id = (
+            str(self._command.agent_id)
+            if self._command is not None
+            else ""
+        )
+        pedestrian_radius = (
+            self._planning_radius
+            + self._avoidance_min_dynamic_clearance_m
+            + 0.25 * self._avoidance_sample_spacing_m
+        )
+        obstacles.extend(
+            (
+                float(pedestrian["x"]),
+                float(pedestrian["y"]),
+                pedestrian_radius,
+            )
+            for pedestrian in self._pedestrian_obstacles(
+                current_id,
+                fixed_only=False,
+            ).values()
+        )
         return obstacles
 
     @staticmethod
@@ -1849,6 +2144,7 @@ class HuNavMotionBackend:
         avoidance = self._start_regular_avoidance(
             position,
             self._lookahead_target,
+            start_yaw=float(agent.yaw),
         )
         if avoidance is not None:
             agent.goals = [self._point_goal_pose(avoidance)]
@@ -1918,6 +2214,20 @@ class HuNavMotionBackend:
         )
         return not clipped and fraction >= 1.0 - 1e-6
 
+    def _segment_has_static_visibility(
+        self,
+        start: tuple[float, float],
+        goal: tuple[float, float],
+    ) -> bool:
+        if self._walkable_planner is None:
+            return True
+        return self._walkable_planner.polyline_avoids_raw_obstacles(
+            (
+                [start[0], start[1], 0.0],
+                [goal[0], goal[1], 0.0],
+            )
+        )
+
     def _reset_local_route(self) -> None:
         self._local_route_mode = None
         self._local_route_points = []
@@ -1964,11 +2274,16 @@ class HuNavMotionBackend:
                 self._local_route_best_distance = distance
                 self._local_route_last_progress_at = now
             if (
-                self._local_route_mode == "AVOIDANCE"
+                self._local_route_mode
+                in {"AVOIDANCE", "PEDESTRIAN_AVOIDANCE"}
                 and now - self._local_route_last_progress_at
                 >= self._avoidance_stall_timeout_sec
             ):
-                recovered = self._recover_stalled_avoidance(position)
+                recovered = (
+                    self._recover_stalled_avoidance(position)
+                    if self._local_route_mode == "AVOIDANCE"
+                    else self._recover_stalled_pedestrian_corridor(position)
+                )
                 if recovered is not None:
                     return recovered
             if distance > self._local_waypoint_tolerance_m:
@@ -1984,15 +2299,58 @@ class HuNavMotionBackend:
             f"HuNav local route completed: agent={self._command.agent_id}, "
             f"mode={completed_mode}"
         )
-        if completed_mode == "AVOIDANCE":
+        if completed_mode in {"AVOIDANCE", "PEDESTRIAN_AVOIDANCE"}:
+            blocker_id = self._pedestrian_yield_blocker
             self._avoidance_side = 0
             self._avoidance_target = None
             self._avoidance_active_route_infeasible_ticks = 0
             self._avoidance_recovery_attempts = 0
+            if completed_mode == "PEDESTRIAN_AVOIDANCE":
+                self._pedestrian_yield_blocker = None
+                self._pedestrian_yield_clear_ticks = 0
             self._replan_to_final_goal(
                 position,
-                reason="regular avoidance completed",
+                reason=(
+                    "fixed pedestrian avoidance completed"
+                    if completed_mode == "PEDESTRIAN_AVOIDANCE"
+                    else "regular avoidance completed"
+                ),
             )
+            if completed_mode == "PEDESTRIAN_AVOIDANCE":
+                self._logger.info(
+                    f"HuNav pedestrian corridor rejoined: "
+                    f"agent={self._command.agent_id}, blocker={blocker_id}."
+                )
+        return None
+
+    def _recover_stalled_pedestrian_corridor(
+        self,
+        position: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        blocker_id = self._pedestrian_yield_blocker
+        self._reset_local_route()
+        self._pedestrian_yield_blocker = None
+        self._pedestrian_yield_clear_ticks = 0
+        self._avoidance_side = 0
+        self._avoidance_target = None
+        if self._replan_to_final_goal(
+            position,
+            reason="stalled pedestrian corridor",
+            force=True,
+        ):
+            self._logger.info(
+                f"HuNav stalled pedestrian corridor rebuilt: "
+                f"agent={self._command.agent_id}, blocker={blocker_id}."
+            )
+            if self._lookahead_target is not None:
+                return (
+                    float(self._lookahead_target.x),
+                    float(self._lookahead_target.y),
+                )
+        self._logger.warning(
+            f"HuNav stalled pedestrian corridor could not be rebuilt: "
+            f"agent={self._command.agent_id}, blocker={blocker_id}."
+        )
         return None
 
     def _recover_stalled_avoidance(
@@ -2148,16 +2506,22 @@ class HuNavMotionBackend:
         if (
             self._walkable_planner is None
             or tracker is None
-            or self._segment_is_walkable(position, (nominal.x, nominal.y))
+            or self._segment_has_static_visibility(
+                position,
+                (nominal.x, nominal.y),
+            )
         ):
             self._route_hold_active = False
             self._route_hold_yaw = None
             self._route_visibility_lost_since = 0.0
             self._last_visible_route_target = nominal
             return nominal
-        minimum_forward = min(
-            0.20,
-            max(0.01, self._goal_radius + 0.01),
+        # Visibility is a local routing concern, not a goal-arrival concern.
+        # Reusing goal_radius here skipped valid sub-10 cm doorway steps and
+        # could leave an agent permanently holding beside an inflated frame.
+        minimum_forward = max(
+            self._goal_radius + 0.01,
+            float(self._walkable_planner.resolution),
         )
         minimum_progress = min(
             tracker.total_length_m,
@@ -2171,7 +2535,10 @@ class HuNavMotionBackend:
                 cross_track_error_m=nominal.cross_track_error_m,
                 progress_limited=nominal.progress_limited,
             )
-            if self._segment_is_walkable(position, (candidate.x, candidate.y)):
+            if self._segment_has_static_visibility(
+                position,
+                (candidate.x, candidate.y),
+            ):
                 self._route_hold_active = False
                 self._route_hold_yaw = None
                 self._route_visibility_lost_since = 0.0
@@ -2183,7 +2550,10 @@ class HuNavMotionBackend:
             cross_track_error_m=nominal.cross_track_error_m,
             progress_limited=nominal.progress_limited,
         )
-        if self._segment_is_walkable(position, (candidate.x, candidate.y)):
+        if self._segment_has_static_visibility(
+            position,
+            (candidate.x, candidate.y),
+        ):
             self._route_hold_active = False
             self._route_hold_yaw = None
             self._route_visibility_lost_since = 0.0
@@ -2198,7 +2568,7 @@ class HuNavMotionBackend:
             )
         ):
             replanned = self._lookahead_target
-            if self._segment_is_walkable(
+            if self._segment_has_static_visibility(
                 position,
                 (replanned.x, replanned.y),
             ):
@@ -2235,6 +2605,8 @@ class HuNavMotionBackend:
         self,
         position: tuple[float, float],
         nominal: LookaheadTarget,
+        *,
+        start_yaw: float | None = None,
     ) -> tuple[float, float] | None:
         robot = self._robot
         if (
@@ -2256,6 +2628,7 @@ class HuNavMotionBackend:
             position,
             nominal,
             robot,
+            start_yaw=start_yaw,
         )
         robot_passed = longitudinal <= -0.10
         if self._avoidance_encounter_active:
@@ -2304,8 +2677,198 @@ class HuNavMotionBackend:
         position: tuple[float, float],
         nominal,
         robot: Mapping[str, float],
+        *,
+        start_yaw: float | None = None,
     ) -> tuple[bool, list[AvoidanceCandidate], float]:
-        robot_xy = (float(robot["x"]), float(robot["y"]))
+        current_id = (
+            str(self._command.agent_id)
+            if self._command is not None
+            else ""
+        )
+        return self._corridor_candidates(
+            position,
+            nominal,
+            obstacle_kind="robot",
+            obstacle_id="robot",
+            obstacle=robot,
+            trigger_distance_m=self._avoidance_trigger_distance_m,
+            side_clearance_m=self._avoidance_side_clearance_m,
+            clearance_samples=self._avoidance_clearance_samples_m,
+            forward_offset_samples=self._avoidance_forward_offset_samples_m,
+            pedestrians=self._pedestrian_obstacles(
+                current_id,
+                fixed_only=False,
+            ),
+            start_yaw=start_yaw,
+        )
+
+    def _pedestrian_avoidance_candidates(
+        self,
+        position: tuple[float, float],
+        nominal,
+        blocker_id: str,
+        pedestrians: Mapping[str, Mapping[str, float]],
+        *,
+        start_yaw: float | None = None,
+    ) -> tuple[bool, list[AvoidanceCandidate], float]:
+        blocker = pedestrians.get(blocker_id)
+        if blocker is None:
+            self._last_avoidance_candidates = ()
+            return False, [], 0.0
+        clearance_samples = tuple(
+            dict.fromkeys(
+                (
+                    self._pedestrian_yield_side_clearance_m,
+                    *self._avoidance_clearance_samples_m,
+                )
+            )
+        )
+        forward_samples = tuple(
+            dict.fromkeys(
+                (
+                    self._pedestrian_yield_forward_offset_m,
+                    *self._avoidance_forward_offset_samples_m,
+                )
+            )
+        )
+        blocking, candidates, longitudinal = self._corridor_candidates(
+            position,
+            nominal,
+            obstacle_kind="pedestrian",
+            obstacle_id=str(blocker_id),
+            obstacle=blocker,
+            trigger_distance_m=self._pedestrian_yield_trigger_distance_m,
+            side_clearance_m=self._pedestrian_yield_side_clearance_m,
+            clearance_samples=clearance_samples,
+            forward_offset_samples=forward_samples,
+            pedestrians=pedestrians,
+            start_yaw=start_yaw,
+        )
+        if blocking and not candidates:
+            planned = self._planned_pedestrian_corridor_candidate(
+                position,
+                nominal,
+                blocker_id=str(blocker_id),
+                blocker=blocker,
+                pedestrians=pedestrians,
+                longitudinal_m=longitudinal,
+                start_yaw=start_yaw,
+            )
+            if planned is not None:
+                self._last_avoidance_candidates = (
+                    *self._last_avoidance_candidates,
+                    planned,
+                )
+                if planned.accepted:
+                    candidates = [planned]
+        return blocking, candidates, longitudinal
+
+    def _planned_pedestrian_corridor_candidate(
+        self,
+        position: tuple[float, float],
+        nominal,
+        *,
+        blocker_id: str,
+        blocker: Mapping[str, float],
+        pedestrians: Mapping[str, Mapping[str, float]],
+        longitudinal_m: float,
+        start_yaw: float | None,
+    ) -> AvoidanceCandidate | None:
+        planner = self._walkable_planner
+        if planner is None:
+            return None
+        tangent = (
+            float(nominal.x) - position[0],
+            float(nominal.y) - position[1],
+        )
+        tangent_length = math.hypot(*tangent)
+        if tangent_length <= 1e-6:
+            return None
+        tangent = (tangent[0] / tangent_length, tangent[1] / tangent_length)
+        normal_left = (-tangent[1], tangent[0])
+        rejoin = self._corridor_rejoin_point(
+            position,
+            tangent,
+            longitudinal_m=longitudinal_m,
+            forward_offset_m=max(self._avoidance_forward_offset_samples_m),
+        )
+        dynamic_obstacles = [
+            (
+                float(obstacle["x"]),
+                float(obstacle["y"]),
+                self._planning_radius
+                + self._avoidance_min_dynamic_clearance_m
+                + 0.25 * self._avoidance_sample_spacing_m,
+            )
+            for obstacle in pedestrians.values()
+        ]
+        robot = self._robot
+        if (
+            robot is not None
+            and time.monotonic() - float(robot.get("received_at", 0.0)) <= 1.0
+        ):
+            dynamic_obstacles.append(
+                (
+                    float(robot["x"]),
+                    float(robot["y"]),
+                    self._effective_robot_radius(robot),
+                )
+            )
+        try:
+            points = planner.plan(
+                [position[0], position[1], 0.0],
+                [rejoin[0], rejoin[1], 0.0],
+                z=0.0,
+                dynamic_obstacles=dynamic_obstacles,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                f"HuNav pedestrian corridor search failed: "
+                f"agent={self._command.agent_id}, blocker={blocker_id}, "
+                f"reason={exc}"
+            )
+            return None
+        route = (
+            position,
+            *((float(point[0]), float(point[1])) for point in points),
+        )
+        if len(route) < 2:
+            return None
+        blocker_xy = (float(blocker["x"]), float(blocker["y"]))
+        closest = min(route[1:], key=lambda point: math.dist(point, blocker_xy))
+        lateral = (
+            (closest[0] - blocker_xy[0]) * normal_left[0]
+            + (closest[1] - blocker_xy[1]) * normal_left[1]
+        )
+        side = 1 if lateral >= 0.0 else -1
+        return self._evaluate_corridor_candidate(
+            side=side,
+            route=route,
+            tangent=tangent,
+            obstacle_kind="pedestrian",
+            obstacle_id=blocker_id,
+            obstacle=blocker,
+            pedestrians=pedestrians,
+            static_validated=True,
+            start_yaw=start_yaw,
+        )
+
+    def _corridor_candidates(
+        self,
+        position: tuple[float, float],
+        nominal,
+        *,
+        obstacle_kind: str,
+        obstacle_id: str,
+        obstacle: Mapping[str, float],
+        trigger_distance_m: float,
+        side_clearance_m: float,
+        clearance_samples: tuple[float, ...],
+        forward_offset_samples: tuple[float, ...],
+        pedestrians: Mapping[str, Mapping[str, float]],
+        start_yaw: float | None = None,
+    ) -> tuple[bool, list[AvoidanceCandidate], float]:
+        obstacle_xy = (float(obstacle["x"]), float(obstacle["y"]))
         tangent = (float(nominal.x) - position[0], float(nominal.y) - position[1])
         tangent_length = math.hypot(*tangent)
         if tangent_length <= 1e-6:
@@ -2313,18 +2876,31 @@ class HuNavMotionBackend:
             return False, [], 0.0
         tangent = (tangent[0] / tangent_length, tangent[1] / tangent_length)
         normal_left = (-tangent[1], tangent[0])
-        relative = (robot_xy[0] - position[0], robot_xy[1] - position[1])
+        relative = (
+            obstacle_xy[0] - position[0],
+            obstacle_xy[1] - position[1],
+        )
         longitudinal = relative[0] * tangent[0] + relative[1] * tangent[1]
         lateral = relative[0] * normal_left[0] + relative[1] * normal_left[1]
-        robot_forward_support = self._robot_support_radius(robot, tangent)
-        robot_lateral_support = self._robot_support_radius(robot, normal_left)
+        if obstacle_kind == "robot":
+            obstacle_forward_support = self._robot_support_radius(
+                obstacle,
+                tangent,
+            )
+            obstacle_lateral_support = self._robot_support_radius(
+                obstacle,
+                normal_left,
+            )
+        else:
+            obstacle_forward_support = self._planning_radius
+            obstacle_lateral_support = self._planning_radius
         blocking_radius = (
             self._planning_radius
-            + robot_lateral_support
-            + self._avoidance_side_clearance_m
+            + obstacle_lateral_support
+            + float(side_clearance_m)
         )
         blocking = (
-            math.dist(position, robot_xy) <= self._avoidance_trigger_distance_m
+            math.dist(position, obstacle_xy) <= float(trigger_distance_m)
             and longitudinal > 0.0
             and abs(lateral) < blocking_radius
         )
@@ -2336,20 +2912,20 @@ class HuNavMotionBackend:
         for side in (-1, 1):
             normal = (normal_left[0] * side, normal_left[1] * side)
             side_evaluations = []
-            for clearance in self._avoidance_clearance_samples_m:
+            for clearance in clearance_samples:
                 lateral_radius = (
                     self._planning_radius
-                    + robot_lateral_support
+                    + obstacle_lateral_support
                     + float(clearance)
                 )
-                for forward_offset in self._avoidance_forward_offset_samples_m:
+                for forward_offset in forward_offset_samples:
                     entry_forward = max(
                         0.0,
                         min(
                             float(forward_offset),
                             longitudinal
                             - self._planning_radius
-                            - robot_forward_support,
+                            - obstacle_forward_support,
                         ),
                     )
                     entry_lateral = lateral + side * lateral_radius
@@ -2361,20 +2937,33 @@ class HuNavMotionBackend:
                         + tangent[1] * entry_forward
                         + normal_left[1] * entry_lateral,
                     )
-                    candidate = (
-                        robot_xy[0]
+                    bypass = (
+                        obstacle_xy[0]
                         + tangent[0] * float(forward_offset)
                         + normal[0] * lateral_radius,
-                        robot_xy[1]
+                        obstacle_xy[1]
                         + tangent[1] * float(forward_offset)
                         + normal[1] * lateral_radius,
                     )
+                    route = (position, entry, bypass)
+                    if obstacle_kind == "pedestrian":
+                        rejoin = self._corridor_rejoin_point(
+                            position,
+                            tangent,
+                            longitudinal_m=longitudinal,
+                            forward_offset_m=float(forward_offset),
+                        )
+                        route = (*route, rejoin)
                     side_evaluations.append(
-                        self._evaluate_avoidance_candidate(
+                        self._evaluate_corridor_candidate(
                             side=side,
-                            route=(position, entry, candidate),
+                            route=route,
                             tangent=tangent,
-                            robot=robot,
+                            obstacle_kind=obstacle_kind,
+                            obstacle_id=obstacle_id,
+                            obstacle=obstacle,
+                            pedestrians=pedestrians,
+                            start_yaw=start_yaw,
                         )
                     )
             accepted = [
@@ -2407,20 +2996,54 @@ class HuNavMotionBackend:
             longitudinal,
         )
 
-    def _evaluate_avoidance_candidate(
+    def _corridor_rejoin_point(
+        self,
+        position: tuple[float, float],
+        tangent: tuple[float, float],
+        *,
+        longitudinal_m: float,
+        forward_offset_m: float,
+    ) -> tuple[float, float]:
+        distance = max(
+            self._lookahead_distance_m,
+            longitudinal_m + forward_offset_m + 2.0 * self._planning_radius,
+        )
+        tracker = self._lookahead_tracker
+        if tracker is not None:
+            target = tracker.target_at_progress(
+                tracker.progress_m + distance,
+                cross_track_error_m=0.0,
+                progress_limited=False,
+            )
+            return (float(target.x), float(target.y))
+        return (
+            position[0] + tangent[0] * distance,
+            position[1] + tangent[1] * distance,
+        )
+
+    def _evaluate_corridor_candidate(
         self,
         *,
         side: int,
         route: tuple[tuple[float, float], ...],
         tangent: tuple[float, float],
-        robot: Mapping[str, float],
+        obstacle_kind: str,
+        obstacle_id: str,
+        obstacle: Mapping[str, float],
+        pedestrians: Mapping[str, Mapping[str, float]],
+        static_validated: bool = False,
+        start_yaw: float | None = None,
     ) -> AvoidanceCandidate:
         target = route[-1]
         path_length = sum(
             math.dist(route[index], route[index + 1])
             for index in range(len(route) - 1)
         )
-        first_leg = (target[0] - route[0][0], target[1] - route[0][1])
+        first_waypoint = route[1] if len(route) > 1 else target
+        first_leg = (
+            first_waypoint[0] - route[0][0],
+            first_waypoint[1] - route[0][1],
+        )
         first_length = math.hypot(*first_leg)
         turn_angle = (
             math.pi
@@ -2447,7 +3070,10 @@ class HuNavMotionBackend:
         static_clearance = math.inf
         if self._walkable_planner is not None:
             route_points = tuple([point[0], point[1], 0.0] for point in route)
-            if not self._walkable_planner.polyline_is_free(route_points):
+            if (
+                not static_validated
+                and not self._walkable_planner.polyline_is_free(route_points)
+            ):
                 return AvoidanceCandidate(
                     side=side,
                     target=target,
@@ -2460,11 +3086,27 @@ class HuNavMotionBackend:
                     forward_progress_m=forward_progress,
                     turn_angle_rad=turn_angle,
                 )
-            clearance_samples = samples[1:] if len(samples) > 1 else samples
-            static_clearance = min(
-                self._walkable_planner.clearance_at(point)
-                for _, point in clearance_samples
+            static_clearance = self._geometry_safety_port().polyline_minimum_clearance(
+                route,
+                start_yaw=(
+                    math.atan2(tangent[1], tangent[0])
+                    if start_yaw is None or not math.isfinite(float(start_yaw))
+                    else float(start_yaw)
+                ),
             )
+            if static_clearance < -1e-9:
+                return AvoidanceCandidate(
+                    side=side,
+                    target=target,
+                    waypoints=route[1:],
+                    accepted=False,
+                    reason="swept character envelope blocked",
+                    static_clearance_m=static_clearance,
+                    dynamic_clearance_m=math.inf,
+                    path_length_m=path_length,
+                    forward_progress_m=forward_progress,
+                    turn_angle_rad=turn_angle,
+                )
 
         pedestrian_speed = max(
             0.10,
@@ -2472,10 +3114,6 @@ class HuNavMotionBackend:
             if self._command is not None
             else 0.60,
         )
-        robot_x = float(robot["x"])
-        robot_y = float(robot["y"])
-        robot_vx = float(robot.get("vx", 0.0))
-        robot_vy = float(robot.get("vy", 0.0))
         dynamic_clearance = math.inf
         for distance_along, point in samples:
             time_at_point = distance_along / pedestrian_speed
@@ -2483,17 +3121,46 @@ class HuNavMotionBackend:
                 time_at_point,
                 self._avoidance_prediction_horizon_sec,
             )
-            predicted_robot = {
-                "x": robot_x + robot_vx * prediction_time,
-                "y": robot_y + robot_vy * prediction_time,
-                "yaw": float(robot.get("yaw", 0.0))
-                + float(robot.get("wz", 0.0)) * prediction_time,
-            }
             dynamic_clearance = min(
                 dynamic_clearance,
-                self._robot_footprint_clearance(point, predicted_robot)
-                - self._planning_radius,
+                self._corridor_obstacle_clearance(
+                    point,
+                    obstacle_kind=obstacle_kind,
+                    obstacle=obstacle,
+                    prediction_time=prediction_time,
+                ),
             )
+            if obstacle_kind != "robot" and self._robot is not None:
+                robot = self._robot
+                if (
+                    time.monotonic()
+                    - float(robot.get("received_at", 0.0))
+                    <= 1.0
+                ):
+                    dynamic_clearance = min(
+                        dynamic_clearance,
+                        self._corridor_obstacle_clearance(
+                            point,
+                            obstacle_kind="robot",
+                            obstacle=robot,
+                            prediction_time=prediction_time,
+                        ),
+                    )
+            for agent_id, pedestrian in pedestrians.items():
+                if (
+                    obstacle_kind == "pedestrian"
+                    and agent_id == obstacle_id
+                ):
+                    continue
+                dynamic_clearance = min(
+                    dynamic_clearance,
+                    self._corridor_obstacle_clearance(
+                        point,
+                        obstacle_kind="pedestrian",
+                        obstacle=pedestrian,
+                        prediction_time=prediction_time,
+                    ),
+                )
         accepted = (
             dynamic_clearance + 1e-9
             >= self._avoidance_min_dynamic_clearance_m
@@ -2509,6 +3176,32 @@ class HuNavMotionBackend:
             path_length_m=path_length,
             forward_progress_m=forward_progress,
             turn_angle_rad=turn_angle,
+        )
+
+    def _corridor_obstacle_clearance(
+        self,
+        point: tuple[float, float],
+        *,
+        obstacle_kind: str,
+        obstacle: Mapping[str, float],
+        prediction_time: float,
+    ) -> float:
+        predicted = {
+            "x": float(obstacle["x"])
+            + float(obstacle.get("vx", 0.0)) * prediction_time,
+            "y": float(obstacle["y"])
+            + float(obstacle.get("vy", 0.0)) * prediction_time,
+            "yaw": float(obstacle.get("yaw", 0.0))
+            + float(obstacle.get("wz", 0.0)) * prediction_time,
+        }
+        if obstacle_kind == "robot":
+            return (
+                self._robot_footprint_clearance(point, predicted)
+                - self._planning_radius
+            )
+        return (
+            math.dist(point, (predicted["x"], predicted["y"]))
+            - 2.0 * self._planning_radius
         )
 
     def _sample_avoidance_route(
@@ -2711,7 +3404,7 @@ class HuNavMotionBackend:
         self,
         actual: Mapping[str, float],
     ) -> bool:
-        """Hold behind a fixed pedestrian when neither passing side is usable."""
+        """Choose one passing side for a pedestrian or hold if none is safe."""
         if (
             not self._pedestrian_yield_enabled
             or self._lookahead_target is None
@@ -2724,32 +3417,61 @@ class HuNavMotionBackend:
             float(self._lookahead_target.x),
             float(self._lookahead_target.y),
         )
-        fixed = self._fixed_pedestrian_positions(current_id)
+        pedestrians = self._pedestrian_obstacles(
+            current_id,
+            fixed_only=False,
+        )
         blocker_id = self._pedestrian_yield_blocker
+        if (
+            blocker_id is not None
+            and self._local_route_mode == "PEDESTRIAN_AVOIDANCE"
+        ):
+            return False
         if blocker_id is None:
             blocker_id = self._nearest_blocking_pedestrian(
                 position,
                 target,
-                fixed,
+                pedestrians,
                 self._pedestrian_yield_trigger_distance_m,
             )
             if blocker_id is None:
                 return False
-        blocker = fixed.get(blocker_id)
-        passage_available = (
-            blocker is None
-            or self._pedestrian_bypass_available(
+        blocker = pedestrians.get(blocker_id)
+        blocker_distance = (
+            math.inf
+            if blocker is None
+            else math.dist(
                 position,
-                target,
-                blocker,
-                fixed,
+                (float(blocker["x"]), float(blocker["y"])),
             )
         )
-        blocker_distance = (
-            math.inf if blocker is None else math.dist(position, blocker)
-        )
+        blocking = False
+        candidates: list[AvoidanceCandidate] = []
+        if self._pedestrian_yield_blocker is not None:
+            nearest = self._nearest_blocking_pedestrian(
+                position,
+                target,
+                pedestrians,
+                self._pedestrian_yield_trigger_distance_m,
+            )
+            geometry_released = (
+                blocker is None
+                or nearest != blocker_id
+                or blocker_distance > self._pedestrian_yield_release_distance_m
+            )
+            blocking = not geometry_released
+        elif blocker is not None:
+            blocking, candidates, _ = self._pedestrian_avoidance_candidates(
+                position,
+                self._lookahead_target,
+                blocker_id,
+                pedestrians,
+                start_yaw=float(actual.get("yaw", 0.0)),
+            )
         should_release = (
-            passage_available
+            blocker is None
+            or not blocking
+            or bool(candidates)
             or blocker_distance > self._pedestrian_yield_release_distance_m
         )
         if self._pedestrian_yield_blocker is not None:
@@ -2792,7 +3514,35 @@ class HuNavMotionBackend:
                 f"blocker={released}; remaining route will be rebuilt."
             )
             return False
-        if passage_available:
+        if not blocking:
+            return False
+        if candidates:
+            selected = min(
+                candidates,
+                key=lambda item: self._avoidance_candidate_sort_key(
+                    item,
+                    preferred_side=1,
+                ),
+            )
+            self._pedestrian_yield_blocker = blocker_id
+            self._avoidance_side = selected.side
+            self._avoidance_target = selected.target
+            self._avoidance_recovery_attempts = 0
+            self._set_local_route(
+                "PEDESTRIAN_AVOIDANCE",
+                selected.waypoints,
+            )
+            self._logger.info(
+                f"HuNav pedestrian corridor latched: agent={current_id}, "
+                f"blocker={blocker_id}, side={selected.side:+d}, "
+                f"target=({selected.target[0]:.3f},"
+                f"{selected.target[1]:.3f}), "
+                f"static_clearance_m={selected.static_clearance_m:.3f}, "
+                f"dynamic_clearance_m={selected.dynamic_clearance_m:.3f}, "
+                f"path_length_m={selected.path_length_m:.3f}, "
+                f"turn_angle_deg={math.degrees(selected.turn_angle_rad):.1f}, "
+                f"candidates={self._format_avoidance_candidates()}"
+            )
             return False
         self._pedestrian_yield_blocker = blocker_id
         self._pedestrian_yield_clear_ticks = 0
@@ -2809,17 +3559,20 @@ class HuNavMotionBackend:
         self._logger.info(
             f"HuNav pedestrian corridor blocked: agent={current_id}, "
             f"blocker={blocker_id}, distance_m={blocker_distance:.3f}; "
-            "both passing sides are unavailable, holding position."
+            "both passing sides are unavailable, holding position; "
+            f"candidates={self._format_avoidance_candidates()}"
         )
         return True
 
-    def _fixed_pedestrian_positions(
+    def _pedestrian_obstacles(
         self,
         current_id: str,
-    ) -> dict[str, tuple[float, float]]:
+        *,
+        fixed_only: bool,
+    ) -> dict[str, dict[str, float]]:
         now = time.monotonic()
-        fixed: dict[str, tuple[float, float]] = {}
-        for agent_id, state in self._runtime_states.items():
+        obstacles: dict[str, dict[str, float]] = {}
+        for agent_id, state in getattr(self, "_runtime_states", {}).items():
             if agent_id == current_id:
                 continue
             command = state.get("_command")
@@ -2832,7 +3585,7 @@ class HuNavMotionBackend:
                     and bool(getattr(command, "stop", False))
                 )
             )
-            if not is_fixed:
+            if fixed_only and not is_fixed:
                 continue
             pose = self._actual.get(agent_id)
             if (
@@ -2841,14 +3594,32 @@ class HuNavMotionBackend:
                 > self._state_timeout_sec
             ):
                 continue
-            fixed[agent_id] = (float(pose["x"]), float(pose["y"]))
-        return fixed
+            obstacles[agent_id] = {
+                "x": float(pose["x"]),
+                "y": float(pose["y"]),
+                "vx": 0.0 if is_fixed else float(pose.get("vx", 0.0)),
+                "vy": 0.0 if is_fixed else float(pose.get("vy", 0.0)),
+                "fixed": float(is_fixed),
+            }
+        return obstacles
+
+    def _fixed_pedestrian_positions(
+        self,
+        current_id: str,
+    ) -> dict[str, tuple[float, float]]:
+        return {
+            agent_id: (float(obstacle["x"]), float(obstacle["y"]))
+            for agent_id, obstacle in self._pedestrian_obstacles(
+                current_id,
+                fixed_only=True,
+            ).items()
+        }
 
     def _nearest_blocking_pedestrian(
         self,
         position: tuple[float, float],
         target: tuple[float, float],
-        fixed: Mapping[str, tuple[float, float]],
+        pedestrians: Mapping[str, Mapping[str, float]],
         trigger_distance_m: float,
     ) -> str | None:
         tangent = (target[0] - position[0], target[1] - position[1])
@@ -2862,10 +3633,10 @@ class HuNavMotionBackend:
             + self._pedestrian_yield_side_clearance_m
         )
         candidates = []
-        for agent_id, obstacle in fixed.items():
+        for agent_id, obstacle in pedestrians.items():
             relative = (
-                obstacle[0] - position[0],
-                obstacle[1] - position[1],
+                float(obstacle["x"]) - position[0],
+                float(obstacle["y"]) - position[1],
             )
             longitudinal = relative[0] * tangent[0] + relative[1] * tangent[1]
             lateral = abs(
@@ -2878,74 +3649,6 @@ class HuNavMotionBackend:
             ):
                 candidates.append((distance, agent_id))
         return min(candidates)[1] if candidates else None
-
-    def _pedestrian_bypass_available(
-        self,
-        position: tuple[float, float],
-        target: tuple[float, float],
-        blocker: tuple[float, float],
-        fixed: Mapping[str, tuple[float, float]],
-    ) -> bool:
-        if self._walkable_planner is None:
-            return True
-        tangent = (target[0] - position[0], target[1] - position[1])
-        tangent_length = math.hypot(*tangent)
-        if tangent_length <= 1e-6:
-            return False
-        tangent = (tangent[0] / tangent_length, tangent[1] / tangent_length)
-        normal_left = (-tangent[1], tangent[0])
-        lateral_offset = (
-            2.0 * self._planning_radius
-            + self._pedestrian_yield_side_clearance_m
-        )
-        rejoin = (
-            blocker[0] + tangent[0] * self._pedestrian_yield_forward_offset_m,
-            blocker[1] + tangent[1] * self._pedestrian_yield_forward_offset_m,
-        )
-        for side in (-1, 1):
-            bypass = (
-                blocker[0] + normal_left[0] * side * lateral_offset,
-                blocker[1] + normal_left[1] * side * lateral_offset,
-            )
-            route = (position, bypass, rejoin)
-            route_points = tuple((x, y, 0.0) for x, y in route)
-            if not self._walkable_planner.polyline_is_free(route_points):
-                continue
-            if self._pedestrian_bypass_dynamic_clear(
-                route,
-                fixed,
-            ):
-                return True
-        return False
-
-    def _pedestrian_bypass_dynamic_clear(
-        self,
-        route: tuple[tuple[float, float], ...],
-        fixed: Mapping[str, tuple[float, float]],
-    ) -> bool:
-        robot = self._robot
-        if (
-            robot is not None
-            and time.monotonic() - float(robot.get("received_at", 0.0)) > 1.0
-        ):
-            robot = None
-        minimum = self._avoidance_min_dynamic_clearance_m
-        for _, point in self._sample_avoidance_route(route):
-            if robot is not None:
-                clearance = (
-                    self._robot_footprint_clearance(point, robot)
-                    - self._planning_radius
-                )
-                if clearance + 1e-9 < minimum:
-                    return False
-            for agent_id, obstacle in fixed.items():
-                clearance = (
-                    math.dist(point, obstacle)
-                    - 2.0 * self._planning_radius
-                )
-                if clearance + 1e-9 < minimum:
-                    return False
-        return True
 
     def _update_robot_reaction(
         self,
@@ -3351,10 +4054,60 @@ class HuNavMotionBackend:
             float(robot.position.position.y),
         )
         robot_available = abs(robot_current[0]) < 50.0
-        robot_previous = (
-            self._safety_robot_previous
+        current_components = (
+            self._robot_hard_safety_components(self._robot)
+            if robot_available and self._robot is not None
+            else ()
+        )
+        previous_components = (
+            tuple(self._safety_robot_previous)
             if self._safety_robot_previous is not None
-            else robot_current
+            else current_components
+        )
+        if len(previous_components) != len(current_components):
+            previous_components = current_components
+        robot_history_reset = bool(
+            previous_components
+            and current_components
+            and max(
+                math.dist(previous[0], current[0])
+                for previous, current in zip(
+                    previous_components,
+                    current_components,
+                )
+            )
+            > self._robot_pose_reset_jump_m
+        )
+        if robot_history_reset:
+            previous_components = current_components
+            self._logger.info(
+                "HuNav hard safety reset robot footprint history after a "
+                "discontinuous robot pose update."
+            )
+        robot_components = tuple(
+            (previous[0], current[0], current[1])
+            for previous, current in zip(
+                previous_components,
+                current_components,
+            )
+        )
+        constrained_x, constrained_y, route_corridor_clipped = (
+            self._constrain_to_global_route(
+                (
+                    float(proposed.position.position.x),
+                    float(proposed.position.position.y),
+                )
+            )
+        )
+        proposed.position.position.x = constrained_x
+        proposed.position.position.y = constrained_y
+        desired_velocity = (
+            (
+                constrained_x - float(previous.position.position.x)
+            ) / dt,
+            (
+                constrained_y - float(previous.position.position.y)
+            ) / dt,
         )
         result = project_safe_step(
             previous={
@@ -3370,13 +4123,16 @@ class HuNavMotionBackend:
                 )
             },
             radii={agent_id: self._hard_radius},
-            robot_previous=robot_previous,
+            robot_previous=robot_current,
             robot_proposed=robot_current,
-            robot_radius=float(robot.radius) if robot_available else 0.0,
+            robot_radius=0.0,
+            robot_components=robot_components,
             static_obstacles={agent_id: ()},
             config=self._safety_config,
         )
-        self._safety_robot_previous = robot_current if robot_available else None
+        self._safety_robot_previous = (
+            current_components if robot_available else None
+        )
         safe_x, safe_y = result.positions[agent_id]
         safe_x, safe_y = self._suppress_backward_avoidance_step(
             (
@@ -3388,37 +4144,41 @@ class HuNavMotionBackend:
         static_fraction = 1.0
         static_clipped = False
         static_projection = "disabled"
+        static_minimum_clearance = math.inf
         if self._walkable_planner is not None:
             start_xy = (
                 float(previous.position.position.x),
                 float(previous.position.position.y),
             )
-            if self._static_projection_enabled:
-                target = (
-                    None
-                    if self._lookahead_target is None
-                    else (
-                        float(self._lookahead_target.x),
-                        float(self._lookahead_target.y),
-                    )
+            proposed_xy = (safe_x, safe_y)
+            displacement = (
+                proposed_xy[0] - start_xy[0],
+                proposed_xy[1] - start_xy[1],
+            )
+            previous_yaw = float(previous.yaw)
+            proposed_yaw = (
+                float(proposed.yaw)
+                if math.hypot(*displacement) <= 1e-9
+                else math.atan2(displacement[1], displacement[0])
+            )
+            if not math.isfinite(proposed_yaw):
+                proposed_yaw = previous_yaw
+            swept = self._geometry_safety_port().project(
+                GeometrySafetyRequest(
+                    start_xy=start_xy,
+                    proposed_xy=proposed_xy,
+                    start_yaw=previous_yaw,
+                    proposed_yaw=proposed_yaw,
                 )
-                (
-                    (safe_x, safe_y),
-                    static_fraction,
-                    static_clipped,
-                    static_projection,
-                ) = self._walkable_planner.project_step(
-                    start_xy,
-                    (safe_x, safe_y),
-                    target=target,
-                    max_deflection_deg=self._static_projection_max_deflection_deg,
-                    angle_step_deg=self._static_projection_angle_step_deg,
-                )
+            )
+            safe_x, safe_y = swept.position_xy
+            static_fraction = swept.applied_fraction
+            static_clipped = swept.clipped
+            static_minimum_clearance = swept.minimum_clearance_m
+            if swept.recovering_overlap:
+                static_projection = "swept_recovery"
             else:
-                (safe_x, safe_y), static_fraction, static_clipped = (
-                    self._walkable_planner.clip_step(start_xy, (safe_x, safe_y))
-                )
-                static_projection = "clipped" if static_clipped else "direct"
+                static_projection = "swept_clip" if static_clipped else "direct"
         proposed.position.position.x = safe_x
         proposed.position.position.y = safe_y
         proposed.velocity.linear.x = (
@@ -3435,8 +4195,27 @@ class HuNavMotionBackend:
         diagnostics["static_clip"] = static_clipped
         diagnostics["static_fraction"] = static_fraction
         diagnostics["static_projection"] = static_projection
+        diagnostics["static_minimum_clearance_m"] = static_minimum_clearance
+        diagnostics["route_corridor_clipped"] = route_corridor_clipped
+        diagnostics["route_corridor_limit_m"] = float(
+            self._last_route_corridor_limit_m
+        )
+        diagnostics["desired_velocity"] = desired_velocity
+        diagnostics["applied_velocity"] = (
+            float(proposed.velocity.linear.x),
+            float(proposed.velocity.linear.y),
+        )
+        diagnostics["robot_clearance_m"] = self._hard_robot_clearance(
+            (
+                float(previous.position.position.x),
+                float(previous.position.position.y),
+            )
+        )
+        diagnostics["robot_history_reset"] = robot_history_reset
         diagnostics["intervened"] = bool(
-            diagnostics["intervened"] or static_clipped
+            diagnostics["intervened"]
+            or static_clipped
+            or route_corridor_clipped
         )
         if diagnostics["intervened"]:
             self._logger.info(
@@ -3446,9 +4225,115 @@ class HuNavMotionBackend:
                 f"static_contacts={diagnostics['static_contacts']}, "
                 f"static_clip={static_clipped}, "
                 f"static_fraction={static_fraction:.3f}, "
-                f"static_projection={static_projection}"
+                f"static_projection={static_projection}, "
+                f"static_minimum_clearance_m={static_minimum_clearance:.3f}, "
+                f"route_corridor_clipped={route_corridor_clipped}, "
+                f"route_corridor_limit_m="
+                f"{diagnostics['route_corridor_limit_m']:.3f}, "
+                f"robot_clearance_m={diagnostics['robot_clearance_m']:.3f}, "
+                f"desired_velocity=({desired_velocity[0]:+.3f},"
+                f"{desired_velocity[1]:+.3f}), "
+                f"applied_velocity=({proposed.velocity.linear.x:+.3f},"
+                f"{proposed.velocity.linear.y:+.3f})"
             )
         return diagnostics
+
+    def _robot_hard_safety_components(
+        self,
+        robot: Mapping[str, float] | None,
+    ) -> tuple[tuple[tuple[float, float], float], ...]:
+        if robot is None:
+            return ()
+        return tuple(
+            ((float(item[0]), float(item[1])), float(item[2]))
+            for item in oriented_footprint_circles(
+                x=float(robot["x"]),
+                y=float(robot["y"]),
+                yaw=float(robot.get("yaw", 0.0)),
+                half_length_m=self._robot_footprint_half_length_m,
+                half_width_m=self._robot_footprint_half_width_m,
+                soft_clearance_m=0.0,
+            )
+        )
+
+    def _hard_robot_clearance(
+        self,
+        point: tuple[float, float],
+    ) -> float:
+        if self._robot is None:
+            return math.inf
+        return (
+            self._robot_footprint_clearance(point, self._robot)
+            - self._hard_radius
+            - self._safety_config.clearance_m
+        )
+
+    def _constrain_to_global_route(
+        self,
+        proposed: tuple[float, float],
+    ) -> tuple[float, float, bool]:
+        tracker = self._lookahead_tracker
+        if (
+            tracker is None
+            or self._local_route_mode is not None
+            or self._terminal_align_active
+        ):
+            return float(proposed[0]), float(proposed[1]), False
+        projected_x, projected_y, cross_track = tracker.project_to_route(
+            float(proposed[0]),
+            float(proposed[1]),
+        )
+        corridor_limit = self._adaptive_route_corridor_limit(
+            (projected_x, projected_y),
+            proposed,
+        )
+        self._last_route_corridor_limit_m = corridor_limit
+        if cross_track <= corridor_limit + 1e-9:
+            return float(proposed[0]), float(proposed[1]), False
+        offset_x = float(proposed[0]) - projected_x
+        offset_y = float(proposed[1]) - projected_y
+        offset_length = math.hypot(offset_x, offset_y)
+        if offset_length <= 1e-9:
+            return projected_x, projected_y, True
+        scale = corridor_limit / offset_length
+        return (
+            projected_x + offset_x * scale,
+            projected_y + offset_y * scale,
+            True,
+        )
+
+    def _adaptive_route_corridor_limit(
+        self,
+        projected: tuple[float, float],
+        proposed: tuple[float, float],
+    ) -> float:
+        if self._walkable_planner is None:
+            return self._route_corridor_half_width_m
+        target = self._lookahead_target
+        direction = (
+            (
+                float(target.x) - projected[0],
+                float(target.y) - projected[1],
+            )
+            if target is not None
+            else (
+                float(proposed[0]) - projected[0],
+                float(proposed[1]) - projected[1],
+            )
+        )
+        yaw = (
+            math.atan2(direction[1], direction[0])
+            if math.hypot(*direction) > 1e-9
+            else 0.0
+        )
+        route_clearance = self._geometry_safety_port().pose_clearance(
+            projected,
+            yaw,
+        )
+        return min(
+            self._route_corridor_half_width_m,
+            max(0.0, float(route_clearance)),
+        )
 
     def _suppress_backward_avoidance_step(
         self,
@@ -3458,7 +4343,10 @@ class HuNavMotionBackend:
         """Keep HuNav's lateral response without allowing avoidance retreat."""
         if (
             not self._avoidance_suppress_backward_motion
-            or not self._avoidance_encounter_active
+            or (
+                not self._avoidance_encounter_active
+                and self._local_route_mode != "PEDESTRIAN_AVOIDANCE"
+            )
             or self._avoidance_target is None
         ):
             return proposed
@@ -3575,6 +4463,7 @@ class HuNavMotionBackend:
             agent.behavior,
         )
         self._record_native_behavior_transition(behavior_diagnostics)
+        local_shadow = getattr(self, "_last_local_motion_shadow", None) or {}
         message = (
             f"HuNav diagnostics: agent={self._command.agent_id}, generation={self._generation}, "
             f"phase={self._command.phase or 'UNSPECIFIED'}, pose=({agent.position.position.x:.3f},"
@@ -3597,6 +4486,17 @@ class HuNavMotionBackend:
             f"local_route_mode={self._local_route_mode}, "
             f"local_route_waypoint={self._local_route_index}/"
             f"{len(self._local_route_points)}, "
+            f"local_shadow_enabled="
+            f"{getattr(self, '_local_motion_shadow_enabled', False)}, "
+            f"local_shadow_feasible={local_shadow.get('feasible')}, "
+            f"local_shadow_velocity_error_mps="
+            f"{float(local_shadow.get('velocity_error_mps', 0.0)):.3f}, "
+            f"local_shadow_behavior_mode="
+            f"{local_shadow.get('behavior_mode')}, "
+            f"local_shadow_selected_speed_mps="
+            f"{float(local_shadow.get('selected_speed_mps', 0.0)):.3f}, "
+            f"local_shadow_avoidance_active="
+            f"{local_shadow.get('avoidance_active')}, "
             f"static_hold_yaw={self._static_hold_yaw}, "
             f"behavior_profile={behavior_diagnostics['profile']}, "
             f"native_behavior={behavior_diagnostics['native_type']}, "
@@ -3709,6 +4609,11 @@ class HuNavMotionBackend:
         self._dispatch_external_command(command)
 
     def _dispatch_external_command(self, command: MotionCommand) -> None:
+        now = time.monotonic()
+        if now < getattr(self, "_external_retry_after", 0.0):
+            self._pending_external_command = command
+            return
+        self._pending_external_command = None
         agent_id = str(command.agent_id)
         self._external_request_token += 1
         token = self._external_request_token
@@ -3724,6 +4629,46 @@ class HuNavMotionBackend:
                 future,
             ),
         )
+        self._external_future_started_at = now
+
+    def _flush_pending_external_command(self) -> bool:
+        command = getattr(self, "_pending_external_command", None)
+        future = getattr(self, "_external_future", None)
+        if (
+            command is None
+            or (future is not None and not future.done())
+            or time.monotonic() < getattr(self, "_external_retry_after", 0.0)
+        ):
+            return False
+        self._pending_external_command = None
+        self._dispatch_external_command(command)
+        return True
+
+    def _expire_stale_external_future(self) -> bool:
+        future = getattr(self, "_external_future", None)
+        if future is None or future.done():
+            return False
+        started_at = float(getattr(self, "_external_future_started_at", 0.0))
+        now = time.monotonic()
+        if (
+            started_at <= 0.0
+            or now - started_at <= self._external_future_deadline_sec
+        ):
+            return False
+        cancel = getattr(future, "cancel", None)
+        if callable(cancel):
+            cancel()
+        self._external_request_token += 1
+        self._external_future = None
+        self._external_future_started_at = 0.0
+        self._external_retry_after = now + self._external_retry_cooldown_sec
+        self._logger.warning(
+            f"Isaac external-motion request timed out for "
+            f"{self._command.agent_id if self._command is not None else 'unknown'} "
+            f"after {now - started_at:.2f}s; dropping the stale future and "
+            "continuing local planning."
+        )
+        return True
 
     def _external_done_for(
         self,
@@ -3748,11 +4693,16 @@ class HuNavMotionBackend:
 
     def _external_done(self, future) -> None:
         try:
-            accepted = bool(future.result().ret)
+            response = future.result()
+            if response is None:
+                raise RuntimeError("service completed without a response")
+            accepted = bool(response.ret)
         except Exception as exc:
             self._logger.error(f"Isaac external-motion update failed: {exc}")
             self._external_future = None
+            self._external_future_started_at = 0.0
             return
         if not accepted:
             self._logger.error("Isaac rejected a HuNav external-motion update.")
         self._external_future = None
+        self._external_future_started_at = 0.0

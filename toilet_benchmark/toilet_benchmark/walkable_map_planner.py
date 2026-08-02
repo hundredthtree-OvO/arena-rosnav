@@ -107,6 +107,17 @@ class WalkableMapPlanner:
             allow_out_of_bounds=allow_out_of_bounds,
         )
 
+    def polyline_avoids_raw_obstacles(
+        self,
+        points,
+        *,
+        allow_out_of_bounds: bool = False,
+    ) -> bool:
+        return self._planner.polyline_avoids_raw_obstacles(
+            points,
+            allow_out_of_bounds=allow_out_of_bounds,
+        )
+
     def clearance_at(self, position) -> float:
         cell = self._planner.world_to_cell(
             float(position[0]),

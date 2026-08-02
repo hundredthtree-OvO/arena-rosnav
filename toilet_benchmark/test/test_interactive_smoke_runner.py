@@ -14,6 +14,7 @@ from toilet_benchmark.interactive_smoke_runner import (
     _latest_agent_x,
     _pose_arg,
     _build_parser,
+    apply_visual_envelope_gate,
     build_dynamic_crossing_command,
     build_commands,
     build_robot_reset_command,
@@ -24,6 +25,7 @@ from toilet_benchmark.interactive_smoke_runner import (
     run_director_with_occupied_passage,
     stop_dynamic_crossing,
     summarize_director_log,
+    summarize_local_motion_diagnostics,
     summarize_raw_pose_log,
     summarize_visual_envelope_log,
 )
@@ -54,6 +56,22 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         ]
         self.assertEqual(targets, ["urinal_1", "urinal_5"])
 
+    def test_build_commands_forwards_scenario_runtime_override(self):
+        paths = discover_paths()
+        _, _, director = build_commands(
+            paths,
+            benchmark=paths.benchmark,
+            behavior="regular",
+            target_resource="urinal_1",
+            initial_agents=1,
+            scenario_runtime="takeover",
+        )
+
+        self.assertEqual(
+            director[director.index("--scenario-runtime") + 1],
+            "takeover",
+        )
+
     def test_variant_isolated_diagnostics_and_reaction_override(self):
         source_payload = {
             "motion_backend": {
@@ -80,6 +98,30 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
             self.assertEqual(hunav["diagnostic_log_dir"], str(root / "diagnostics"))
             self.assertTrue(destination.is_file())
 
+    def test_variant_can_enable_local_motion_shadow_without_editing_source(self):
+        source_payload = {
+            "motion_backend": {
+                "hunav": {"local_motion_shadow": {"enabled": False}}
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.yaml"
+            destination = root / "variant.yaml"
+            source.write_text(yaml.safe_dump(source_payload), encoding="utf-8")
+
+            result = make_benchmark_variant(
+                source,
+                destination,
+                diagnostic_dir=root / "diagnostics",
+                reaction_override=None,
+                local_motion_shadow_override=True,
+            )
+
+        self.assertTrue(
+            result["motion_backend"]["hunav"]["local_motion_shadow"]["enabled"]
+        )
+
     def test_occupied_passage_variant_freezes_activation_and_service_timing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -97,6 +139,125 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
 
         self.assertEqual(result["director"]["initial_spawn_interval_sec"], 40.0)
         self.assertEqual(result["service_time_sec"]["urinal"], [55.0, 55.0])
+
+    def test_passable_passage_profiles_share_geometry_but_vary_destination(self):
+        first = SCENARIO_PROFILES["passable_passage_u1"]
+        second = SCENARIO_PROFILES["passable_passage_u2"]
+
+        self.assertEqual(first.target_resource, "urinal_3,urinal_1")
+        self.assertEqual(second.target_resource, "urinal_3,urinal_2")
+        self.assertEqual(first.robot_blocking_pose, (0.0, 0.0, 0.03, 0.0))
+        self.assertEqual(second.robot_blocking_pose, first.robot_blocking_pose)
+        self.assertEqual(first.trigger_marker, "toilet_agent_01 started using urinal_3")
+        self.assertEqual(first.initial_spawn_interval_sec, 40.0)
+        self.assertEqual(first.urinal_service_time_sec, (70.0, 70.0))
+
+    def test_diagnostic_summary_counts_avoidance_side_commitment(self):
+        def diagnostic_line(timestamp, avoidance_side):
+            return (
+                f"[INFO] [{timestamp:.3f}] [toilet_director_node]: "
+                "HuNav diagnostics: agent=toilet_agent_01, generation=1, "
+                "phase=WALK_TO_URINAL, pose=(-1.00,0.00), yaw=0.000, "
+                "speed=0.500, route_progress_m=1.00, "
+                f"avoidance_side={avoidance_side:+d}, "
+                "behavior_profile=regular, native_behavior=regular, "
+                "native_behavior_state=inactive, pedestrian_pair_contacts=0"
+            )
+
+        text = "\n".join(
+            (
+                diagnostic_line(10.0, avoidance_side=0),
+                diagnostic_line(11.0, avoidance_side=1),
+                diagnostic_line(12.0, avoidance_side=1),
+                diagnostic_line(13.0, avoidance_side=-1),
+                diagnostic_line(14.0, avoidance_side=0),
+                diagnostic_line(15.0, avoidance_side=-1),
+            )
+        )
+
+        result = summarize_director_log(text, exit_code=0)
+        metrics = result["diagnostic_samples_by_agent"]["toilet_agent_01"]
+
+        self.assertEqual(metrics["avoidance_episode_count"], 2)
+        self.assertEqual(metrics["avoidance_active_sample_count"], 4)
+        self.assertEqual(metrics["avoidance_side_switch_count"], 1)
+
+    def test_diagnostic_summary_aggregates_local_motion_shadow(self):
+        def diagnostic_line(timestamp, feasible, error, behavior_mode):
+            return (
+                f"[INFO] [{timestamp:.3f}] [toilet_director_node]: "
+                "HuNav diagnostics: agent=toilet_agent_01, generation=1, "
+                "phase=WALK_TO_URINAL, pose=(-1.00,0.00), yaw=0.000, "
+                "speed=0.500, route_progress_m=1.00, avoidance_side=+0, "
+                "local_shadow_enabled=True, "
+                f"local_shadow_feasible={feasible}, "
+                f"local_shadow_velocity_error_mps={error:.3f}, "
+                f"local_shadow_behavior_mode={behavior_mode}, "
+                "local_shadow_selected_speed_mps=0.300, "
+                f"local_shadow_avoidance_active={'True' if feasible == 'False' else 'False'}, "
+                "behavior_profile=regular, native_behavior=regular, "
+                "native_behavior_state=inactive, pedestrian_pair_contacts=0"
+            )
+
+        text = "\n".join(
+            (
+                diagnostic_line(10.0, "True", 0.10, "walking"),
+                diagnostic_line(11.0, "False", 0.40, "yielding"),
+                diagnostic_line(12.0, "True", 0.20, "walking"),
+            )
+        )
+
+        result = summarize_director_log(text, exit_code=0)
+        metrics = result["diagnostic_samples_by_agent"]["toilet_agent_01"]
+
+        self.assertEqual(metrics["local_shadow_sample_count"], 3)
+        self.assertEqual(metrics["local_shadow_feasible_sample_count"], 2)
+        self.assertAlmostEqual(metrics["local_shadow_feasible_ratio"], 2.0 / 3.0)
+        self.assertAlmostEqual(metrics["local_shadow_velocity_error_mean_mps"], 0.7 / 3.0)
+        self.assertEqual(metrics["local_shadow_velocity_error_max_mps"], 0.4)
+        self.assertEqual(metrics["local_shadow_avoidance_active_sample_count"], 1)
+        self.assertAlmostEqual(metrics["local_shadow_selected_speed_mean_mps"], 0.3)
+        self.assertEqual(
+            metrics["local_shadow_behavior_modes"],
+            {"walking": 2, "yielding": 1},
+        )
+        self.assertEqual(result["local_shadow_sample_count"], 3)
+        self.assertEqual(result["local_shadow_infeasible_sample_count"], 1)
+
+    def test_pair_distance_uses_planar_euclidean_distance_once(self):
+        def diagnostic_line(agent_id, x, y):
+            return (
+                "[INFO] [10.000] [toilet_director_node]: "
+                f"HuNav diagnostics: agent={agent_id}, generation=1, "
+                f"phase=WALK_TO_URINAL, pose=({x:.2f},{y:.2f}), yaw=0.000, "
+                "speed=0.500, route_progress_m=1.00, avoidance_side=+0, "
+                "behavior_profile=regular, native_behavior=regular, "
+                "native_behavior_state=inactive, pedestrian_pair_contacts=0"
+            )
+
+        result = summarize_director_log(
+            "\n".join(
+                (
+                    diagnostic_line("toilet_agent_01", 0.0, 0.0),
+                    diagnostic_line("toilet_agent_02", 0.3, 0.4),
+                )
+            ),
+            exit_code=0,
+        )
+
+        self.assertAlmostEqual(result["pedestrian_pair_min_distance_m"], 0.5)
+
+    def test_summary_counts_e1_shadow_mismatches(self):
+        text = "\n".join(
+            (
+                "E1 scenario shadow mismatch: agent=toilet_agent_01",
+                "E1 scenario shadow mismatch: agent=toilet_agent_02",
+            )
+        )
+
+        result = summarize_director_log(text, exit_code=0)
+
+        self.assertEqual(result["scenario_shadow_mismatch_events"], 2)
 
     def test_variant_preserves_seed_and_behavior_blocks_without_override(self):
         source_payload = {
@@ -200,6 +361,23 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_build_commands_can_select_local_motion_backend(self):
+        paths = discover_paths()
+
+        _, _, director = build_commands(
+            paths,
+            benchmark=Path("/tmp/variant.yaml"),
+            motion_backend="local_motion",
+            behavior="regular",
+            target_resource="urinal_1",
+            initial_agents=1,
+        )
+
+        self.assertEqual(
+            director[director.index("--motion-backend") + 1],
+            "local_motion",
+        )
+
     def test_build_robot_reset_command_uses_ros_pose_quaternion(self):
         command = build_robot_reset_command((1.0, -2.0, 0.03, 3.141592653589793))
 
@@ -219,6 +397,7 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
     def test_robot_intervention_arg_normalizes_dynamic_crossing_alias(self):
         self.assertEqual(_robot_intervention_arg("dynamic-crossing"), "dynamic_crossing")
         self.assertEqual(_robot_intervention_arg("dynamic_crossing"), "dynamic_crossing")
+        self.assertEqual(_robot_intervention_arg("parked-away"), "parked_away")
         self.assertEqual(
             _robot_intervention_arg("occupied-passage"),
             "occupied_passage",
@@ -271,20 +450,24 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         clear_profile, clear_name = resolve_dynamic_crossing_profile("crossing_clear")
         resolved, resolved_name = resolve_dynamic_crossing_profile(
             "crossing_clear",
-            trigger_x=-2.4,
+            trigger_x=-2.0,
             linear_x=0.18,
         )
 
         self.assertEqual(clear_name, "crossing_clear")
-        self.assertLess(
+        self.assertGreater(
             clear_profile.trigger_x,
             DYNAMIC_CROSSING_PROFILES["crossing_conflict"].trigger_x,
+        )
+        self.assertEqual(
+            DYNAMIC_CROSSING_PROFILES["crossing_conflict"].trigger_x,
+            -2.0,
         )
         self.assertEqual(resolved_name, "custom")
         self.assertEqual(resolved.reset_pose, DYNAMIC_CROSSING_PROFILES["crossing_clear"].reset_pose)
         self.assertEqual(resolved.post_pose, DYNAMIC_CROSSING_PROFILES["crossing_clear"].post_pose)
         self.assertEqual(resolved.topic, "/cmd_vel_gamepad_diff")
-        self.assertEqual(resolved.trigger_x, -2.4)
+        self.assertEqual(resolved.trigger_x, -2.0)
         self.assertEqual(resolved.linear_x, 0.18)
         self.assertEqual(resolved.motion_sec, DYNAMIC_CROSSING_PROFILES["crossing_clear"].motion_sec)
 
@@ -588,6 +771,17 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
 
             self.assertAlmostEqual(_latest_agent_x(log), -1.175)
 
+    def test_latest_agent_x_reads_local_motion_diagnostic_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "director.log"
+            log.write_text(
+                "Local motion diagnostics: agent=a, phase=WALK_TO_URINAL, "
+                "feasible=True, pose=(-1.250,-0.8), robot_fresh=True\n",
+                encoding="utf-8",
+            )
+
+            self.assertAlmostEqual(_latest_agent_x(log), -1.250)
+
     def test_pose_arg_requires_four_finite_values(self):
         self.assertEqual(_pose_arg("0,-2,0.03,1.57"), (0.0, -2.0, 0.03, 1.57))
 
@@ -601,6 +795,17 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
 
         self.assertTrue(parsed.reuse_existing_bridge)
         self.assertTrue(parsed.skip_spawn)
+
+    def test_parser_preserves_hunav_default_and_accepts_local_motion(self):
+        self.assertEqual(_build_parser().parse_args([]).motion_backend, "hunav")
+        parsed = _build_parser().parse_args(
+            ["--motion-backend", "local_motion"]
+        )
+
+        self.assertEqual(parsed.motion_backend, "local_motion")
+
+        with self.assertRaises(SystemExit):
+            _build_parser().parse_args(["--motion-backend", "unsupported"])
 
     def test_summary_reports_completion_and_interventions(self):
         text = "\n".join(
@@ -625,6 +830,49 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         self.assertEqual(summary["static_clip_events"], 1)
         self.assertEqual(summary["urinal_arrivals"], 1)
         self.assertEqual(summary["exit_arrivals"], 1)
+
+    def test_local_motion_summary_reports_feasibility_and_tracking(self):
+        text = "\n".join(
+            (
+                (
+                    "[INFO] [10.000] [toilet_director_node]: Local motion "
+                    "diagnostics: agent=toilet_agent_01, phase=WALK_TO_URINAL, "
+                    "feasible=True, command_speed=0.500, actual_speed=0.300, "
+                    "remaining_m=2.000, static_clearance_m=inf, "
+                    "service_inflight=True, static_rejected=2, dynamic_rejected=3, "
+                    "dynamic_clearance_m=0.080, peer_clearance_m=0.120, "
+                    "robot_clearance_m=-0.040, soft_clearance_target_m=0.150, "
+                    "overlap_recovery_neighbors=1"
+                ),
+                (
+                    "[INFO] [11.000] [toilet_director_node]: Local motion "
+                    "diagnostics: agent=toilet_agent_01, phase=WALK_TO_URINAL, "
+                    "feasible=False, command_speed=0.000, actual_speed=0.100, "
+                    "remaining_m=2.100, static_clearance_m=-0.020, "
+                    "service_inflight=False, static_rejected=5, dynamic_rejected=7"
+                ),
+            )
+        )
+
+        summary = summarize_local_motion_diagnostics(text)
+        agent = summary["local_motion_diagnostic_samples_by_agent"][
+            "toilet_agent_01"
+        ]
+
+        self.assertEqual(summary["local_motion_sample_count"], 2)
+        self.assertEqual(summary["local_motion_infeasible_sample_count"], 1)
+        self.assertEqual(summary["local_motion_feasible_ratio"], 0.5)
+        self.assertAlmostEqual(
+            summary["local_motion_speed_tracking_error_mean_mps"], 0.15
+        )
+        self.assertEqual(summary["local_motion_min_static_clearance_m"], -0.02)
+        self.assertEqual(summary["local_motion_min_peer_clearance_m"], 0.12)
+        self.assertEqual(summary["local_motion_min_robot_clearance_m"], -0.04)
+        self.assertEqual(summary["local_motion_overlap_recovery_sample_count"], 1)
+        self.assertEqual(summary["local_motion_service_inflight_sample_count"], 1)
+        self.assertEqual(agent["remaining_distance_regression_count"], 1)
+        self.assertEqual(agent["max_static_rejected_candidates"], 5)
+        self.assertEqual(agent["max_dynamic_rejected_candidates"], 7)
 
     def test_summary_counts_active_state_markers_from_multiple_samples(self):
         text = "\n".join(
@@ -781,6 +1029,96 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
             summary["visual_envelope_overlap_paths"],
             {"/World/partition": 2},
         )
+        self.assertFalse(apply_visual_envelope_gate(summary))
+        self.assertFalse(summary["visual_envelope_collision_free"])
+        self.assertEqual(
+            summary["visual_envelope_failure_reasons"],
+            ["visual_envelope_overlap"],
+        )
+
+    def test_visual_envelope_gate_requires_observed_skeletons(self):
+        summary = summarize_visual_envelope_log(
+            Path("/tmp/does-not-exist.jsonl")
+        )
+
+        self.assertFalse(apply_visual_envelope_gate(summary))
+        self.assertFalse(summary["visual_envelope_validated"])
+        self.assertEqual(
+            summary["visual_envelope_failure_reasons"],
+            ["visual_envelope_unavailable"],
+        )
+
+    def test_visual_envelope_summary_ignores_unactivated_parked_agents(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "visual-envelope.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "agent_id": "toilet_agent_01",
+                                "available": True,
+                                "overlap_sample_count": 0,
+                                "overlap_ratio": 0.0,
+                                "overlap_paths": [],
+                            },
+                            {
+                                "agent_id": "toilet_agent_02",
+                                "available": True,
+                                "overlap_sample_count": 1,
+                                "overlap_ratio": 0.5,
+                                "overlap_paths": ["/World/parking_obstacle"],
+                            },
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            summary = summarize_visual_envelope_log(
+                path,
+                expected_agent_ids=("toilet_agent_01",),
+            )
+
+        self.assertEqual(summary["visual_envelope_agent_samples"], 1)
+        self.assertEqual(
+            summary["visual_envelope_available_samples_by_agent"],
+            {"toilet_agent_01": 1},
+        )
+        self.assertEqual(summary["visual_envelope_overlap_samples"], 0)
+        self.assertEqual(summary["visual_envelope_overlap_paths"], {})
+        self.assertTrue(
+            apply_visual_envelope_gate(
+                summary,
+                expected_agent_ids=("toilet_agent_01",),
+            )
+        )
+
+    def test_visual_envelope_gate_requires_every_activated_agent(self):
+        summary = {
+            "visual_envelope_frame_samples": 4,
+            "visual_envelope_available_samples": 4,
+            "visual_envelope_available_samples_by_agent": {
+                "toilet_agent_01": 4,
+            },
+            "visual_envelope_overlap_samples": 0,
+        }
+
+        self.assertFalse(
+            apply_visual_envelope_gate(
+                summary,
+                expected_agent_ids=("toilet_agent_01", "toilet_agent_02"),
+            )
+        )
+        self.assertEqual(
+            summary["visual_envelope_missing_agents"],
+            ["toilet_agent_02"],
+        )
+        self.assertEqual(
+            summary["visual_envelope_failure_reasons"],
+            ["visual_envelope_agent_missing"],
+        )
 
     def test_raw_pose_summary_filters_parking_and_tracks_active_pairs(self):
         director_text = "\n".join(
@@ -859,6 +1197,11 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         self.assertEqual(summary["raw_pose_agent_sample_count"], 3)
         self.assertAlmostEqual(summary["raw_pose_pair_min_distance_m"], 0.45)
         self.assertEqual(summary["raw_pose_pair_overlap_frames"], 1)
+        pair = summary["raw_pose_pair_metrics"][
+            "toilet_agent_01|toilet_agent_02"
+        ]
+        self.assertAlmostEqual(pair["min_distance_m"], 0.45)
+        self.assertEqual(pair["overlap_frame_count"], 1)
         self.assertAlmostEqual(
             summary["raw_pose_peer_activation_max_jump_excess_m"],
             0.0,

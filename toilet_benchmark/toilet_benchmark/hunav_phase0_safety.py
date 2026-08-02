@@ -13,6 +13,7 @@ from typing import Dict, Iterable, Mapping, Sequence, Set, Tuple
 
 
 Point2D = Tuple[float, float]
+RobotComponent = Tuple[Point2D, Point2D, float]
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ def project_safe_step(
     robot_previous: Point2D,
     robot_proposed: Point2D,
     robot_radius: float,
+    robot_components: Sequence[RobotComponent] = (),
     static_obstacles: Mapping[int, Sequence[Point2D]],
     fixed_ids: Iterable[int] = (),
     config: SafetyConfig = SafetyConfig(),
@@ -207,6 +209,9 @@ def project_safe_step(
     constrained_agents: Set[int] = set()
     correction_count = 0
     max_correction = 0.0
+    components = tuple(robot_components)
+    if not components and robot_radius > 0.0:
+        components = ((robot_previous, robot_proposed, robot_radius),)
 
     def record(
         key: str,
@@ -248,26 +253,39 @@ def project_safe_step(
                     record(f"static:{agent_id}:{obstacle_index}", (agent_id,), before)
                     changed = True
 
-        if robot_radius > 0.0:
+        for component_index, (
+            component_previous,
+            component_proposed,
+            component_radius,
+        ) in enumerate(components):
+            if component_radius <= 0.0:
+                continue
             for agent_id in agent_ids:
                 if agent_id in fixed:
                     continue
                 before_position = positions[agent_id]
-                relative_start = _sub(previous[agent_id], robot_previous)
-                relative_end = _sub(before_position, robot_proposed)
+                relative_start = _sub(previous[agent_id], component_previous)
+                relative_end = _sub(before_position, component_proposed)
                 safe_relative, corrected = _safe_relative_endpoint(
                     relative_start,
                     relative_end,
                     float(radii[agent_id])
-                    + float(robot_radius)
+                    + float(component_radius)
                     + float(config.clearance_m),
                     float(config.contact_epsilon_m),
-                    fallback_key=agent_id * 7919,
+                    fallback_key=agent_id * 7919 + component_index,
                 )
                 if corrected:
                     before = {agent_id: before_position}
-                    positions[agent_id] = _add(robot_proposed, safe_relative)
-                    record(f"robot:{agent_id}", (agent_id,), before)
+                    positions[agent_id] = _add(
+                        component_proposed,
+                        safe_relative,
+                    )
+                    record(
+                        f"robot:{agent_id}:{component_index}",
+                        (agent_id,),
+                        before,
+                    )
                     changed = True
 
         for index, left_id in enumerate(agent_ids):
@@ -359,15 +377,15 @@ def project_safe_step(
                 _distance(positions[left_id], positions[right_id])
                 < minimum - 1e-8
             )
-    if robot_radius > 0.0:
+    for _, component_proposed, component_radius in components:
         for agent_id in agent_ids:
             minimum = (
                 float(radii[agent_id])
-                + float(robot_radius)
+                + float(component_radius)
                 + float(config.clearance_m)
             )
             residual_violations += int(
-                _distance(positions[agent_id], robot_proposed)
+                _distance(positions[agent_id], component_proposed)
                 < minimum - 1e-8
             )
     for agent_id in agent_ids:

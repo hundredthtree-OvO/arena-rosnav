@@ -1,7 +1,7 @@
 # Toilet Benchmark 代码结构迁移计划
 
-状态：S0/S1/S2-A/S2-B completed  
-最后更新：2026-07-30
+状态：S0/S1/S2-A/S2-B completed；E0 frozen；E1 contract verified；E2-B shadow ready
+最后更新：2026-08-01
 
 ## 1. 目的
 
@@ -19,7 +19,9 @@
 
 本文只定义代码边界和迁移顺序。完整 benchmark 规范见
 `benchmark_design_cn.md`，HuNav 行为迁移细节见
-`hunav_pedestrian_pipeline_migration_plan_cn.md`。
+`hunav_pedestrian_pipeline_migration_plan_cn.md`。2026-08-01 后新增代码以
+`pedestrian_ecosystem_architecture_cn.md` 的控制权和端口定义为准；旧 HuNav 计划保留为
+实验与迁移证据，不再单独定义架构。
 
 ## 2. 当前基线
 
@@ -160,12 +162,21 @@ toilet_benchmark/
 │   ├── __init__.py
 │   ├── agent.py
 │   ├── events.py
-│   └── task.py
+│   ├── task.py
+│   ├── world.py
+│   └── intent.py
+│
+├── scenario/
+│   ├── runtime.py
+│   ├── executive.py
+│   ├── smart_objects.py
+│   ├── templates.py
+│   └── triggers.py
 │
 ├── motion/
 │   ├── __init__.py
 │   ├── base.py
-│   ├── isaac_people.py
+│   ├── safety.py
 │   └── hunav/
 │       ├── __init__.py
 │       ├── backend.py
@@ -182,6 +193,11 @@ toilet_benchmark/
 │   ├── grid_search.py
 │   ├── walkable_map.py
 │   └── voxel_legacy.py
+│
+├── embodiment/
+│   ├── base.py
+│   ├── isaac_animgraph.py
+│   └── smpl_h.py
 │
 ├── episodes/
 │   ├── __init__.py
@@ -213,6 +229,10 @@ toilet_benchmark/
 ```
 
 这是一条渐进目标，不要求一次性创建所有目录。没有实现内容的空目录不应提前创建。
+
+`scenario/` 只拥有任务意图、Smart Object 和事件生命周期；`motion/` 只产生局部运动；
+`routing/` 只产生全局路线；`embodiment/` 只把 MotionCommand 映射到角色。四者不得直接
+互相写内部状态，统一通过冻结端口和不可变快照通信。
 
 ## 5. 共享数据契约
 
@@ -325,12 +345,24 @@ Evaluation Track 配置的总模型。
 - 文件系统写入；
 - planner 实现。
 
-### 6.2 motion
+### 6.2 scenario
 
-负责把 `MotionCommand` 转换为行人运动：
+只处理目的性任务和事件：
+
+- `runtime.py`：按统一 world snapshot 推进 episode 事件；
+- `executive.py`：维护每名 agent 的 task state 和 reaction state；
+- `smart_objects.py`：query、claim、occupy、release 和 queue promotion；
+- `templates.py`：组合 EnterUseExit、DoorwayConflict 等事件节点；
+- `triggers.py`：时间、区域、资源和前序事件触发条件。
+
+禁止直接调用 HuNav、规划网格、Isaac prim API 或逐帧写行人位姿。
+
+### 6.3 motion
+
+负责根据 MotionIntent、RoutePlan 和 WorldSnapshot 产生局部运动结果：
 
 - `base.py`：`MotionBackend` protocol；
-- `isaac_people.py`：旧兼容实现；
+- `safety.py`：只约束非法穿透，不搜索绕行方向；
 - `hunav/backend.py`：组合各 HuNav 子模块；
 - `hunav/client.py`：服务调用和请求/响应；
 - `hunav/behavior.py`：原生行为类型和 BT 配置；
@@ -340,8 +372,9 @@ Evaluation Track 配置的总模型。
 - `hunav/diagnostics.py`：日志、marker、trace。
 
 `backend.py` 应逐步缩减为生命周期协调器，不再包含大量几何和评分函数。
+它不得占用资源、改变 task state 或直接操作 Isaac prim。
 
-### 6.3 routing
+### 6.4 routing
 
 只处理静态/动态几何上的全局路线：
 
@@ -353,7 +386,18 @@ Evaluation Track 配置的总模型。
 当前 `voxel_path_planner.py` 不能直接删除，因为 walkable-map planner 复用了其搜索
 内核。应先把通用搜索抽到 `grid_search.py`，再隔离 voxel loader。
 
-### 6.4 episodes
+### 6.5 embodiment
+
+负责把 `MotionCommand` 转换为角色运行时操作：
+
+- `base.py`：spawn、apply、retire 和状态查询协议；
+- `isaac_animgraph.py`：当前 Isaac external-motion/AnimGraph 兼容实现；
+- `smpl_h.py`：后续 SMPL-H root motion、动作 phase 和骨骼更新实现。
+
+表现层不能修改 route、task state、资源状态或 episode 成败。角色碰撞 proxy 和视觉扫掠
+包络必须版本化，并通过 truth/diagnostics 输出给 evaluator。
+
+### 6.6 episodes
 
 负责：
 
@@ -366,7 +410,7 @@ Evaluation Track 配置的总模型。
 
 不负责启动 ROS、reset 仿真、录 bag 或计算 policy action。
 
-### 6.5 tracks
+### 6.7 tracks
 
 统一生命周期接口：
 
@@ -382,7 +426,7 @@ class TrackRunner(Protocol):
 - `interactive.py`：连接 director + HuNav；
 - `dataset.py`：连接人工控制和 EpisodeRecorder。
 
-### 6.6 evaluation
+### 6.8 evaluation
 
 只消费 step truth/event：
 
@@ -398,7 +442,7 @@ Evaluator 不能控制机器人或行人。
 
 | 当前文件 | 迁移方向 | 本阶段动作 |
 | --- | --- | --- |
-| `motion_backend.py` | `motion/base.py` + `motion/isaac_people.py` | 保留 facade |
+| `motion_backend.py` | `motion/base.py` + `embodiment/isaac_animgraph.py` | 保留 facade |
 | `hunav_motion_backend.py` | `motion/hunav/*` | 分职责渐进抽取 |
 | `robot_reaction.py` | 原生 `motion/hunav/behavior.py` 替代 | 暂保留 |
 | `interaction_policy.py` | native behavior/hard safety 替代 | 暂保留 |
@@ -410,7 +454,8 @@ Evaluator 不能控制机器人或行人。
 | `collection_scenarios.py` | Dataset config adapter | 不作为正式 schema |
 | `episode_recorder.py` | `episodes/manifest.py` + Dataset writer | 保留 facade |
 | `manual_collection_node.py` | `tracks/dataset.py` 的 ROS facade | 暂不拆 Node |
-| `toilet_director_node.py` | task/domain facade | 最后拆，避免大范围回归 |
+| `resource_manager.py` | `scenario/smart_objects.py` | 先以 adapter 保持旧 API |
+| `toilet_director_node.py` | `scenario/*` + ROS facade | E1 渐进拆分，保持 CLI/topic |
 | `hunav_phase0_*` | `tools/` 或 tests support | 保留 |
 | `hunav_isaac_mirror*` | `tools/` | 稳定前保留 |
 
@@ -805,3 +850,203 @@ benchmark split，先修复双人中心重叠、静态视觉穿模和 behavior a
 该边界解决的是“不可通行却持续挤压”的错误，不应扩展成通用多人硬冻结。后续结构上
 继续把可通行会车交给 HuNav 和走廊选择器，并用独立 profile 验证，避免一个场景同时
 承担“应等待”和“应绕行”两种相反的验收语义。
+
+### 2026-07-31 可通行走廊反例
+
+- 新增 `passable_passage_u1/u2`，固定 agent 01 占用 `urinal_3`、机器人位于原点，
+  agent 02 分别前往 `urinal_1/2`；
+- 两轮流程均完成，但 agent 02 都没有锁定绕行侧，而是被固定行人封闭判定冻结；
+- `urinal_2` 轮对 `Partition_0001` 累计出现 151 次视觉外包络 overlap，且全局最长
+  连续 overlap 为 149 帧；
+- 这证明 `pedestrian_yield` 不能继续独立扩展成另一套局部规划器。
+
+该结构切片已完成：
+
+- robot/fixed/moving pedestrian 共用候选生成和静态/动态评分；
+- 局部直线候选失败时复用 walkable Theta*，不新增另一套栅格规划器；
+- 可行候选锁定单侧并重接全局路线，无路候选锁定让行；
+- 无路等待不重复同步搜索，避免阻塞 ROS executor 和制造 stale pose；
+- `PEDESTRIAN_AVOIDANCE` stall 会带机器人和其他行人动态占据重建全局路线；
+- HuNav 继续负责连续社会运动，hard safety 仍是最后一层。
+
+固定 seed 的 `passable_passage_u1/u2` 均完成。`u1` 实现单侧绕行且不换边；`u2`
+实现等待者保持、离开者动态重建和后续释放，raw 行人中心距没有低于 `0.60 m`。
+
+下一结构切片不再增加局部状态机，而是：
+
+1. 将 visual-envelope overlap 帧按门、墙、隔板分类回放，收敛骨骼外包络与 walkable
+   map 的几何不一致；
+2. 用 3 个固定 seed 和移动机器人重跑两个 profile，确认选边与动态预测稳定；
+3. 收敛让行 yaw span 和可恢复 stall 数，再回到 surprised/scared BT 保持语义；
+4. 继续保持 director 不感知具体位置特判，避免事件层重新承担运动规划。
+
+### 2026-07-31 连续几何硬安全边界
+
+静态 hard safety 已从“root 圆端点检查 + 左右投影搜索”替换为独立的
+`motion/swept_envelope.py`：
+
+- 使用经动画骨骼观测标定的有向胶囊；
+- 连续检查平移和旋转扫掠，而非只检查下一 root 点；
+- 碰撞前二分裁剪；起点已在边界内时只允许净空单调增加的原命令；
+- 不产生绕行 waypoint，不选择通行侧，不承担脱困规划；
+- 全局 Theta*/动态走廊选择器仍是唯一的几何选路层，HuNav 仍是连续社会运动层。
+
+自动 Interactive smoke 已将视觉骨骼静态 overlap 提升为硬失败条件。角色穿模不再
+以“流程最终完成”或“根节点未进入 occupied cell”掩盖。
+
+## 13. 2026-08-01 接口冻结与后续长目标
+
+E0 已完成文档级接口冻结：
+
+- 新增 `pedestrian_ecosystem_architecture_cn.md`，冻结唯一控制权、Smart Object、
+  Scenario Runtime、Agent Executive、LocalMotion 和 Embodiment 端口；
+- 新增 `motion_backend_evaluation_cn.md`，冻结 HuNav、ORCA/HRVO、Replay、Isaac
+  AnimGraph 和 SMPL-H 的能力边界与微场景矩阵；
+- 现有 `AgentSnapshot`、`BenchmarkEvent`、`MotionCommand`、`EpisodeSpec`、CLI、ROS
+  service/topic 保持兼容；
+- 本阶段没有拆代码或修改行人运动行为。
+
+后续长目标采用 E1-E5，而不是继续在 S3-A 热路径叠加策略：
+
+1. **E1 事件内核**：提取 SmartObjectRegistry、AgentExecutive、ScenarioRuntime；
+2. **E2 运动边界**：提取 GlobalRouter、LocalMotionBackend、GeometrySafety；
+3. **E3 表现层**：提取 Isaac adapter，并以同一 MotionCommand 接入 SMPL-H A/B；
+4. **E4 事件库**：实现五类冻结模板、受控随机生成和连续 reset；
+5. **E5 发布闭环**：统一 runner、evaluator、baseline 和 benchmark card。
+
+第一个代码切片仅实现 E1 的纯 Python 领域对象和 golden tests。它必须通过 adapter 复现
+现有 `EnterUseExit`，不得同时调 HuNav、路径、碰撞半径或动画。旧 director 分支在新旧
+event trace shadow 对比一致前保留。
+
+### 13.1 E1 第一切片结果
+
+已新增且通过纯 Python 回归：
+
+- `domain/intent.py`：`TaskDirective`，只表达任务意图，不包含路径或速度；
+- `domain/world.py`：`WorldSnapshot` 与语义级 `AgentTaskFeedback`；
+- `scenario/smart_objects.py`：Smart Object 注册、槽位、容量、FIFO 队列和原子释放晋升；
+- `scenario/executive.py`：每 agent 的 `EnterUseExit` 状态推进；
+- `scenario/runtime.py`：确定性多 agent tick、事件聚合和完成判定；
+- `test_smart_object_registry.py`、`test_scenario_runtime.py`：资源不变量与双行人 golden
+  event trace。
+
+后续切片已建立 `DirectorScenarioAdapter` 并接入 director：
+
+- 配置面新增 `scenario_runtime.mode: legacy|shadow|takeover`；
+- shadow 比较阶段、owner 和 FIFO queue，差异日志按 key 去重；
+- takeover 下 `SmartObjectRegistry` 是唯一资源写入方，`ResourceManager` 仅是旧 motion
+  代码读取的兼容镜像；
+- 到达、服务完成和异常退休都通过 `AgentTaskFeedback` 推进 runtime；
+- owner 异常退休时，同一 tick 内完成队首晋升和指令刷新，避免资源已晋升但行人仍等待；
+- activation、portal、route、stall recovery、despawn 和 `MotionCommand` 仍属于 director
+  facade，因此没有修改 HuNav、路径、碰撞或动画。
+
+E1 代码实现已完成，默认仍是 `shadow`。2026-08-01 的固定 seed Isaac 验证结果如下：
+
+- 单行人 `shadow` 与显式 `takeover` 均完成 `EnterUseExit`，各有一次 urinal/exit arrival，
+  无 stall、无 recovery exhausted、无 E1 mismatch；
+- 双行人、不同目标小便池的 `shadow` 完成两次 urinal/exit arrival，
+  `scenario_shadow_mismatch_events=0`，无激活跳变、无行人重叠；
+- 双行人、同一小便池能正确产生 FIFO 晋升，但旧 HuNav queue motion 在占用者附近进入
+  corridor freeze，最终 300 秒超时；这是 E2 运动层门槛，不是 Smart Object owner/queue
+  漂移；
+- smoke 的非零进程码来自现有 visual-envelope 门框/墙体重叠 gate，不能解释为 E1 失败。
+
+因此 E1 语义契约已通过 live shadow 验证，但 YAML 默认值暂不切到 `takeover`。下一步先在
+E2 消除同资源 queue/exit 互锁并通过视觉包络 gate，再执行默认值切换；命令行仍可用
+`--scenario-runtime takeover` 显式验证，也可用 `legacy` 一键回退。
+
+### 13.2 E2-A 运动边界结果
+
+截至 2026-08-01，E2-A 已完成第一组可执行边界，而不是只新增未使用的 Protocol：
+
+- `motion/contracts.py` 冻结不可变 `RoutePlan`、`BehaviorPolicyRequest/Decision`、
+  `LocalMotionRequest/Result` 和 `GeometrySafetyRequest/Result`；
+- `motion/ports.py` 冻结 `GlobalRouterPort`、`BehaviorPolicyPort`、`LocalMotionPort` 和
+  `GeometrySafetyPort`；
+- `VoxelRouteProvider` 与 `WalkableMapRouteProvider` 真实返回带 planner/map provenance 的
+  `RoutePlan`，director 在唯一路由调用点转换为兼容 path points；
+- `SweptEnvelopeGeometrySafety` 成为 HuNav 静态扫掠裁剪的生产端口，仍调用原有
+  `SweptEnvelope`，没有修改采样、裁剪比例或 overlap recovery 数值；
+- 保留 `MotionBackend` 的 `register_agents`、direct-pose、settled handshake、
+  `allows_director_stall_recovery` 和 Isaac external-motion 生命周期，不把观察用途的
+  `HunavAdapter`/motion-intent 错当控制端口。
+
+验证结果：纯 Python 全套 `344 passed`；固定 seed 单行人 Isaac shadow 完成
+`EnterUseExit`，director `exit_code=0`，urinal/exit arrival 各 1 次，无 stall、无 recovery
+exhausted、无 E1 mismatch。smoke 外层仍因既有门框 visual-envelope overlap 返回非零，
+该问题不属于 E2-A 接口回归。
+
+E2-B 不再继续扩大 `HuNavMotionBackend`。下一切片在 HuNav 内部提取实际
+`BehaviorPolicyPort` 与 `LocalMotionPort` 调用点，并增加一个确定性 ORCA/HRVO 候选后端；
+先通过纯 2D 微场景矩阵，再接 Isaac external-motion。HuNav 在 A/B gate 通过前保留为可回退
+实现。
+
+### 13.3 E2-B 局部运动候选与 shadow
+
+截至 2026-08-01，E2-B 的第一阶段已经落地：
+
+- `motion/behavior_policy.py` 提供 simulator-neutral 的上下文策略，显式区分
+  `WALKING/YIELDING/PASSING_LEFT/PASSING_RIGHT/FOLLOWING/WAITING/GROUPING`；
+- `motion/sampled_rvo.py` 提供无第三方依赖、确定性的 sampled velocity-obstacle 基线；
+  它通过固定速度/方向候选和有限时间最近距离检查选择局部速度；
+- `preferred_side=+1` 固定表示相对当前路线方向的左侧，`-1` 表示右侧，避免世界坐标和
+  行进坐标混用；
+- 纯 2D 测试覆盖无障碍、迎面、交叉、无可行通道、显式 hold、确定性重复和 50 tick
+  连续会车；连续会车测试同时冻结“通过且不重叠”的要求；
+- HuNav 原始输出与 hard safety 之间新增默认关闭的 `local_motion_shadow` 调用点。启用后
+  candidate 读取相同 agent/peer/robot/lookahead 快照，只记录可行性和速度差，绝不修改
+  HuNav 发往 Isaac 的命令。
+
+配置入口位于 `motion_backend.hunav.local_motion_shadow`。当前默认 `enabled: false`，因为该
+实现是用于验证端口和几何基线的 sampled velocity-obstacle，并不是严格线性规划 ORCA，
+也尚未通过 doorway、narrow-passable、occupied-goal 和 queue-release 的 Isaac gate。禁止
+仅凭开放区域会车测试将其切为默认控制权。
+
+固定 seed Isaac shadow characterization 已完成第一轮：
+
+- 单人、无机器人：`54/54` 个 candidate 样本可行，速度差均值 `0.493 m/s`；
+- 双人、不同目标：`96/96` 个 candidate 样本可行，原始轨迹最小行人间距
+  `1.003 m`，无重叠、无激活跳变；
+- 单人 crossing：`60/65` 个 candidate 样本可行，可行率 `92.3%`，但只有 2 个样本真正
+  选择了避让速度；机器人接触窗口内连续 5 个样本不可行，随后仍由既有 HuNav 与 hard
+  safety 完成任务。
+
+因此 E2-B **未达到 takeover 门槛**。当前 sampled_rvo 在开放空间可作为确定性几何对照，
+但在紧接触 crossing 中仍表现为“保持首选速度，直到候选集全部失效”。下一切片优先改进
+候选生成而非放宽安全距离：加入相对速度障碍边界附近的自适应候选，并在评分前查询
+`GeometrySafetyPort` 的静态可行性。只有 crossing、narrow-passable 和 doorway gate 均通过后，
+才增加 `local_motion_backend: hunav|sampled_rvo` takeover 开关。
+
+重复 bridge 的视觉包络汇总已按 director 实际激活 agent 过滤，停车池中的预生成角色不再
+污染 overlap 指标。GeometrySafety 始终保留为最终非法穿透约束，不负责选边或侧向脱困。
+
+### 13.4 E2-B 独立 takeover 骨架
+
+E2-B 第二阶段不再修改 HuNav 热路径，已新增独立控制链：
+
+```text
+director RoutePlan
+  -> ContextualBehaviorPolicy
+  -> SampledRvoLocalMotion
+  -> SweptEnvelopeGeometrySafety
+  -> IsaacPeopleBackend external-motion
+```
+
+- `motion/pipeline.py` 组合 `BehaviorPolicyPort` 和 `LocalMotionPort`，不依赖 ROS、HuNav 或
+  Isaac；
+- `local_motion_backend.py` 实现现有 `MotionBackend` 协议，复用 director 路径、实时
+  agent/robot 快照和 Isaac external-motion adapter；
+- director 新增显式 `--motion-backend local_motion`，并把 portal、walkable route、final
+  alignment 和 settled handshake 的能力判断从 `hunav` 字符串扩展为连续运动 backend；
+- 默认 `motion_backend.type` 未改变。HuNav 保留为冻结基线，`local_motion` 仅用于 E2 gate，
+  不能据此宣称已经替换主链路。
+
+候选器新增相对速度障碍边界采样、候选级静态扫掠预筛、上一帧速度连续性和低速 heading
+锁定。前向或侧向存在可行解时优先保持路线进度；若已进入无法侧向通过的紧急窗口，后退
+候选仍然保留，不把“禁止后退”写成错误硬规则。
+
+纯 2D gate 已覆盖并通过：动态边界候选、静态侧预筛、跨 tick 侧向连续性、静止 heading
+和 doorway 前向通过。下一步必须使用 `--motion-backend local_motion` 跑固定 seed 的
+open crossing、doorway、narrow-passable 和 EnterUseExit Isaac smoke；全部通过视觉包络与
+stop/yaw gate 后，才讨论修改 YAML 默认 backend。

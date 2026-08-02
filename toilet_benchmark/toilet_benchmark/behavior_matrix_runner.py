@@ -31,6 +31,8 @@ class BehaviorMatrixSpec:
     reaction: str
     legacy_avoidance: str
     target_resource: str
+    target_layout: str = "custom"
+    motion_backend: str = "hunav"
     reuse_existing_bridge: bool = False
     skip_spawn: bool = False
 
@@ -41,6 +43,16 @@ class BehaviorMatrixRunSpec:
     initial_agents: int
     intervention_profile: str
     seed: int
+    target_resource: str = "urinal_1"
+
+
+TARGET_LAYOUTS: dict[str, tuple[str, ...]] = {
+    # Keep the first two pedestrians far apart, then fill the center and one
+    # adjacent resource as density rises.
+    "spread": ("urinal_1", "urinal_5", "urinal_3", "urinal_2"),
+    # Deliberately sends pedestrians through the same narrow urinal corridor.
+    "adjacent": ("urinal_1", "urinal_2", "urinal_3", "urinal_4"),
+}
 
 
 def _csv_values(value: str) -> tuple[str, ...]:
@@ -66,6 +78,29 @@ def _intervention_profile_values(value: str) -> tuple[str, ...]:
     return values
 
 
+def resolve_target_resources(
+    *,
+    layout: str,
+    agent_count: int,
+    custom: str,
+) -> str:
+    if int(agent_count) < 1:
+        raise ValueError("agent_count must be positive")
+    if layout == "custom":
+        values = _csv_values(custom)
+    else:
+        try:
+            values = TARGET_LAYOUTS[layout]
+        except KeyError as exc:
+            raise ValueError(f"unknown target layout: {layout}") from exc
+    if int(agent_count) > len(values):
+        raise ValueError(
+            f"target layout {layout!r} provides {len(values)} resources for "
+            f"{agent_count} agents"
+        )
+    return ",".join(values[: int(agent_count)])
+
+
 def _slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
 
@@ -78,6 +113,7 @@ def build_hunav_interactive_smoke_command(
     reaction: str,
     legacy_avoidance: str,
     target_resource: str,
+    motion_backend: str = "hunav",
     reuse_existing_bridge: bool = False,
     skip_spawn: bool = False,
 ) -> list[str]:
@@ -93,6 +129,8 @@ def build_hunav_interactive_smoke_command(
         str(run_output_root),
         "--behavior",
         str(run_spec.behavior),
+        "--motion-backend",
+        str(motion_backend),
         "--reaction",
         str(reaction),
         "--legacy-avoidance",
@@ -122,6 +160,11 @@ def expand_behavior_matrix(spec: BehaviorMatrixSpec) -> tuple[BehaviorMatrixRunS
             initial_agents=agent_count,
             intervention_profile=intervention_profile,
             seed=seed,
+            target_resource=resolve_target_resources(
+                layout=spec.target_layout,
+                agent_count=agent_count,
+                custom=spec.target_resource,
+            ),
         )
         for behavior in spec.behaviors
         for agent_count in spec.agent_counts
@@ -144,6 +187,86 @@ def _run_directory(base_output_root: Path) -> Path:
     return run_dir
 
 
+def summarize_matrix_quality(results: Sequence[dict[str, object]]) -> dict[str, object]:
+    summaries = [
+        item["subrun_summary"]
+        for item in results
+        if isinstance(item.get("subrun_summary"), dict)
+    ]
+    pair_distances = [
+        float(summary["raw_pose_pair_min_distance_m"])
+        for summary in summaries
+        if summary.get("raw_pose_pair_min_distance_m") is not None
+    ]
+    activation_jumps = [
+        float(summary["raw_pose_peer_activation_max_jump_excess_m"])
+        for summary in summaries
+        if summary.get("raw_pose_peer_activation_max_jump_excess_m") is not None
+    ]
+    peer_clearances = [
+        float(summary["local_motion_min_peer_clearance_m"])
+        for summary in summaries
+        if summary.get("local_motion_min_peer_clearance_m") is not None
+    ]
+    robot_clearances = [
+        float(summary["local_motion_min_robot_clearance_m"])
+        for summary in summaries
+        if summary.get("local_motion_min_robot_clearance_m") is not None
+    ]
+    return {
+        "observed_run_count": len(summaries),
+        "task_completed_run_count": sum(
+            bool(summary.get("completed")) for summary in summaries
+        ),
+        "visual_gate_passed_run_count": sum(
+            bool(summary.get("visual_envelope_gate_passed")) for summary in summaries
+        ),
+        "pair_overlap_run_count": sum(
+            int(summary.get("raw_pose_pair_overlap_frames", 0) or 0) > 0
+            for summary in summaries
+        ),
+        "minimum_pair_distance_m": min(pair_distances) if pair_distances else None,
+        "max_pair_simultaneous_stop_duration_sec": max(
+            (
+                float(
+                    summary.get(
+                        "raw_pose_pair_max_simultaneous_stop_duration_sec", 0.0
+                    )
+                    or 0.0
+                )
+                for summary in summaries
+            ),
+            default=0.0,
+        ),
+        "max_peer_activation_jump_excess_m": (
+            max(activation_jumps) if activation_jumps else None
+        ),
+        "local_motion_infeasible_sample_count": sum(
+            int(summary.get("local_motion_infeasible_sample_count", 0) or 0)
+            for summary in summaries
+        ),
+        "local_motion_overlap_recovery_sample_count": sum(
+            int(
+                summary.get(
+                    "local_motion_overlap_recovery_sample_count", 0
+                )
+                or 0
+            )
+            for summary in summaries
+        ),
+        "minimum_peer_clearance_m": (
+            min(peer_clearances) if peer_clearances else None
+        ),
+        "minimum_robot_clearance_m": (
+            min(robot_clearances) if robot_clearances else None
+        ),
+        "total_stop_episode_count": sum(
+            int(summary.get("raw_pose_total_stop_episodes", 0) or 0)
+            for summary in summaries
+        ),
+    }
+
+
 def run_behavior_matrix(
     spec: BehaviorMatrixSpec,
     *,
@@ -161,7 +284,8 @@ def run_behavior_matrix(
 
     for index, run_spec in enumerate(planned_runs):
         run_slug = _slug(
-            f"{index:03d}_{run_spec.behavior}_a{run_spec.initial_agents}_{run_spec.intervention_profile}_s{run_spec.seed}"
+            f"{index:03d}_{run_spec.behavior}_a{run_spec.initial_agents}_"
+            f"{spec.target_layout}_{run_spec.intervention_profile}_s{run_spec.seed}"
         )
         run_output_root = runs_root / run_slug
         command = build_hunav_interactive_smoke_command(
@@ -170,7 +294,8 @@ def run_behavior_matrix(
             run_output_root=run_output_root,
             reaction=spec.reaction,
             legacy_avoidance=spec.legacy_avoidance,
-            target_resource=spec.target_resource,
+            target_resource=run_spec.target_resource,
+            motion_backend=spec.motion_backend,
             reuse_existing_bridge=spec.reuse_existing_bridge,
             skip_spawn=spec.skip_spawn,
         )
@@ -180,6 +305,9 @@ def run_behavior_matrix(
             "initial_agents": run_spec.initial_agents,
             "intervention_profile": run_spec.intervention_profile,
             "seed": run_spec.seed,
+            "target_resource": run_spec.target_resource,
+            "target_layout": spec.target_layout,
+            "motion_backend": spec.motion_backend,
             "command": command,
             "output_root": str(run_output_root),
         }
@@ -238,10 +366,13 @@ def run_behavior_matrix(
             "reaction": spec.reaction,
             "legacy_avoidance": spec.legacy_avoidance,
             "target_resource": spec.target_resource,
+            "target_layout": spec.target_layout,
+            "motion_backend": spec.motion_backend,
             "reuse_existing_bridge": spec.reuse_existing_bridge,
             "skip_spawn": spec.skip_spawn,
         },
         "runs": results,
+        "quality": summarize_matrix_quality(results),
     }
     (matrix_run_dir / "matrix_summary.json").write_text(
         json.dumps(matrix_summary, indent=2, sort_keys=True) + "\n",
@@ -286,6 +417,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--target-resource", default="urinal_1")
     parser.add_argument(
+        "--target-layout",
+        choices=("custom", *tuple(TARGET_LAYOUTS)),
+        default="custom",
+        help=(
+            "Frozen resource assignment by agent count. spread keeps early "
+            "agents apart; adjacent stresses the narrow urinal corridor."
+        ),
+    )
+    parser.add_argument(
+        "--motion-backend",
+        choices=("hunav", "local_motion"),
+        default="hunav",
+    )
+    parser.add_argument(
         "--reuse-existing-bridge",
         action="store_true",
         help="Reuse one externally managed bridge for every matrix run.",
@@ -313,6 +458,8 @@ def main(args: Sequence[str] | None = None) -> int:
         reaction=parsed.reaction,
         legacy_avoidance=parsed.legacy_avoidance,
         target_resource=parsed.target_resource,
+        target_layout=parsed.target_layout,
+        motion_backend=parsed.motion_backend,
         reuse_existing_bridge=bool(parsed.reuse_existing_bridge),
         skip_spawn=bool(parsed.skip_spawn),
     )

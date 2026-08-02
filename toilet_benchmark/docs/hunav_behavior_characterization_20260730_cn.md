@@ -170,7 +170,8 @@ Isaac bridge 增加了只读 topic：
 ```
 
 并在 `summary.json` 中输出跨时间的重叠帧数、最大连续重叠采样数和 prim 命中统计。
-这些字段当前只用于 characterization，不参与路径、速度、HuNav force 或 hard safety。
+这些字段不参与路径、速度或 HuNav force。自 2026-07-31 起，自动 smoke 将其作为独立
+验收门禁：没有有效骨骼样本或任一有效帧出现静态 overlap，测试均直接失败。
 
 当前限制：
 
@@ -422,3 +423,150 @@ smoke summary 已增加只统计该状态窗口的
 
 因此本次只证明“不可通行时稳定等待”边界成立，不代表普通可通行会车的自然性已经
 通过。下一步应增加独立的“可通行窄缝”profile，验收单侧承诺、换边次数和通过时间。
+
+## 14. 可通行窄缝反例
+
+2026-07-31 新增两个同构场景：
+
+- `passable_passage_u1`：agent 01 占用 `urinal_3`，agent 02 前往 `urinal_1`；
+- `passable_passage_u2`：agent 01 占用 `urinal_3`，agent 02 前往 `urinal_2`；
+- 机器人在 agent 01 开始服务后固定于 `(0, 0)`，agent 02 延迟激活；
+- agent 01 离开时撤走机器人，避免把终态清理死锁混入通行测试。
+
+smoke summary 同时新增每个 agent 的：
+
+- `avoidance_episode_count`；
+- `avoidance_active_sample_count`；
+- `avoidance_side_switch_count`。
+
+固定 seed `12345` 的实测目录：
+
+```text
+/tmp/toilet_passable_passage_20260731/
+  20260731_124559_regular_disabled  # urinal_1
+  20260731_125034_regular_disabled  # urinal_2
+```
+
+两轮均完成全部 urinal/exit 流程，且没有 stall 或 recovery exhausted，但均未实现
+“有可行通道时稳定选边通过”：
+
+- agent 02 的 `avoidance_active_sample_count=0`，没有锁定任何绕行侧；
+- 两轮分别在距固定行人约 `0.970 m` 和 `0.981 m` 时进入
+  `YIELDING_TO_PEDESTRIAN`；
+- agent 02 等待固定行人离开后才恢复，因此流程完成不能视为自然通行成功；
+- `urinal_1` 轮 raw 最小人距 `0.293 m`，视觉外包络 overlap 28 个样本；
+- `urinal_2` 轮 raw 最小人距 `0.483 m`，视觉外包络 overlap 182 个样本，其中
+  `Partition_0001` 累计命中 151 次；该轮全局最长连续 overlap 为 149 帧，是明确的
+  局部穿模风险。
+
+根因不是 behavior 随机权重，而是当前固定行人边界只有两种结果：
+
+1. 单个固定横向偏移候选通过检查，则继续交给 HuNav 社会力；
+2. 候选失败，则冻结等待。
+
+它既没有像机器人走廊选择器一样搜索多组横向间距/前向重接点，也没有在候选可行后
+锁定一侧局部通道。因此下一步不应通过缩小圆形半径把 case 调成通过，而应把
+“走廊候选生成、静态/动态可行性评分、单侧锁定、路线重接”抽成统一局部规划接口，
+同时让骨骼外包络只负责验收和最终硬安全。
+
+长期边界保持为：
+
+1. director 只负责任务意图、资源和事件状态；
+2. Theta*/walkable map 提供全局可行走廊；
+3. HuNav/BT 提供社会行为与连续速度；
+4. 动态局部规划器统一处理机器人和行人的走廊选择；
+5. 硬安全层只阻止最终几何穿透，不代替通行决策。
+
+## 15. 骨骼标定扫掠包络与连续静态裁剪
+
+旧 hard safety 只检查 root 圆，并在静态阻塞时搜索左右偏转方向。这同时存在两个
+问题：
+
+- root 端点安全不代表动画骨骼从上一姿态扫到下一姿态的全过程安全；
+- 最终安全层自行寻找侧向脱困方向，会与全局路线、走廊选择器和 HuNav 社会运动
+  产生第四套运动决策。
+
+当前边界调整为：
+
+1. 从 `/isaac/pedestrian_visual_envelopes` 和同时间的 live root pose 反算骨骼局部
+   外包络；
+2. 用沿角色朝向排列的多圆胶囊近似角色平面包络；
+3. 对每个 HuNav step 的平移与 yaw 变化连续采样，首次接触前二分裁剪；
+4. hard safety 不再生成左/右候选，也不修改目标方向；
+5. 若数值误差使起点已位于包络边界内，只接受原规划命令中单调增加静态净空的部分；
+6. 是否绕行、走哪一侧仍由动态走廊选择器和全局路线重建决定。
+
+固定 seed 的门口失败样本给出的局部骨骼范围约为：前后
+`[-0.286, 0.203] m`、横向 `[-0.163, 0.080] m`。叠加视觉 overlap 探针的
+`0.08 m` 采样半径后，配置使用：
+
+```yaml
+path_planner:
+  walkable_agent_radius_m: 0.30
+motion_backend:
+  hunav:
+    route_corridor_half_width_m: 0.30
+    safety:
+      swept_envelope:
+        disc_radius_m: 0.20
+        half_length_m: 0.125
+        clearance_m: 0.01
+```
+
+扫掠胶囊参数在旧冻结位置把静态净空从旧模型的 `-0.063 m` 修正为 `+0.016 m`。
+后续 live smoke 表明，仅让执行层使用胶囊仍不足够：全局路线按 `0.21 m` root
+圆盘生成时，HuNav 可横向偏离到隔板一侧，再由 hard safety 高频裁剪。
+
+因此全局路线中心线半径提高到 `0.30 m`，同时普通全局跟踪限制在中心线
+`0.30 m` 内；显式机器人/行人局部绕行路径不受该中心线夹持。离线扫描确认：
+
+- `0.30 m` 仍可从入口双向规划到 `urinal_1`；
+- `0.335 m` 最坏外接圆会封闭当前 walkable map 中的门口连通区域，因此未采用；
+- 每条初始/重建路线都会记录 `HuNav global route swept clearance`，以 yaw-aware
+  胶囊检查整条折线。
+
+这些参数不是社会距离，不能用来调绕行幅度。
+
+### 15.1 速度感知机器人全局障碍
+
+失败样本：
+
+```text
+/tmp/toilet_pipeline_runs/20260731_164248_regular_disabled
+```
+
+该轮完成了事件流，但出现：
+
+- `static_clip_events=250`；
+- `visual_envelope_overlap_samples=45`；
+- raw 停止 `14` 次、转向反转 `17` 次；
+- 无机器人干预命令时，静止机器人仍以单个保守圆和全局 `0.55 m` 软净空代价参与
+  Theta*，导致路线绕行偏大。
+
+当前改为：
+
+1. 从 odom 读取机器人 yaw、线速度和角速度；
+2. 用 `half_length=0.36 m`、`half_width=0.27 m` 的定向 footprint 构造紧胶囊；
+3. 静止机器人只加入当前位置 footprint，软净空为 `0.05 m`；
+4. 达到速度阈值后才追加预测 footprint，运动软净空为 `0.12 m`；
+5. 动态障碍软代价与静态场的 preferred clearance 分开计算，不再把静止机器人
+   人为扩张到全局墙体净空尺度。
+
+smoke 严格失败条件：
+
+- `visual_envelope_frame_samples == 0`；
+- `visual_envelope_available_samples == 0`；
+- 任一已激活 agent 没有可用骨骼样本；
+- `visual_envelope_overlap_samples > 0`。
+
+此外，Isaac external-motion future 增加 1 秒期限和冷却重试。服务响应丢失时只丢弃
+过期请求并继续本地规划，不再让一个 agent 永久阻塞 director tick。
+
+验证状态：
+
+- `318` 个 `toilet_benchmark` 测试通过；
+- `colcon build --packages-select toilet_benchmark --symlink-install` 通过；
+- 两次新的 live smoke 均在 Isaac Sim 4.5 启动约 4 秒时，于 URDF importer /
+  OmniGraph extension 扫描阶段段错误，尚未进入 spawn，因此不能作为本功能失败或
+  通过证据；
+- 上一轮进入运行态的样本已证明旧包络假阻塞与 external future 假死的独立根因。

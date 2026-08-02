@@ -130,6 +130,19 @@ class PolylineLookaheadTracker:
         _, cross_track_error = self._nearest_progress(float(x), float(y))
         return cross_track_error
 
+    def project_to_route(
+        self,
+        x: float,
+        y: float,
+    ) -> tuple[float, float, float]:
+        """Return the nearest forward route point without advancing progress."""
+        progress, cross_track_error = self._nearest_progress(
+            float(x),
+            float(y),
+        )
+        projected_x, projected_y = self._point_at(progress)
+        return projected_x, projected_y, cross_track_error
+
     def _nearest_progress(self, x: float, y: float) -> tuple[float, float]:
         best_distance_sq = math.inf
         best_progress = self.progress_m

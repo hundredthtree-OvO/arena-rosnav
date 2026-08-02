@@ -1,15 +1,21 @@
 import json
 from dataclasses import replace
+import math
 from pathlib import Path
 import tempfile
 import time
 import unittest
 
 from geometry_msgs.msg import Pose
-from hunav_msgs.msg import Agent
+from hunav_msgs.msg import Agent, Agents
 
 from toilet_benchmark.hunav_motion_backend import HuNavMotionBackend
+from toilet_benchmark.hunav_phase0_safety import SafetyConfig
 from toilet_benchmark.motion_backend import MotionCommand
+from toilet_benchmark.motion.swept_envelope import (
+    SweptEnvelope,
+    SweptEnvelopeConfig,
+)
 from toilet_benchmark.polyline_lookahead import PolylineLookaheadTracker
 from toilet_benchmark.robot_reaction import (
     ReactionDecision,
@@ -47,6 +53,11 @@ class _WalkablePlanner:
         self.plan_calls = []
 
     def polyline_is_free(self, points):
+        if self.route_filter is not None:
+            return bool(self.route_filter(points))
+        return self.segment_free
+
+    def polyline_avoids_raw_obstacles(self, points):
         if self.route_filter is not None:
             return bool(self.route_filter(points))
         return self.segment_free
@@ -101,6 +112,8 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._lookahead_projection_window_m = 1.50
         self.backend._lookahead_progress_slack_m = 0.15
         self.backend._lookahead_max_cross_track_m = 0.80
+        self.backend._route_corridor_half_width_m = 0.30
+        self.backend._last_route_corridor_limit_m = 0.30
         self.backend._lookahead_tracker = None
         self.backend._lookahead_target = None
         self.backend._last_visible_route_target = None
@@ -109,9 +122,13 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._route_splice_max_cross_track_m = 0.35
         self.backend._walkable_planner = None
         self.backend._constrained_yaw_speed_threshold_mps = 0.12
-        self.backend._static_projection_enabled = True
-        self.backend._static_projection_max_deflection_deg = 80.0
-        self.backend._static_projection_angle_step_deg = 20.0
+        self.backend._swept_envelope = SweptEnvelope(
+            SweptEnvelopeConfig(
+                disc_radius_m=0.20,
+                half_length_m=0.0,
+                clearance_m=0.0,
+            )
+        )
         self.backend._regular_avoidance_enabled = True
         self.backend._avoidance_trigger_distance_m = 1.40
         self.backend._avoidance_side_clearance_m = 0.18
@@ -168,13 +185,21 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._stationary_robot_angular_speed_threshold_rps = 0.10
         self.backend._robot_footprint_half_length_m = 0.36
         self.backend._robot_footprint_half_width_m = 0.27
+        self.backend._robot_stationary_soft_clearance_m = 0.05
+        self.backend._robot_moving_soft_clearance_m = 0.12
+        self.backend._robot_pose_reset_jump_m = 0.75
         self.backend._goal_radius = 0.12
         self.backend._behavior = {}
         self.backend._external_timeout_sec = 0.35
+        self.backend._external_future_deadline_sec = 1.0
+        self.backend._external_retry_cooldown_sec = 1.0
         self.backend._max_hunav_step_speed_factor = 2.0
         self.backend._max_hunav_step_min_m = 0.03
         self.backend._state_timeout_sec = 0.5
         self.backend._external_future = None
+        self.backend._external_future_started_at = 0.0
+        self.backend._external_retry_after = 0.0
+        self.backend._pending_external_command = None
         self.backend._actual = {}
         self.backend._reaction_controller = RobotProximityReactionController(
             {"enabled": False},
@@ -193,6 +218,9 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.backend._robot = None
         self.backend._route_hold_active = False
         self.backend._route_hold_yaw = None
+        self.backend._safety_enabled = True
+        self.backend._safety_config = SafetyConfig()
+        self.backend._safety_robot_previous = None
 
     def test_fixed_pedestrian_in_closed_corridor_triggers_stable_yield(self):
         now = time.monotonic()
@@ -214,6 +242,7 @@ class TestHuNavMotionBackend(unittest.TestCase):
             (),
             {"x": 1.0, "y": 0.0},
         )()
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
         self.backend._actual = {
             "toilet_agent_01": {
                 "x": 0.75,
@@ -226,8 +255,6 @@ class TestHuNavMotionBackend(unittest.TestCase):
                 "received_at": now,
             },
         }
-        self.backend._pedestrian_bypass_available = lambda *args: False
-
         yielding = self.backend._update_pedestrian_corridor_yield(
             {"x": 0.0, "y": 0.0, "yaw": 0.2}
         )
@@ -243,6 +270,216 @@ class TestHuNavMotionBackend(unittest.TestCase):
         )
         self.assertAlmostEqual(self.backend._yield_hold_yaw, 0.2)
 
+    def test_fixed_pedestrian_in_open_corridor_latches_one_passing_side(self):
+        now = time.monotonic()
+        self.backend.send(_walking_command("toilet_agent_01"))
+        self.backend.send(
+            MotionCommand(
+                agent_id="toilet_agent_01",
+                goal_pose=[0.8, 0.0, 0.0],
+                path_points=[],
+                velocity=0.0,
+                orientation=0.0,
+                stop=True,
+            )
+        )
+        self.backend.send(_walking_command("toilet_agent_02"))
+        self.backend._select_runtime("toilet_agent_02")
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._walkable_planner = _WalkablePlanner(
+            route_filter=lambda points: any(
+                float(point[1]) > 0.0 for point in points[1:-1]
+            )
+            and not any(float(point[1]) < 0.0 for point in points[1:-1]),
+        )
+        self.backend._actual = {
+            "toilet_agent_01": {
+                "x": 0.75,
+                "y": 0.0,
+                "received_at": now,
+            },
+            "toilet_agent_02": {
+                "x": 0.0,
+                "y": 0.0,
+                "received_at": now,
+            },
+        }
+
+        yielding = self.backend._update_pedestrian_corridor_yield(
+            {"x": 0.0, "y": 0.0, "yaw": 0.2}
+        )
+
+        self.assertFalse(yielding)
+        self.assertEqual(
+            self.backend._local_route_mode,
+            "PEDESTRIAN_AVOIDANCE",
+        )
+        self.assertEqual(self.backend._avoidance_side, 1)
+        self.assertEqual(
+            self.backend._pedestrian_yield_blocker,
+            "toilet_agent_01",
+        )
+        self.assertEqual(self.backend._reaction_decision.state, "WALKING")
+
+    def test_fixed_pedestrian_passing_side_stays_latched_on_noisy_map_tick(self):
+        self.test_fixed_pedestrian_in_open_corridor_latches_one_passing_side()
+        selected_side = self.backend._avoidance_side
+        selected_route = tuple(self.backend._local_route_points)
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=False)
+
+        yielding = self.backend._update_pedestrian_corridor_yield(
+            {"x": 0.05, "y": 0.02, "yaw": 0.2}
+        )
+
+        self.assertFalse(yielding)
+        self.assertEqual(self.backend._avoidance_side, selected_side)
+        self.assertEqual(
+            tuple(self.backend._local_route_points),
+            selected_route,
+        )
+
+    def test_moving_pedestrian_uses_the_same_latched_corridor_selector(self):
+        now = time.monotonic()
+        self.backend.send(_walking_command("toilet_agent_01"))
+        self.backend.send(_walking_command("toilet_agent_02"))
+        self.backend._select_runtime("toilet_agent_02")
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._walkable_planner = _WalkablePlanner(
+            route_filter=lambda points: any(
+                float(point[1]) > 0.0 for point in points[1:-1]
+            )
+            and not any(float(point[1]) < 0.0 for point in points[1:-1]),
+        )
+        self.backend._actual = {
+            "toilet_agent_01": {
+                "x": 0.75,
+                "y": 0.0,
+                "vx": -0.2,
+                "vy": 0.0,
+                "received_at": now,
+            },
+            "toilet_agent_02": {
+                "x": 0.0,
+                "y": 0.0,
+                "vx": 0.2,
+                "vy": 0.0,
+                "received_at": now,
+            },
+        }
+
+        yielding = self.backend._update_pedestrian_corridor_yield(
+            {"x": 0.0, "y": 0.0, "yaw": 0.2}
+        )
+
+        self.assertFalse(yielding)
+        self.assertEqual(
+            self.backend._local_route_mode,
+            "PEDESTRIAN_AVOIDANCE",
+        )
+        self.assertEqual(self.backend._avoidance_side, 1)
+        self.assertEqual(
+            self.backend._pedestrian_yield_blocker,
+            "toilet_agent_01",
+        )
+
+    def test_pedestrian_corridor_rejoins_the_global_polyline_after_a_turn(self):
+        self.backend.send(_walking_command("toilet_agent_02"))
+        self.backend._select_runtime("toilet_agent_02")
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 2.0)],
+            lookahead_m=0.8,
+        )
+        nominal = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+        pedestrians = {
+            "toilet_agent_01": {
+                "x": 0.75,
+                "y": 0.0,
+                "vx": 0.0,
+                "vy": 0.0,
+            }
+        }
+
+        blocking, candidates, _ = self.backend._pedestrian_avoidance_candidates(
+            (0.0, 0.0),
+            nominal,
+            "toilet_agent_01",
+            pedestrians,
+        )
+
+        self.assertTrue(blocking)
+        self.assertTrue(candidates)
+        self.assertTrue(
+            all(abs(candidate.target[0] - 1.0) < 1e-6 for candidate in candidates)
+        )
+        self.assertTrue(all(candidate.target[1] > 0.0 for candidate in candidates))
+
+    def test_grid_detour_is_used_when_direct_side_segments_are_blocked(self):
+        class _DetourPlanner(_WalkablePlanner):
+            def __init__(self):
+                super().__init__(segment_free=False)
+
+            def plan(self, start, goal, *, z=0.0, dynamic_obstacles=None):
+                self.plan_calls.append((start, goal, z, dynamic_obstacles))
+                return [
+                    [0.2, 0.8, z],
+                    [1.3, 0.8, z],
+                    [goal[0], goal[1], z],
+                ]
+
+        self.backend.send(_walking_command("toilet_agent_02"))
+        self.backend._select_runtime("toilet_agent_02")
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 2.0, "y": 0.0},
+        )()
+        self.backend._walkable_planner = _DetourPlanner()
+        pedestrians = {
+            "toilet_agent_01": {
+                "x": 0.75,
+                "y": 0.0,
+                "vx": 0.0,
+                "vy": 0.0,
+            }
+        }
+
+        blocking, candidates, _ = self.backend._pedestrian_avoidance_candidates(
+            (0.0, 0.0),
+            self.backend._lookahead_target,
+            "toilet_agent_01",
+            pedestrians,
+        )
+
+        self.assertTrue(blocking)
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].accepted)
+        self.assertIn((0.2, 0.8), candidates[0].waypoints)
+        self.assertEqual(len(self.backend._walkable_planner.plan_calls), 1)
+
+    def test_fixed_pedestrian_detour_completion_rejoins_global_route(self):
+        self.test_fixed_pedestrian_in_open_corridor_latches_one_passing_side()
+        final_local_point = self.backend._local_route_points[-1]
+        self.backend._local_route_index = len(self.backend._local_route_points)
+        self.backend._walkable_planner = _WalkablePlanner(segment_free=True)
+
+        goal = self.backend._active_local_route_goal(final_local_point)
+
+        self.assertIsNone(goal)
+        self.assertIsNone(self.backend._local_route_mode)
+        self.assertIsNone(self.backend._pedestrian_yield_blocker)
+        self.assertEqual(self.backend._avoidance_side, 0)
+        self.assertIsNone(self.backend._avoidance_target)
+        self.assertEqual(len(self.backend._walkable_planner.plan_calls), 1)
+
     def test_pedestrian_corridor_yield_releases_after_blocker_moves(self):
         self.test_fixed_pedestrian_in_closed_corridor_triggers_stable_yield()
         self.backend._runtime_states["toilet_agent_01"][
@@ -253,6 +490,7 @@ class TestHuNavMotionBackend(unittest.TestCase):
             command,
             stop=False,
         )
+        self.backend._actual["toilet_agent_01"]["x"] = -1.0
 
         results = [
             self.backend._update_pedestrian_corridor_yield(
@@ -265,6 +503,20 @@ class TestHuNavMotionBackend(unittest.TestCase):
         self.assertIsNone(self.backend._pedestrian_yield_blocker)
         self.assertTrue(self.backend._pending_rebase_replan)
         self.assertEqual(self.backend._reaction_decision.state, "WALKING")
+
+    def test_blocked_pedestrian_corridor_search_is_rate_limited(self):
+        self.test_fixed_pedestrian_in_closed_corridor_triggers_stable_yield()
+        plan_calls = len(self.backend._walkable_planner.plan_calls)
+
+        yielding = self.backend._update_pedestrian_corridor_yield(
+            {"x": 0.0, "y": 0.0, "yaw": 0.2}
+        )
+
+        self.assertTrue(yielding)
+        self.assertEqual(
+            len(self.backend._walkable_planner.plan_calls),
+            plan_calls,
+        )
 
     def test_walking_command_is_accepted_without_forwarding_isaac_path(self):
         callback_results = []
@@ -545,6 +797,39 @@ class TestHuNavMotionBackend(unittest.TestCase):
             self.backend._isaac.commands[0].external_motion_mode,
             2,
         )
+
+    def test_stale_external_future_is_dropped_without_blocking_runtime(self):
+        from concurrent.futures import Future
+
+        self.backend.send(_walking_command())
+        busy = Future()
+        self.backend._external_future = busy
+        self.backend._external_future_started_at = time.monotonic() - 1.1
+
+        expired = self.backend._expire_stale_external_future()
+
+        self.assertTrue(expired)
+        self.assertTrue(busy.cancelled())
+        self.assertIsNone(self.backend._external_future)
+        self.assertGreater(
+            self.backend._external_retry_after,
+            time.monotonic(),
+        )
+
+    def test_latest_external_command_is_replayed_after_timeout_cooldown(self):
+        self.backend.send(_walking_command())
+        command = _walking_command()
+        self.backend._external_retry_after = time.monotonic() + 1.0
+
+        self.backend._dispatch_external_command(command)
+
+        self.assertIs(self.backend._pending_external_command, command)
+        self.assertEqual(self.backend._isaac.commands, [])
+
+        self.backend._external_retry_after = 0.0
+        self.assertTrue(self.backend._flush_pending_external_command())
+        self.assertIsNone(self.backend._pending_external_command)
+        self.assertEqual(self.backend._isaac.commands, [command])
 
     def test_terminal_alignment_settles_only_after_stable_live_pose(self):
         import time
@@ -1069,10 +1354,10 @@ class TestHuNavMotionBackend(unittest.TestCase):
 
         obstacles = self.backend._dynamic_replan_obstacles()
 
-        self.assertEqual(len(obstacles), 2)
-        self.assertAlmostEqual(obstacles[0][0], 1.0)
-        self.assertAlmostEqual(obstacles[1][0], 1.6)
-        self.assertAlmostEqual(obstacles[1][1], 1.7)
+        self.assertEqual(len(obstacles), 6)
+        self.assertLess(max(item[0] for item in obstacles[:3]), 1.2)
+        self.assertGreater(min(item[0] for item in obstacles[3:]), 1.4)
+        self.assertLess(max(item[1] for item in obstacles[3:]), 1.9)
 
     def test_dynamic_replan_rejects_a_route_that_starts_backward(self):
         import time
@@ -1173,6 +1458,199 @@ class TestHuNavMotionBackend(unittest.TestCase):
 
         self.assertEqual(selected.side, -1)
 
+    def test_corridor_rejects_swept_character_envelope_collision(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            clearance=lambda point: abs(float(point[0]) - 1.0),
+        )
+
+        candidate = self.backend._evaluate_corridor_candidate(
+            side=1,
+            route=((0.50, 0.0), (0.90, 0.0)),
+            tangent=(1.0, 0.0),
+            obstacle_kind="robot",
+            obstacle_id="robot",
+            obstacle={"x": 5.0, "y": 5.0},
+            pedestrians={},
+        )
+
+        self.assertFalse(candidate.accepted)
+        self.assertEqual(
+            candidate.reason,
+            "swept character envelope blocked",
+        )
+
+    def test_hard_safety_clips_direct_sweep_without_lateral_projection(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            clearance=lambda point: abs(float(point[0]) - 1.0),
+        )
+        self.backend._command = _walking_command()
+        previous = Agent()
+        previous.id = 1
+        previous.name = "toilet_agent_01"
+        previous.position.position.x = 0.50
+        previous.position.position.y = 0.0
+        previous.yaw = 0.0
+        proposed = Agent()
+        proposed.id = 1
+        proposed.name = "toilet_agent_01"
+        proposed.position.position.x = 0.90
+        proposed.position.position.y = 0.0
+        proposed.yaw = 0.0
+        proposed.velocity.linear.x = 0.40
+        proposed.linear_vel = 0.40
+
+        diagnostics = self.backend._apply_hard_safety(
+            previous,
+            proposed,
+            1.0,
+        )
+
+        self.assertTrue(diagnostics["static_clip"])
+        self.assertEqual(diagnostics["static_projection"], "swept_clip")
+        self.assertLess(proposed.position.position.x, 0.90)
+        self.assertAlmostEqual(proposed.position.position.y, 0.0)
+
+    def test_global_route_corridor_limits_unplanned_lateral_drift(self):
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [2.0, 0.0]],
+            lookahead_m=0.8,
+        )
+        self.backend._lookahead_tracker.update(0.0, 0.0)
+
+        x, y, clipped = self.backend._constrain_to_global_route((0.5, 0.6))
+
+        self.assertTrue(clipped)
+        self.assertAlmostEqual(x, 0.5)
+        self.assertAlmostEqual(y, 0.30)
+
+    def test_global_route_corridor_tightens_near_static_geometry(self):
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [2.0, 0.0]],
+            lookahead_m=0.8,
+        )
+        self.backend._lookahead_target = type(
+            "Target",
+            (),
+            {"x": 1.0, "y": 0.0},
+        )()
+        self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._walkable_planner = _WalkablePlanner(
+            clearance=lambda _point: 0.26,
+        )
+
+        x, y, clipped = self.backend._constrain_to_global_route((0.5, 0.20))
+
+        self.assertTrue(clipped)
+        self.assertAlmostEqual(x, 0.5)
+        self.assertAlmostEqual(y, 0.06)
+        self.assertAlmostEqual(self.backend._last_route_corridor_limit_m, 0.06)
+
+    def test_explicit_local_route_bypasses_global_corridor_limit(self):
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [[0.0, 0.0], [2.0, 0.0]],
+            lookahead_m=0.8,
+        )
+        self.backend._local_route_mode = "AVOIDANCE"
+
+        x, y, clipped = self.backend._constrain_to_global_route((0.5, 0.6))
+
+        self.assertFalse(clipped)
+        self.assertAlmostEqual((x, y), (0.5, 0.6))
+
+    def test_hard_safety_clips_blocked_in_place_turn(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            clearance=lambda point: abs(float(point[0]) - 1.0),
+        )
+        self.backend._swept_envelope = SweptEnvelope(
+            SweptEnvelopeConfig(
+                disc_radius_m=0.20,
+                half_length_m=0.10,
+                clearance_m=0.0,
+            )
+        )
+        self.backend._command = _walking_command()
+        previous = Agent()
+        previous.id = 1
+        previous.name = "toilet_agent_01"
+        previous.position.position.x = 0.72
+        previous.yaw = math.pi / 2.0
+        proposed = Agent()
+        proposed.id = 1
+        proposed.name = "toilet_agent_01"
+        proposed.position.position.x = 0.72
+        proposed.yaw = 0.0
+
+        diagnostics = self.backend._apply_hard_safety(
+            previous,
+            proposed,
+            0.1,
+        )
+
+        self.assertTrue(diagnostics["static_clip"])
+        self.assertLess(diagnostics["static_fraction"], 1.0)
+
+    def test_hard_safety_resets_discontinuous_robot_footprint_history(self):
+        self.backend._command = _walking_command()
+        self.backend._robot = {
+            "x": 4.0,
+            "y": -3.0,
+            "yaw": 0.0,
+            "vx": 0.0,
+            "vy": 0.0,
+            "wz": 0.0,
+            "received_at": time.monotonic(),
+        }
+        self.backend._safety_robot_previous = (
+            ((-0.09, 0.0), 0.27),
+            ((0.0, 0.0), 0.27),
+            ((0.09, 0.0), 0.27),
+        )
+        previous = Agent()
+        previous.id = 1
+        previous.name = "toilet_agent_01"
+        previous.position.position.y = 0.60
+        proposed = Agent()
+        proposed.id = 1
+        proposed.name = "toilet_agent_01"
+        proposed.position.position.y = 0.60
+
+        diagnostics = self.backend._apply_hard_safety(previous, proposed, 0.1)
+
+        self.assertTrue(diagnostics["robot_history_reset"])
+        self.assertEqual(diagnostics["robot_contacts"], 0)
+        self.assertAlmostEqual(proposed.position.position.x, 0.0)
+        self.assertAlmostEqual(proposed.position.position.y, 0.60)
+
+    def test_corridor_checks_initial_turn_from_live_yaw(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            segment_free=True,
+            clearance=lambda point: abs(float(point[0]) - 1.0),
+        )
+        self.backend._swept_envelope = SweptEnvelope(
+            SweptEnvelopeConfig(
+                disc_radius_m=0.20,
+                half_length_m=0.10,
+                clearance_m=0.0,
+            )
+        )
+
+        candidate = self.backend._evaluate_corridor_candidate(
+            side=1,
+            route=((0.72, 0.0), (0.72, 0.30)),
+            tangent=(0.0, 1.0),
+            obstacle_kind="robot",
+            obstacle_id="robot",
+            obstacle={"x": 5.0, "y": 5.0},
+            pedestrians={},
+            start_yaw=0.0,
+        )
+
+        self.assertFalse(candidate.accepted)
+        self.assertEqual(candidate.reason, "swept character envelope blocked")
+
     def test_stationary_robot_uses_smaller_hard_safety_radius(self):
         stationary = {
             "vx": 0.01,
@@ -1212,6 +1690,27 @@ class TestHuNavMotionBackend(unittest.TestCase):
 
         self.assertGreater(visible.target_progress_m, 0.09)
         self.assertLess(visible.target_progress_m, 0.15)
+        self.assertFalse(self.backend._route_hold_active)
+
+    def test_visible_route_target_never_uses_goal_already_inside_goal_radius(self):
+        self.backend._walkable_planner = _WalkablePlanner(
+            route_filter=lambda points: (
+                0.04
+                <= float(points[-1][0])
+                <= 0.09
+            ),
+        )
+        self.backend._walkable_planner.resolution = 0.05
+        self.backend._lookahead_tracker = PolylineLookaheadTracker(
+            [(0.0, 0.0), (1.0, 0.0)],
+            lookahead_m=0.80,
+        )
+        nominal = self.backend._lookahead_tracker.update(0.0, 0.0)
+        self.backend._last_global_replan_at = time.monotonic()
+
+        visible = self.backend._visible_route_target((0.0, 0.0), nominal)
+
+        self.assertGreater(visible.target_progress_m, self.backend._goal_radius)
         self.assertFalse(self.backend._route_hold_active)
 
     def test_no_visible_route_target_latches_explicit_yaw_hold(self):
@@ -1266,6 +1765,29 @@ class TestHuNavMotionBackend(unittest.TestCase):
 
         self.assertTrue(rebuilt)
         self.assertEqual(self.backend._lookahead_tracker._points[1], (0.8, 0.0))
+
+    def test_route_rebuild_reads_live_yaw_when_shadow_is_agents_container(self):
+        self.backend.send(_walking_command())
+        self.backend._shadow = Agents()
+        self.backend._actual["toilet_agent_01"] = {
+            "x": 0.2,
+            "y": 0.0,
+            "yaw": 0.75,
+            "received_at": time.monotonic(),
+        }
+        captured = []
+        self.backend._log_route_swept_clearance = lambda points, **kwargs: (
+            captured.append(kwargs)
+        )
+
+        rebuilt = self.backend._reset_lookahead_route(
+            (0.2, 0.0),
+            [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            reason="container regression",
+        )
+
+        self.assertTrue(rebuilt)
+        self.assertAlmostEqual(captured[0]["start_yaw"], 0.75)
 
     def test_route_splice_discards_new_route_points_behind_splice(self):
         self.backend.send(_walking_command())

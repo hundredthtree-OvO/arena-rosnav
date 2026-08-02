@@ -9,7 +9,10 @@ from toilet_benchmark.behavior_matrix_runner import (
     BehaviorMatrixRunSpec,
     BehaviorMatrixSpec,
     build_hunav_interactive_smoke_command,
+    expand_behavior_matrix,
+    resolve_target_resources,
     run_behavior_matrix,
+    summarize_matrix_quality,
 )
 from toilet_benchmark.interactive_smoke_runner import discover_paths
 
@@ -43,6 +46,43 @@ class BehaviorMatrixRunnerTests(unittest.TestCase):
         self.assertIn("--benchmark", command)
         self.assertIn(str(paths.benchmark), command)
 
+    def test_fixed_target_layouts_resolve_two_to_four_agents(self):
+        self.assertEqual(
+            resolve_target_resources(layout="spread", agent_count=2, custom=""),
+            "urinal_1,urinal_5",
+        )
+        self.assertEqual(
+            resolve_target_resources(layout="adjacent", agent_count=4, custom=""),
+            "urinal_1,urinal_2,urinal_3,urinal_4",
+        )
+        with self.assertRaises(ValueError):
+            resolve_target_resources(layout="spread", agent_count=5, custom="")
+
+    def test_matrix_expansion_freezes_targets_for_each_agent_count(self):
+        spec = BehaviorMatrixSpec(
+            behaviors=("regular",),
+            agent_counts=(2, 3, 4),
+            intervention_profiles=("crossing_conflict",),
+            seeds=(12345,),
+            output_root=Path("/tmp/matrix"),
+            dry_run=True,
+            stop_on_failure=False,
+            reaction="disabled",
+            legacy_avoidance="disabled",
+            target_resource="urinal_1",
+            target_layout="spread",
+            motion_backend="local_motion",
+        )
+
+        runs = expand_behavior_matrix(spec)
+
+        self.assertEqual([run.initial_agents for run in runs], [2, 3, 4])
+        self.assertEqual(runs[0].target_resource, "urinal_1,urinal_5")
+        self.assertEqual(
+            runs[-1].target_resource,
+            "urinal_1,urinal_5,urinal_3,urinal_2",
+        )
+
     def test_command_can_reuse_one_spawned_bridge_for_the_matrix(self):
         paths = discover_paths()
         run_spec = BehaviorMatrixRunSpec(
@@ -65,6 +105,61 @@ class BehaviorMatrixRunnerTests(unittest.TestCase):
 
         self.assertIn("--reuse-existing-bridge", command)
         self.assertIn("--skip-spawn", command)
+
+    def test_local_motion_backend_is_forwarded_to_smoke(self):
+        paths = discover_paths()
+        run_spec = BehaviorMatrixRunSpec(
+            behavior="regular",
+            initial_agents=2,
+            intervention_profile="crossing_conflict",
+            seed=12345,
+            target_resource="urinal_1,urinal_5",
+        )
+
+        command = build_hunav_interactive_smoke_command(
+            paths,
+            run_spec,
+            run_output_root=Path("/tmp/matrix/local"),
+            reaction="disabled",
+            legacy_avoidance="disabled",
+            target_resource=run_spec.target_resource,
+            motion_backend="local_motion",
+        )
+
+        self.assertEqual(command[command.index("--motion-backend") + 1], "local_motion")
+        self.assertEqual(
+            command[command.index("--target-resource") + 1],
+            "urinal_1,urinal_5",
+        )
+
+    def test_matrix_quality_aggregates_multi_agent_failures(self):
+        quality = summarize_matrix_quality(
+            (
+                {
+                    "subrun_summary": {
+                        "completed": True,
+                        "visual_envelope_gate_passed": False,
+                        "raw_pose_pair_overlap_frames": 2,
+                        "raw_pose_pair_min_distance_m": 0.42,
+                        "raw_pose_pair_max_simultaneous_stop_duration_sec": 1.5,
+                        "raw_pose_peer_activation_max_jump_excess_m": 0.03,
+                        "local_motion_infeasible_sample_count": 4,
+                        "local_motion_overlap_recovery_sample_count": 2,
+                        "local_motion_min_peer_clearance_m": -0.01,
+                        "local_motion_min_robot_clearance_m": -0.20,
+                        "raw_pose_total_stop_episodes": 3,
+                    }
+                },
+            )
+        )
+
+        self.assertEqual(quality["task_completed_run_count"], 1)
+        self.assertEqual(quality["pair_overlap_run_count"], 1)
+        self.assertAlmostEqual(quality["minimum_pair_distance_m"], 0.42)
+        self.assertEqual(quality["local_motion_infeasible_sample_count"], 4)
+        self.assertEqual(quality["local_motion_overlap_recovery_sample_count"], 2)
+        self.assertEqual(quality["minimum_peer_clearance_m"], -0.01)
+        self.assertEqual(quality["minimum_robot_clearance_m"], -0.20)
 
     def test_dry_run_writes_matrix_summary_without_launching_smoke(self):
         spec = BehaviorMatrixSpec(

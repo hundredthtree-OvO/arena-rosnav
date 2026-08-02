@@ -154,6 +154,21 @@ class TestVoxelPathPlanner(unittest.TestCase):
             )
         )
 
+    def test_raw_visibility_does_not_treat_inflation_as_scene_geometry(self):
+        path = self._write_map([[1, 1, 0, 4]], grid_bounds=[0, 3, 0, 3])
+        planner = VoxelPathPlanner.from_file(
+            VoxelPathPlannerConfig(
+                map_path=path,
+                z_min=0.0,
+                z_max=2.0,
+                agent_radius_m=1.1,
+            )
+        )
+        segment = [[0.5, 0.5, 0.0], [2.5, 0.5, 0.0]]
+
+        self.assertFalse(planner.polyline_is_free(segment))
+        self.assertTrue(planner.polyline_avoids_raw_obstacles(segment))
+
     def test_polyline_can_enter_map_from_outside_without_ignoring_obstacles(self):
         path = self._write_map([[1, 1, 0, 4]], grid_bounds=[0, 3, 0, 3])
         planner = VoxelPathPlanner.from_file(

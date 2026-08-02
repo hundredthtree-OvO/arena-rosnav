@@ -4,7 +4,9 @@ scene_root_path: /World/shenxinfu_841837
 entrances:
   - id: entrance_main
     scene_prim: Door_0000
-    pose: [-3.8, -0.91, 1.5708]
+    # The portal-free HuNav route enters along +X. Starting at +Y forces a
+    # 90-degree turn inside the doorway and sweeps the animated body into the frame.
+    pose: [-3.8, -0.91, 0.0]
 
 exits:
   - id: exit_main

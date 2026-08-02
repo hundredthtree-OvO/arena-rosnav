@@ -1,7 +1,7 @@
 # 厕所社会导航 Benchmark 总体设计
 
-状态：Draft v0.1  
-最后更新：2026-07-30
+状态：Draft v0.2 / Architecture Freeze v0.1
+最后更新：2026-08-01
 
 ## 1. 文档目的
 
@@ -21,6 +21,9 @@
 - HuNav 隔离测试见 `hunav_phase0_smoke_cn.md`；
 - HuNav 迁移实现计划见 `hunav_pedestrian_pipeline_migration_plan_cn.md`；
 - 两条开发线的代码结构与删除门槛见 `code_structure_migration_cn.md`；
+- 目的性行人生态、Smart Object、事件管线和冻结接口见
+  `pedestrian_ecosystem_architecture_cn.md`；
+- 行人运动与表现 backend 的对照门槛见 `motion_backend_evaluation_cn.md`；
 - 人工数采见 `manual_collection_cn.md`；
 - 历史失败约束见 `pedestrian_pair_guard_failure_review_20260724.md`。
 
@@ -33,6 +36,17 @@
 > 在具有动态行人、局部遮挡、窄通道和厕所资源占用的室内环境中，使用双
 > 2D LiDAR、相对目标和机器人自身速度的移动机器人，能否安全、高效并尽量
 > 少干扰行人地到达目标？
+
+本 benchmark 与开放场景随机行走 crowd 的主要差异是**目的性和资源约束**。行人不是
+随机 waypoint 动态障碍，而是执行可观察生命周期的任务主体：
+
+```text
+产生意图 -> 进入 -> 选择/等待资源 -> 交互活动 -> 释放资源 -> 离开
+```
+
+随机性来自 episode 级的受控采样，例如到达时间、目标资源、服务时间、耐心、群组和
+behavior profile；不能依靠逐帧随机决策制造“多样性”。厕所资源、portal、队列和等待区
+统一建模为可预约的 Smart Object，运动 backend 不拥有这些对象的状态。
 
 第一版重点测量：
 
@@ -179,6 +193,9 @@ HuNav 不负责：
 
 ## 4. 任务体系
 
+任务由事件模板组合，而不是由一条不断扩大的 director 状态机硬编码。模板约束语义、
+资源、触发器和成功条件；全局路线、局部社会运动与动画表现由独立 backend 实现。
+
 ### 4.1 v0.1 核心任务
 
 第一版只冻结三类任务，形成可运行的 vertical slice：
@@ -188,6 +205,17 @@ HuNav 不负责：
 | Crossing / Head-on | 动态预测、基本会车 | Replay + Interactive |
 | Doorway Conflict | 窄空间协商、避免死锁 | Replay + Interactive |
 | Goal Occupied + Enter-Exit | 资源语义、长时序导航 | Interactive 为主 |
+
+对应的首批事件模板冻结为：
+
+- `EnterUseExit`；
+- `DoorwayConflict`；
+- `GoalOccupied`；
+- `QueueAndPromote`；
+- `StallExitBlocked`。
+
+模板接口和 Smart Object 语义见 `pedestrian_ecosystem_architecture_cn.md`。v0.1 不要求
+一次性发布全部模板，但新增 case 必须复用这些组合节点，不能增加新的逐帧位姿控制器。
 
 ### 4.2 后续扩展任务
 
@@ -690,14 +718,16 @@ benchmark。
 
 当前优先顺序：
 
-1. 将 HuNav 原生 behavior/BT 正确接入 Interactive Track；
-2. 删除与 HuNav 重复的自研社会反应控制，只保留薄硬安全兜底；
-3. 同时启动 B0/B1，不等待所有视觉问题完全消失；
-4. 使用 Phase 0、mirror 和 takeover 日志建立 Interactive 稳定性门槛；
-5. 从已有人工 episode 中抽取 Replay Track 候选轨迹；
-6. 冻结 v0.1 observation/action 和 collision termination；
-7. 实现 episode schema/validator；
-8. 再实现 metrics、runner 和 baseline。
+1. 保持外部 CLI、ROS topic/service 和现有 domain/episode 契约兼容；
+2. 提取 `SmartObjectRegistry + AgentExecutive + ScenarioRuntime`，先兼容复现
+   `EnterUseExit`；
+3. 将 director 收缩为 ROS、配置和生命周期 facade，本阶段不修改运动表现；
+4. 提取 GlobalRouter、LocalMotionBackend、GeometrySafety 和 EmbodimentAdapter；
+5. 使用统一微场景矩阵比较 HuNav、ORCA/HRVO 候选和 Replay，不再向 HuNav 热路径增加
+   事件特判；
+6. 保持 Replay Track 的确定性基线，并从合格 episode 冻结轨迹资产；
+7. 使用同一 MotionCommand A/B 对照 Isaac AnimGraph 与 SMPL-H；
+8. 实现五类事件模板、runner、evaluator 和 baseline 后再扩展随机场景生成。
 
 行人系统不需要达到“与真人不可区分”才开始 benchmark 工程，但进入正式测试集前必须达到：
 
@@ -711,6 +741,12 @@ benchmark。
 ## 15. 参考
 
 - HuNavSim 2.0: <https://arxiv.org/abs/2507.17317>
+- GROVE: <https://arxiv.org/abs/2606.25504>
+- Menge: <https://gamma.cs.unc.edu/Menge/>
+- ORCA: <https://gamma-web.iacs.umd.edu/ORCA/>
+- Isaac Sim People Simulation:
+  <https://docs.isaacsim.omniverse.nvidia.com/4.5.0/replicator_tutorials/ext_replicator-agent/ext_omni_anim_people.html>
+- AMASS / SMPL-H: <https://amass.is.tue.mpg.de/>
 - SocNavBench: <https://arxiv.org/abs/2103.00047>
 - Arena-Bench: <https://arxiv.org/abs/2206.05728>
 - Arena 3.0: <https://arxiv.org/abs/2406.00837>

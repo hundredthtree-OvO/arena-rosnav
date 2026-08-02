@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from .hunav_adapter import DirectedAgentState, HunavAdapter
 from .hunav_isaac_mirror_core import build_motion_intent_payload
+from .domain.agent import AgentSnapshot
 from .domain.events import BenchmarkEvent, encode_event_payload
 from .interaction_policy import (
     dynamic_robot_obstacles,
@@ -40,6 +41,13 @@ from .motion_backend import IsaacPeopleBackend, MotionCommand
 from .pedestrian_state_stream import observations_from_message
 from .pose_utils import SemanticPose, parse_semantic_pose
 from .resource_manager import QueueSlot, Resource, ResourceManager
+from .scenario import (
+    DirectorScenarioAdapter,
+    ScenarioAgentAssignment,
+    ScenarioRuntimeMode,
+)
+from .domain.intent import DirectiveType
+from .domain.world import AgentTaskFeedback
 from .route_provider import (
     RouteProvider,
     RouteRequest,
@@ -145,6 +153,8 @@ class RuntimeAgent:
     last_pose_update: float = 0.0
     current_yaw: float | None = None
     current_speed_mps: float = 0.0
+    current_vx_mps: float = 0.0
+    current_vy_mps: float = 0.0
     final_alignment_started_at: float = 0.0
     aligned_at_target: bool = False
     last_arrival_wait_log: float = 0.0
@@ -200,6 +210,7 @@ class ToiletDirectorNode(Node):
         status_topic: str = "/toilet_benchmark/director_status",
         motion_backend_name: str = "",
         hunav_namespace: str = "",
+        scenario_runtime_mode: str = "",
     ):
         super().__init__("toilet_director_node")
         self.semantics_path = str(semantics_path)
@@ -245,6 +256,14 @@ class ToiletDirectorNode(Node):
             or "/World"
         ).rstrip("/")
         director_cfg = self.benchmark.get("director", {}) or {}
+        scenario_cfg = dict(self.benchmark.get("scenario_runtime", {}) or {})
+        self.scenario_runtime_mode = ScenarioRuntimeMode(
+            str(
+                scenario_runtime_mode
+                or scenario_cfg.get("mode", ScenarioRuntimeMode.SHADOW.value)
+            ).strip().lower()
+        )
+        self.scenario_shadow_strict = bool(scenario_cfg.get("shadow_strict", False))
         self.arrival_tolerance_m = float(director_cfg.get("arrival_tolerance_m", 0.55))
         self.actor_stop_radius_m = float(director_cfg.get("actor_stop_radius_m", 0.5))
         self.exit_arrival_tolerance_m = float(director_cfg.get("exit_arrival_tolerance_m", 0.35))
@@ -356,6 +375,41 @@ class ToiletDirectorNode(Node):
             0.0,
             float(planner_cfg.get("robot_prediction_horizon_sec", 0.75)),
         )
+        self.robot_footprint_half_length_m = max(
+            0.01,
+            float(planner_cfg.get("robot_footprint_half_length_m", 0.36)),
+        )
+        self.robot_footprint_half_width_m = max(
+            0.01,
+            float(planner_cfg.get("robot_footprint_half_width_m", 0.27)),
+        )
+        self.robot_stationary_speed_threshold_mps = max(
+            0.0,
+            float(
+                planner_cfg.get(
+                    "robot_stationary_speed_threshold_mps",
+                    0.05,
+                )
+            ),
+        )
+        self.robot_stationary_soft_clearance_m = max(
+            0.0,
+            float(
+                planner_cfg.get(
+                    "robot_stationary_soft_clearance_m",
+                    0.05,
+                )
+            ),
+        )
+        self.robot_moving_soft_clearance_m = max(
+            self.robot_stationary_soft_clearance_m,
+            float(
+                planner_cfg.get(
+                    "robot_moving_soft_clearance_m",
+                    0.12,
+                )
+            ),
+        )
         self.robot_yield_pedestrian_radius_m = max(
             0.0,
             float(planner_cfg.get("robot_yield_pedestrian_radius_m", 0.22)),
@@ -366,7 +420,7 @@ class ToiletDirectorNode(Node):
         )
         self.path_planner: VoxelPathPlanner | WalkableMapPlanner | None = None
         self.route_provider: RouteProvider | None = None
-        self._robot_state: tuple[float, float, float, float, float] | None = None
+        self._robot_state: tuple[float, ...] | None = None
         self.character_pool = [
             str(name).strip()
             for name in (character_pool or self.benchmark.get("character_pool", []) or [])
@@ -375,6 +429,8 @@ class ToiletDirectorNode(Node):
         self.entrances: list[dict] = []
         self.exits: list[dict] = []
         self.resources = ResourceManager({})
+        self._scenario_adapter: DirectorScenarioAdapter | None = None
+        self._scenario_shadow_mismatch_keys: set[tuple[str, str, str]] = set()
         self.adapter = HunavAdapter()
         self.arrival_seed = int(
             self.benchmark.get("arrival", {}).get("seed", 12345)
@@ -398,6 +454,19 @@ class ToiletDirectorNode(Node):
                 move_service_name=self.move_service_name,
                 namespace=self.hunav_namespace,
                 config=hunav_config,
+            )
+        elif self.motion_backend_name == "local_motion":
+            from .local_motion_backend import LocalMotionBackend
+
+            local_motion_config = dict(motion_cfg.get("local_motion", {}) or {})
+            local_motion_config.setdefault(
+                "safety",
+                dict(hunav_motion_cfg.get("safety", {}) or {}),
+            )
+            self.motion_backend = LocalMotionBackend(
+                self,
+                move_service_name=self.move_service_name,
+                config=local_motion_config,
             )
         else:
             raise ValueError(
@@ -430,7 +499,7 @@ class ToiletDirectorNode(Node):
         )
         self._setup_path_planner()
         if (
-            self.motion_backend_name == "hunav"
+            hasattr(self.motion_backend, "set_walkable_planner")
             and isinstance(self.path_planner, WalkableMapPlanner)
         ):
             self.motion_backend.set_walkable_planner(self.path_planner)
@@ -441,6 +510,7 @@ class ToiletDirectorNode(Node):
             f"scene_root_path={self.scene_root_path}, "
             f"spawn_service={self.spawn_service_name}, move_service={self.move_service_name}, "
             f"motion_backend={self.motion_backend_name}, "
+            f"scenario_runtime={self.scenario_runtime_mode.value}, "
             f"arrival_seed={self.arrival_seed}, "
             f"default_character={self.character_name}, character_pool={len(self.character_pool)}"
         )
@@ -488,7 +558,7 @@ class ToiletDirectorNode(Node):
             return
         backend = str(
             planner_cfg.get("hunav_backend", "walkable_map")
-            if self.motion_backend_name == "hunav"
+            if self._is_continuous_motion_backend()
             else planner_cfg.get("backend", "voxel")
         ).strip().lower()
         if backend == "walkable_map":
@@ -648,18 +718,44 @@ class ToiletDirectorNode(Node):
 
     def _robot_odom_cb(self, msg: Odometry) -> None:
         pose = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
         velocity = msg.twist.twist.linear
+        angular_velocity = msg.twist.twist.angular
+        yaw = yaw_from_quaternion_xyzw(
+            orientation.x,
+            orientation.y,
+            orientation.z,
+            orientation.w,
+        )
         values = (
             float(pose.x),
             float(pose.y),
+            float(yaw),
             float(velocity.x),
             float(velocity.y),
+            float(angular_velocity.z),
         )
         if not all(math.isfinite(value) for value in values):
             return
         self._robot_state = (*values, time.monotonic())
+        if hasattr(self.motion_backend, "update_robot_snapshot"):
+            self.motion_backend.update_robot_snapshot(
+                AgentSnapshot(
+                    agent_id="robot",
+                    x=values[0],
+                    y=values[1],
+                    z=float(pose.z),
+                    yaw=values[2],
+                    vx=values[3],
+                    vy=values[4],
+                    wz=values[5],
+                    radius_m=self.robot_obstacle_radius_m,
+                    timestamp_sec=self._robot_state[-1],
+                    source="director_odom",
+                )
+            )
 
-    def _dynamic_obstacles(self, now: float) -> list[tuple[float, float, float]]:
+    def _dynamic_obstacles(self, now: float) -> list[tuple[float, ...]]:
         return dynamic_robot_obstacles(
             mode=self.robot_obstacle_mode,
             robot_state=self._robot_state,
@@ -667,6 +763,15 @@ class ToiletDirectorNode(Node):
             timeout_sec=self.robot_obstacle_timeout_sec,
             radius_m=self.robot_obstacle_radius_m,
             prediction_horizon_sec=self.robot_prediction_horizon_sec,
+            footprint_half_length_m=self.robot_footprint_half_length_m,
+            footprint_half_width_m=self.robot_footprint_half_width_m,
+            stationary_speed_threshold_mps=(
+                self.robot_stationary_speed_threshold_mps
+            ),
+            stationary_soft_clearance_m=(
+                self.robot_stationary_soft_clearance_m
+            ),
+            moving_soft_clearance_m=self.robot_moving_soft_clearance_m,
         )
 
     def _is_yielding_to_robot(self, state: RuntimeAgent, now: float) -> bool:
@@ -1353,8 +1458,159 @@ class ToiletDirectorNode(Node):
                 f"path_points={path_points}, velocity={velocity:.2f}, phase={phase}, reservation={reservation}, "
                 f"candidate_order={candidate_ids}"
             )
+        self._initialize_scenario_runtime(now=time.monotonic())
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.TAKEOVER:
+            for directed in directed_agents:
+                state = self._runtime_agents[directed.agent_id]
+                directive = self._scenario_directive(state.agent_id)
+                if directive is None:
+                    continue
+                if directive.directive_type == DirectiveType.WAIT_AT_QUEUE:
+                    state.current_phase = "QUEUEING"
+                    state.activity_phase = "QUEUEING"
+                    state.queue_slot_id = directive.slot_id
+                    if directive.slot_id is not None:
+                        pose = self.resources.queue_slot_pose(state.resource_id, directive.slot_id)
+                        yaw = self.resources.queue_slot_yaw(state.resource_id, directive.slot_id)
+                        if pose is not None:
+                            state.target_pose = list(pose)
+                            state.activity_pose = list(pose)
+                            state.target_yaw = float(yaw or 0.0)
+                            state.activity_yaw = float(yaw or 0.0)
+                elif directive.directive_type == DirectiveType.MOVE_TO_OBJECT:
+                    state.current_phase = "WALK_TO_URINAL"
+                    state.activity_phase = "WALK_TO_URINAL"
+                    state.queue_slot_id = None
+                    state.target_pose = self.resources.resource_pose(state.resource_id)
+                    state.activity_pose = list(state.target_pose)
+                    state.target_yaw = self.resources.resource_yaw(state.resource_id)
+                    state.activity_yaw = float(state.target_yaw)
+                directed.status = state.current_phase.lower()
+                directed.goal_pose = list(state.target_pose)
         self._spawned_agents = directed_agents
         return directed_agents
+
+    def _initialize_scenario_runtime(self, *, now: float) -> None:
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.LEGACY:
+            self._scenario_adapter = None
+            return
+        exit_target_id = str(self.exits[0]["id"]) if self.exits else "exit_main"
+        self._scenario_adapter = DirectorScenarioAdapter.from_legacy_resources(
+            self.resources,
+            exit_target_id=exit_target_id,
+            mode=self.scenario_runtime_mode,
+        )
+        result = self._scenario_adapter.reset(
+            (
+                ScenarioAgentAssignment(state.agent_id, state.resource_id)
+                for state in self._runtime_agents.values()
+            ),
+            episode_id=f"interactive_seed_{self.arrival_seed}",
+            seed=self.arrival_seed,
+            timestamp_sec=now,
+        )
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.TAKEOVER:
+            self._scenario_adapter.sync_legacy_resources(self.resources)
+        self._publish_scenario_events(result.events)
+        self.get_logger().info(
+            f"E1 scenario runtime initialized: mode={self.scenario_runtime_mode.value}, "
+            f"agents={len(self._runtime_agents)}"
+        )
+
+    def _scenario_directive(self, agent_id: str):
+        if self._scenario_adapter is None:
+            return None
+        return self._scenario_adapter.directive_for(agent_id)
+
+    def _scenario_takeover_enabled(self) -> bool:
+        return self.scenario_runtime_mode == ScenarioRuntimeMode.TAKEOVER
+
+    def _notify_scenario_target_reached(
+        self,
+        state: RuntimeAgent,
+        target_id: str,
+        now: float,
+    ):
+        self._advance_scenario_runtime(
+            now,
+            {
+                state.agent_id: AgentTaskFeedback(
+                    reached_target_id=str(target_id),
+                )
+            },
+        )
+        return self._scenario_directive(state.agent_id)
+
+    def _notify_scenario_activity_complete(self, state: RuntimeAgent, now: float):
+        self._advance_scenario_runtime(
+            now,
+            {state.agent_id: AgentTaskFeedback(activity_complete=True)},
+        )
+        return self._scenario_directive(state.agent_id)
+
+    def _advance_scenario_runtime(
+        self,
+        now: float,
+        feedback: dict[str, AgentTaskFeedback],
+    ):
+        if self._scenario_adapter is None:
+            return None
+        result = self._scenario_adapter.advance(now, feedback)
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.TAKEOVER:
+            self._scenario_adapter.sync_legacy_resources(self.resources)
+        self._publish_scenario_events(result.events)
+        return result
+
+    def _cancel_scenario_agent(self, state: RuntimeAgent, now: float, reason: str) -> None:
+        if self._scenario_adapter is None:
+            return
+        result = self._scenario_adapter.cancel_agent(
+            state.agent_id,
+            now,
+            reason=reason,
+        )
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.TAKEOVER:
+            self._scenario_adapter.sync_legacy_resources(self.resources)
+        self._publish_scenario_events(result.events)
+
+    def _publish_scenario_events(self, events) -> None:
+        if self._status_publisher is None:
+            return
+        for event in events:
+            self._status_publisher.publish(String(data=encode_event_payload(event)))
+
+    def _log_scenario_shadow_mismatches(self) -> None:
+        if self._scenario_adapter is None:
+            return
+        mismatches = list(self._scenario_adapter.compare_legacy_phases(
+            {
+                agent_id: state.current_phase
+                for agent_id, state in self._runtime_agents.items()
+                if state.activated and state.current_phase != "DONE"
+            }
+        ))
+        if self.scenario_runtime_mode == ScenarioRuntimeMode.SHADOW:
+            mismatches.extend(
+                self._scenario_adapter.compare_legacy_resources(self.resources)
+            )
+        active_keys = {
+            (item.agent_id, item.legacy_phase, item.reason)
+            for item in mismatches
+        }
+        for mismatch in mismatches:
+            key = (mismatch.agent_id, mismatch.legacy_phase, mismatch.reason)
+            if key in self._scenario_shadow_mismatch_keys:
+                continue
+            message = (
+                "E1 scenario shadow mismatch: "
+                f"agent={mismatch.agent_id}, legacy_phase={mismatch.legacy_phase}, "
+                f"directive={mismatch.directive_type.value}, reason={mismatch.reason}"
+            )
+            if self.scenario_shadow_strict:
+                self.get_logger().error(message)
+            else:
+                self.get_logger().warning(message)
+        self._scenario_shadow_mismatch_keys = active_keys
 
     def _select_character_name(self, idx: int) -> str:
         if self.character_pool:
@@ -1498,7 +1754,13 @@ class ToiletDirectorNode(Node):
                 if state is None:
                     continue
                 try:
-                    self.resources.release(state.agent_id, state.resource_id)
+                    self._cancel_scenario_agent(
+                        state,
+                        time.monotonic(),
+                        "spawn request rejected",
+                    )
+                    if not self._scenario_takeover_enabled():
+                        self.resources.release(state.agent_id, state.resource_id)
                 except Exception:
                     pass
                 self._runtime_agents.pop(agent_id, None)
@@ -1810,7 +2072,7 @@ class ToiletDirectorNode(Node):
     def _portal_entry_waypoints(self) -> list[list[float]]:
         if self.portal is None:
             return []
-        if self.motion_backend_name == "hunav":
+        if self._is_continuous_motion_backend():
             return self._dedupe_waypoints(
                 [
                     self.portal["outside"],
@@ -1838,12 +2100,15 @@ class ToiletDirectorNode(Node):
     def _portal_staging_pose(self) -> list[float]:
         if self.portal is None:
             return [0.0, 0.0, self.walk_plane_z]
-        if self.motion_backend_name == "hunav":
+        if self._is_continuous_motion_backend():
             return self._hunav_portal_clearance_pose()
         return list(self.portal["inside_staging"])
 
+    def _is_continuous_motion_backend(self) -> bool:
+        return self.motion_backend_name in {"hunav", "local_motion"}
+
     def _portal_motion_velocity(self, state: RuntimeAgent) -> float:
-        if self.motion_backend_name == "hunav":
+        if self._is_continuous_motion_backend():
             return float(state.velocity)
         return min(float(state.velocity), self.portal_crossing_velocity_mps)
 
@@ -1872,7 +2137,7 @@ class ToiletDirectorNode(Node):
         return (
             self.portal is not None
             and (
-                self.motion_backend_name != "hunav"
+                not self._is_continuous_motion_backend()
                 or self.hunav_use_portal_controller
             )
         )
@@ -1880,7 +2145,7 @@ class ToiletDirectorNode(Node):
     def _exiting_portal_path(self, state: RuntimeAgent) -> list[list[float]]:
         if self.portal is None:
             return [list(state.exit_pose or state.current_pose)]
-        if self.motion_backend_name == "hunav":
+        if self._is_continuous_motion_backend():
             return remaining_polyline_waypoints(
                 [
                     self._hunav_portal_clearance_pose(),
@@ -1956,7 +2221,10 @@ class ToiletDirectorNode(Node):
 
     def _abort_stalled_portal_agent(self, state: RuntimeAgent) -> None:
         direction = str(state.portal_direction or "unknown")
-        promoted = self.resources.release(state.agent_id, state.resource_id)
+        self._cancel_scenario_agent(state, time.monotonic(), "portal recovery exhausted")
+        promoted = None
+        if not self._scenario_takeover_enabled():
+            promoted = self.resources.release(state.agent_id, state.resource_id)
         state.current_phase = "DESPAWNING"
         self._release_portal(state, "stalled agent aborted")
         self.get_logger().error(
@@ -1967,7 +2235,10 @@ class ToiletDirectorNode(Node):
 
     def _abort_stalled_motion_agent(self, state: RuntimeAgent) -> None:
         phase = str(state.current_phase)
-        promoted = self.resources.release(state.agent_id, state.resource_id)
+        self._cancel_scenario_agent(state, time.monotonic(), "motion recovery exhausted")
+        promoted = None
+        if not self._scenario_takeover_enabled():
+            promoted = self.resources.release(state.agent_id, state.resource_id)
         state.current_phase = "DESPAWNING"
         self._release_portal(state, "stalled motion aborted")
         self.get_logger().error(
@@ -2130,13 +2401,16 @@ class ToiletDirectorNode(Node):
                 f"{agent_id} has no global route provider; refusing unsafe direct motion."
             )
             return None
-        return self.route_provider.plan(
+        plan = self.route_provider.plan(
             RouteRequest(
                 agent_id=agent_id,
                 start_pose=start_pose,
                 goal_pose=goal_pose,
             )
         )
+        if plan is None:
+            return None
+        return [list(point) for point in plan.points]
 
     def _advance_state_machine(self):
         if not self._bootstrapped:
@@ -2211,7 +2485,13 @@ class ToiletDirectorNode(Node):
 
             if state.current_phase == "QUEUEING":
                 resource = self.resources.resources[state.resource_id]
-                if resource.occupied_by != state.agent_id:
+                promoted_by_scenario = (
+                    self._scenario_takeover_enabled()
+                    and self._scenario_directive(state.agent_id) is not None
+                    and self._scenario_directive(state.agent_id).directive_type
+                    == DirectiveType.MOVE_TO_OBJECT
+                )
+                if not promoted_by_scenario and resource.occupied_by != state.agent_id:
                     continue
                 target_pose = self.resources.resource_pose(state.resource_id)
                 target_yaw = self.resources.resource_yaw(state.resource_id)
@@ -2239,18 +2519,40 @@ class ToiletDirectorNode(Node):
                 continue
 
             if state.current_phase == "WALK_TO_URINAL":
-                if self.motion_backend_name == "hunav":
+                if self._is_continuous_motion_backend():
                     state.current_phase = "FINAL_ALIGN_URINAL"
                     state.final_alignment_started_at = 0.0
                     self.get_logger().info(
                         f"{state.agent_id} reached {state.resource_id}; waiting for final yaw alignment."
                     )
                     continue
+                directive = self._notify_scenario_target_reached(
+                    state,
+                    state.resource_id,
+                    now,
+                )
+                if (
+                    self._scenario_takeover_enabled()
+                    and directive is not None
+                    and directive.directive_type != DirectiveType.START_ACTIVITY
+                ):
+                    continue
                 self._begin_urinal_service(state, now, min_service, max_service)
                 continue
 
             if state.current_phase == "FINAL_ALIGN_URINAL":
                 if not self._urinal_final_alignment_complete(state, now):
+                    continue
+                directive = self._notify_scenario_target_reached(
+                    state,
+                    state.resource_id,
+                    now,
+                )
+                if (
+                    self._scenario_takeover_enabled()
+                    and directive is not None
+                    and directive.directive_type != DirectiveType.START_ACTIVITY
+                ):
                     continue
                 if not self._send_move(
                     agent_id=state.agent_id,
@@ -2290,7 +2592,22 @@ class ToiletDirectorNode(Node):
                     intent_phase=next_phase,
                 ):
                     continue
-                promoted = self.resources.release(state.agent_id, state.resource_id)
+                directive = self._notify_scenario_activity_complete(state, now)
+                if (
+                    self._scenario_takeover_enabled()
+                    and directive is not None
+                    and directive.directive_type != DirectiveType.MOVE_TO_EXIT
+                ):
+                    self.get_logger().error(
+                        f"E1 scenario runtime rejected exit transition for {state.agent_id}: "
+                        f"directive={directive.directive_type.value}"
+                    )
+                    continue
+                promoted = None
+                if not self._scenario_takeover_enabled():
+                    promoted = self.resources.release(state.agent_id, state.resource_id)
+                elif self._scenario_adapter is not None:
+                    promoted = self.resources.resources[state.resource_id].occupied_by
                 state.current_phase = next_phase
                 state.target_pose = move_target
                 state.target_yaw = self._portal_exit_yaw() if use_exit_portal else exit_yaw
@@ -2344,10 +2661,23 @@ class ToiletDirectorNode(Node):
                 continue
 
             if state.current_phase == "EXITING":
+                exit_target_id = str(self.exits[0]["id"]) if self.exits else "exit_main"
+                directive = self._notify_scenario_target_reached(
+                    state,
+                    exit_target_id,
+                    now,
+                )
+                if (
+                    self._scenario_takeover_enabled()
+                    and directive is not None
+                    and directive.directive_type != DirectiveType.RETIRE
+                ):
+                    continue
                 state.current_phase = "DESPAWNING"
                 self._request_despawn(state, reason="completed EXITING")
                 continue
 
+        self._log_scenario_shadow_mismatches()
         self._maybe_shutdown_when_complete()
 
     def _estimate_arrival_deadline(
@@ -2423,7 +2753,7 @@ class ToiletDirectorNode(Node):
                         "entering",
                         lateral_margin_m=self.portal["release_tolerance_m"],
                     )
-                    if self.motion_backend_name == "hunav"
+                    if self._is_continuous_motion_backend()
                     else portal_inside_plane_reached(
                         current_pose=state.current_pose,
                         inside_pose=self.portal["inside"],
@@ -2440,7 +2770,7 @@ class ToiletDirectorNode(Node):
                 )
             )
             requires_backend_settlement = (
-                self.motion_backend_name == "hunav"
+                self._is_continuous_motion_backend()
                 and state.current_phase == "WALK_TO_URINAL"
             )
             if requires_backend_settlement and not backend_settled:
@@ -2490,9 +2820,40 @@ class ToiletDirectorNode(Node):
                 self._apply_guard_feedback(state, observation.metadata, observed_at)
                 state.current_yaw = self._metadata_yaw(observation.metadata)
                 if observation.velocity is not None:
+                    state.current_vx_mps = float(observation.velocity[0])
+                    state.current_vy_mps = float(observation.velocity[1])
                     state.current_speed_mps = math.hypot(
-                        float(observation.velocity[0]),
-                        float(observation.velocity[1]),
+                        state.current_vx_mps,
+                        state.current_vy_mps,
+                    )
+                if hasattr(self.motion_backend, "update_agent_snapshot"):
+                    yaw = state.current_yaw
+                    if yaw is None and state.current_speed_mps > 0.03:
+                        yaw = math.atan2(
+                            state.current_vy_mps,
+                            state.current_vx_mps,
+                        )
+                    self.motion_backend.update_agent_snapshot(
+                        AgentSnapshot(
+                            agent_id=state.agent_id,
+                            x=float(xyz[0]),
+                            y=float(xyz[1]),
+                            z=float(xyz[2]),
+                            yaw=float(
+                                state.initial_yaw if yaw is None else yaw
+                            ),
+                            vx=state.current_vx_mps,
+                            vy=state.current_vy_mps,
+                            radius_m=float(
+                                getattr(
+                                    self.motion_backend,
+                                    "agent_radius_m",
+                                    self.robot_yield_pedestrian_radius_m,
+                                )
+                            ),
+                            timestamp_sec=observed_at,
+                            source="director_people",
+                        )
                     )
                 if state.portal_direction is not None:
                     observation = classify_motion_observation(
@@ -2656,7 +3017,7 @@ def main(args=None):
     parser.add_argument("--move-service", default="/isaac/move_pedestrians")
     parser.add_argument(
         "--motion-backend",
-        choices=("isaac_people", "hunav"),
+        choices=("isaac_people", "hunav", "local_motion"),
         default="",
         help="Override motion_backend.type from the benchmark YAML.",
     )
@@ -2684,6 +3045,12 @@ def main(args=None):
         "--status-topic",
         default="/toilet_benchmark/director_status",
         help="Publish pedestrian lifecycle JSON events for orchestration.",
+    )
+    parser.add_argument(
+        "--scenario-runtime",
+        choices=("legacy", "shadow", "takeover"),
+        default="",
+        help="Override scenario_runtime.mode from the benchmark YAML.",
     )
     parsed, ros_args = parser.parse_known_args(args=args)
 
@@ -2735,6 +3102,7 @@ def main(args=None):
             status_topic=parsed.status_topic,
             motion_backend_name=motion_backend_name,
             hunav_namespace=hunav_namespace,
+            scenario_runtime_mode=parsed.scenario_runtime,
         )
         rclpy.spin(node)
     except KeyboardInterrupt:

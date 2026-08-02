@@ -1,5 +1,10 @@
 # 厕所行人系统 HuNav 迁移计划
 
+> 文档状态：历史实现与实验计划。自 2026-08-01 起，新增架构以
+> `pedestrian_ecosystem_architecture_cn.md` 的控制权和冻结接口为准，backend 对照以
+> `motion_backend_evaluation_cn.md` 为准。本文继续保留 Phase 0-6 的实验依据，但 HuNav
+> 不再被定义为完整厕所行人系统，只是 Interactive Track 的 LocalMotion 实现之一。
+
 日期：2026-07-26
 
 > 文档定位：本文只记录 Interactive Track 的行人运动实现迁移，不再承担完整

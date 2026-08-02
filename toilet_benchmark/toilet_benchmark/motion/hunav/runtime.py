@@ -47,10 +47,14 @@ RUNTIME_FIELDS = (
     "_reaction_controller",
     "_reaction_decision",
     "_external_future",
+    "_external_future_started_at",
+    "_external_retry_after",
+    "_pending_external_command",
     "_external_request_token",
     "_last_state_wait_log",
     "_last_diagnostic_log",
     "_last_native_behavior_signature",
+    "_last_local_motion_shadow",
 )
 
 
