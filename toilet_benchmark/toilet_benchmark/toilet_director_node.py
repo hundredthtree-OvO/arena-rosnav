@@ -37,7 +37,8 @@ from .interaction_policy import (
     guard_block_requires_wait,
     robot_blocks_pedestrian,
 )
-from .motion_backend import IsaacPeopleBackend, MotionCommand
+from .motion_backend import MotionCommand
+from .motion.backend_factory import build_motion_backend
 from .pedestrian_state_stream import observations_from_message
 from .pose_utils import SemanticPose, parse_semantic_pose
 from .resource_manager import QueueSlot, Resource, ResourceManager
@@ -83,6 +84,37 @@ def _default_config_path(filename: str) -> str:
 
 def _planar_distance(a, b) -> float:
     return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _polyline_prefix_before_goal(
+    points: list[list[float]],
+    setback_m: float,
+) -> list[list[float]]:
+    """Return a route prefix ending a requested distance before its goal."""
+    route: list[list[float]] = []
+    for point in points:
+        parsed = [float(point[0]), float(point[1]), float(point[2])]
+        if not route or _planar_distance(route[-1], parsed) > 1e-6:
+            route.append(parsed)
+    if len(route) < 2:
+        return route
+
+    remaining = max(0.0, float(setback_m))
+    for index in range(len(route) - 1, 0, -1):
+        start = route[index - 1]
+        end = route[index]
+        length = _planar_distance(start, end)
+        if length <= 1e-9:
+            continue
+        if remaining <= length:
+            ratio = (length - remaining) / length
+            holding = [
+                start[axis] + ratio * (end[axis] - start[axis])
+                for axis in range(3)
+            ]
+            return [*route[:index], holding]
+        remaining -= length
+    return [route[0]]
 
 
 def _parse_placement_rule(item: dict) -> PlacementRule | None:
@@ -264,6 +296,9 @@ class ToiletDirectorNode(Node):
             ).strip().lower()
         )
         self.scenario_shadow_strict = bool(scenario_cfg.get("shadow_strict", False))
+        self.smart_object_geometry = dict(
+            scenario_cfg.get("smart_object_geometry", {}) or {}
+        )
         self.arrival_tolerance_m = float(director_cfg.get("arrival_tolerance_m", 0.55))
         self.actor_stop_radius_m = float(director_cfg.get("actor_stop_radius_m", 0.5))
         self.exit_arrival_tolerance_m = float(director_cfg.get("exit_arrival_tolerance_m", 0.35))
@@ -437,41 +472,21 @@ class ToiletDirectorNode(Node):
         )
         self._rng = random.Random(self.arrival_seed)
         self._spawn_client = self.create_client(Pedestrian, self.spawn_service_name)
-        if self.motion_backend_name == "isaac_people":
-            self.motion_backend = IsaacPeopleBackend(self, self.move_service_name)
-        elif self.motion_backend_name == "hunav":
-            from .hunav_motion_backend import HuNavMotionBackend
-
-            hunav_config = hunav_motion_cfg
-            hunav_config.setdefault("reaction_seed", self.arrival_seed)
-            hunav_config.setdefault("visualization", {})
-            hunav_config["visualization"] = {
-                **dict(hunav_config["visualization"] or {}),
-                "portal": self._hunav_portal_visualization_config(),
-            }
-            self.motion_backend = HuNavMotionBackend(
-                self,
-                move_service_name=self.move_service_name,
-                namespace=self.hunav_namespace,
-                config=hunav_config,
-            )
-        elif self.motion_backend_name == "local_motion":
-            from .local_motion_backend import LocalMotionBackend
-
-            local_motion_config = dict(motion_cfg.get("local_motion", {}) or {})
-            local_motion_config.setdefault(
-                "safety",
-                dict(hunav_motion_cfg.get("safety", {}) or {}),
-            )
-            self.motion_backend = LocalMotionBackend(
-                self,
-                move_service_name=self.move_service_name,
-                config=local_motion_config,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported pedestrian motion backend: {self.motion_backend_name!r}"
-            )
+        hunav_config = dict(hunav_motion_cfg)
+        hunav_config.setdefault("visualization", {})
+        hunav_config["visualization"] = {
+            **dict(hunav_config["visualization"] or {}),
+            "portal": self._hunav_portal_visualization_config(),
+        }
+        self.motion_backend = build_motion_backend(
+            self,
+            backend_name=self.motion_backend_name,
+            move_service_name=self.move_service_name,
+            hunav_namespace=self.hunav_namespace,
+            hunav_config=hunav_config,
+            motion_config=motion_cfg,
+            arrival_seed=self.arrival_seed,
+        )
         self._get_prim_client = self.create_client(GetPrimAttributes, "/isaac/get_prim_attributes")
         self._delete_client = self.create_client(DeletePrim, "/isaac/delete_prim")
         self._spawned_agents: list[DirectedAgentState] = []
@@ -750,6 +765,8 @@ class ToiletDirectorNode(Node):
                     vy=values[4],
                     wz=values[5],
                     radius_m=self.robot_obstacle_radius_m,
+                    box_half_length_m=self.robot_footprint_half_length_m,
+                    box_half_width_m=self.robot_footprint_half_width_m,
                     timestamp_sec=self._robot_state[-1],
                     source="director_odom",
                 )
@@ -1096,11 +1113,14 @@ class ToiletDirectorNode(Node):
     ):
         entry_id = str(item["id"])
         pose = self._coerce_walk_plane(pose)
+        geometry = dict(item.get("smart_object_geometry", {}) or {})
         self._bootstrap_resources[entry_id] = Resource(
             resource_id=entry_id,
             category=category,
             position=pose.as_list(),
             yaw=float(pose.yaw),
+            body_yaw=float(geometry.get("body_yaw", pose.yaw)),
+            passage_yaw=float(geometry.get("passage_yaw", pose.yaw)),
             scene_prim=str(item.get("scene_prim", "")),
             queue_slots=queue_slots,
         )
@@ -1465,7 +1485,30 @@ class ToiletDirectorNode(Node):
                 directive = self._scenario_directive(state.agent_id)
                 if directive is None:
                     continue
-                if directive.directive_type == DirectiveType.WAIT_AT_QUEUE:
+                if directive.directive_type == DirectiveType.MOVE_TO_PASSAGE:
+                    passage_pose = self._scenario_adapter.passage_holding_pose(
+                        state.resource_id
+                    )
+                    passage_yaw = self._scenario_adapter.passage_holding_yaw(
+                        state.resource_id
+                    )
+                    if passage_pose is not None:
+                        state.current_phase = "WALK_TO_PASSAGE"
+                        state.activity_phase = "WALK_TO_PASSAGE"
+                        state.queue_slot_id = None
+                        state.target_pose = list(passage_pose)
+                        state.activity_pose = list(passage_pose)
+                        state.target_yaw = float(passage_yaw or 0.0)
+                        state.activity_yaw = float(passage_yaw or 0.0)
+                elif directive.directive_type == DirectiveType.WAIT_FOR_PASSAGE:
+                    state.current_phase = "QUEUEING"
+                    state.activity_phase = "QUEUEING"
+                    state.queue_slot_id = None
+                    state.target_pose = list(state.entrance_pose)
+                    state.activity_pose = list(state.entrance_pose)
+                    state.target_yaw = float(state.initial_yaw)
+                    state.activity_yaw = float(state.initial_yaw)
+                elif directive.directive_type == DirectiveType.WAIT_AT_QUEUE:
                     state.current_phase = "QUEUEING"
                     state.activity_phase = "QUEUEING"
                     state.queue_slot_id = directive.slot_id
@@ -1499,6 +1542,21 @@ class ToiletDirectorNode(Node):
             self.resources,
             exit_target_id=exit_target_id,
             mode=self.scenario_runtime_mode,
+            pedestrian_radius_m=float(
+                self.smart_object_geometry.get("pedestrian_radius_m", 0.26)
+            ),
+            pedestrian_half_length_m=float(
+                self.smart_object_geometry.get("pedestrian_half_length_m", 0.16)
+            ),
+            passage_depth_m=float(
+                self.smart_object_geometry.get("passage_depth_m", 0.90)
+            ),
+            passage_clearance_m=float(
+                self.smart_object_geometry.get("passage_clearance_m", 0.16)
+            ),
+            passage_holding_offset_m=float(
+                self.smart_object_geometry.get("passage_holding_offset_m", 0.45)
+            ),
         )
         result = self._scenario_adapter.reset(
             (
@@ -1878,6 +1936,33 @@ class ToiletDirectorNode(Node):
         )
 
     def _dispatch_initial_motion(self, state: RuntimeAgent, now: float):
+        directive = self._scenario_directive(state.agent_id)
+        if (
+            self._scenario_takeover_enabled()
+            and directive is not None
+            and directive.directive_type == DirectiveType.WAIT_FOR_PASSAGE
+        ):
+            state.current_phase = "QUEUEING"
+            state.activity_phase = "QUEUEING"
+            state.target_pose = list(state.current_pose)
+            state.activity_pose = list(state.current_pose)
+            state.target_yaw = float(state.initial_yaw)
+            state.activity_yaw = float(state.initial_yaw)
+            state.reached_deadline = float("inf")
+            state.aligned_at_target = True
+            state.target_reached = True
+            state.activation_requested = False
+            state.activation_pose_applied = False
+            state.activation_pose_confirmed = False
+            state.activated = True
+            self._next_initial_spawn_time = now + max(0.0, self.initial_spawn_interval_sec)
+            self.get_logger().info(
+                f"Activated {state.agent_id} in passage hold at {state.current_pose}; "
+                f"waiting for access to {state.resource_id}."
+            )
+            self._publish_status_event("pedestrian_active", state)
+            return
+
         use_portal = self._uses_portal_controller()
         if use_portal:
             target_pose = self._portal_staging_pose()
@@ -1900,6 +1985,34 @@ class ToiletDirectorNode(Node):
                 start_pose=state.current_pose,
                 goal_pose=target_pose,
             )
+            if (
+                activity_path is None
+                and self._scenario_takeover_enabled()
+                and directive is not None
+                and directive.directive_type == DirectiveType.MOVE_TO_PASSAGE
+            ):
+                resource_pose = self.resources.resource_pose(state.resource_id)
+                resource_path = self._path_points_for_move(
+                    agent_id=state.agent_id,
+                    start_pose=state.current_pose,
+                    goal_pose=resource_pose,
+                )
+                if resource_path is not None:
+                    setback_m = max(
+                        0.75,
+                        _planar_distance(target_pose, resource_pose),
+                    )
+                    activity_path = _polyline_prefix_before_goal(
+                        [list(state.current_pose), *resource_path, list(resource_pose)],
+                        setback_m,
+                    )
+                    if activity_path:
+                        target_pose = list(activity_path[-1])
+                        state.activity_pose = list(target_pose)
+                        self.get_logger().warning(
+                            f"{state.agent_id} semantic passage holding pose was unreachable; "
+                            f"using reachable route-derived holding pose {target_pose}."
+                        )
             if activity_path is None:
                 dispatched = False
             else:
@@ -2262,7 +2375,13 @@ class ToiletDirectorNode(Node):
             state.motion_last_motion_at = float(now)
             state.motion_last_pose = list(state.current_pose)
             return
-        tracked_phases = {"WALK_TO_URINAL", "QUEUEING", "WALK_TO_EXIT_STAGING"}
+        tracked_phases = {
+            "WALK_TO_PASSAGE",
+            "WALK_FROM_PASSAGE",
+            "WALK_TO_URINAL",
+            "QUEUEING",
+            "WALK_TO_EXIT_STAGING",
+        }
         if state.portal_direction is not None or state.current_phase not in tracked_phases:
             return
         if state.aligned_at_target:
@@ -2412,6 +2531,80 @@ class ToiletDirectorNode(Node):
             return None
         return [list(point) for point in plan.points]
 
+    def _start_resource_approach(self, state: RuntimeAgent, now: float) -> bool:
+        target_pose = self.resources.resource_pose(state.resource_id)
+        target_yaw = self.resources.resource_yaw(state.resource_id)
+        if not self._send_move(
+            agent_id=state.agent_id,
+            goal_pose=target_pose,
+            velocity=state.velocity,
+            orientation=target_yaw,
+            intent_phase="WALK_TO_URINAL",
+        ):
+            return False
+        state.current_phase = "WALK_TO_URINAL"
+        state.queue_slot_id = None
+        state.target_pose = target_pose
+        state.target_yaw = target_yaw
+        state.reached_deadline = self._estimate_arrival_deadline(
+            state.current_pose,
+            state.target_pose,
+            state.velocity,
+            now=now,
+        )
+        state.aligned_at_target = False
+        state.target_reached = False
+        return True
+
+    def _start_exit_motion(self, state: RuntimeAgent, now: float) -> bool:
+        exit_pose = list(state.exit_pose or state.current_pose)
+        exit_yaw = float(state.exit_yaw)
+        use_exit_portal = self._uses_portal_controller()
+        move_target = self._portal_staging_pose() if use_exit_portal else exit_pose
+        move_path = (
+            self._exit_staging_path(state)
+            if use_exit_portal
+            else self._path_points_for_move(
+                agent_id=state.agent_id,
+                start_pose=state.current_pose,
+                goal_pose=exit_pose,
+            )
+        )
+        if move_path is None:
+            return False
+        next_phase = "WALK_TO_EXIT_STAGING" if use_exit_portal else "EXITING"
+        if not self._send_move(
+            agent_id=state.agent_id,
+            goal_pose=move_target,
+            velocity=state.velocity,
+            orientation=self._portal_exit_yaw() if use_exit_portal else exit_yaw,
+            path_points_override=move_path,
+            intent_phase=next_phase,
+        ):
+            return False
+        promoted = None
+        if not self._scenario_takeover_enabled():
+            promoted = self.resources.release(state.agent_id, state.resource_id)
+        elif self._scenario_adapter is not None:
+            promoted = self.resources.resources[state.resource_id].occupied_by
+        state.current_phase = next_phase
+        state.target_pose = move_target
+        state.target_yaw = self._portal_exit_yaw() if use_exit_portal else exit_yaw
+        state.reached_deadline = self._estimate_arrival_deadline(
+            state.current_pose,
+            state.target_pose,
+            state.velocity,
+            now=now,
+        )
+        state.aligned_at_target = False
+        state.target_reached = False
+        self.get_logger().info(
+            f"{state.agent_id} leaving {state.resource_id} for "
+            f"{'exit staging' if use_exit_portal else 'direct walkable-map exit'}; "
+            f"next queued={promoted}"
+        )
+        return True
+
     def _advance_state_machine(self):
         if not self._bootstrapped:
             return
@@ -2439,6 +2632,8 @@ class ToiletDirectorNode(Node):
                 continue
             if state.current_phase in {
                 "WALK_TO_ENTRY_CLEARANCE",
+                "WALK_TO_PASSAGE",
+                "WALK_FROM_PASSAGE",
                 "WALK_TO_URINAL",
                 "QUEUEING",
                 "WALK_TO_EXIT_STAGING",
@@ -2483,39 +2678,83 @@ class ToiletDirectorNode(Node):
                 )
                 continue
 
-            if state.current_phase == "QUEUEING":
-                resource = self.resources.resources[state.resource_id]
-                promoted_by_scenario = (
-                    self._scenario_takeover_enabled()
-                    and self._scenario_directive(state.agent_id) is not None
-                    and self._scenario_directive(state.agent_id).directive_type
-                    == DirectiveType.MOVE_TO_OBJECT
+            if state.current_phase == "WALK_FROM_PASSAGE":
+                directive = self._notify_scenario_target_reached(
+                    state,
+                    f"{state.resource_id}:passage:egress",
+                    now,
                 )
-                if not promoted_by_scenario and resource.occupied_by != state.agent_id:
-                    continue
-                target_pose = self.resources.resource_pose(state.resource_id)
-                target_yaw = self.resources.resource_yaw(state.resource_id)
-                if not self._send_move(
-                    agent_id=state.agent_id,
-                    goal_pose=target_pose,
-                    velocity=state.velocity,
-                    orientation=target_yaw,
-                    intent_phase="WALK_TO_URINAL",
+                if (
+                    self._scenario_takeover_enabled()
+                    and (
+                        directive is None
+                        or directive.directive_type != DirectiveType.MOVE_TO_EXIT
+                    )
                 ):
                     continue
-                state.current_phase = "WALK_TO_URINAL"
-                state.queue_slot_id = None
-                state.target_pose = target_pose
-                state.target_yaw = target_yaw
-                state.reached_deadline = self._estimate_arrival_deadline(
-                    state.current_pose,
-                    state.target_pose,
-                    state.velocity,
-                    now=now,
+                self._start_exit_motion(state, now)
+                continue
+
+            if state.current_phase == "WALK_TO_PASSAGE":
+                directive = self._notify_scenario_target_reached(
+                    state,
+                    f"{state.resource_id}:passage",
+                    now,
                 )
-                state.aligned_at_target = False
-                state.target_reached = False
-                self.get_logger().info(f"{state.agent_id} promoted from queue to urinal {state.resource_id}")
+                if (
+                    directive is not None
+                    and directive.directive_type == DirectiveType.WAIT_FOR_PASSAGE
+                ):
+                    self._send_move(
+                        agent_id=state.agent_id,
+                        goal_pose=state.current_pose,
+                        velocity=0.0,
+                        orientation=state.current_yaw or state.target_yaw,
+                        stop=True,
+                        intent_phase="QUEUEING",
+                    )
+                    state.current_phase = "QUEUEING"
+                    state.activity_phase = "QUEUEING"
+                    state.target_pose = list(state.current_pose)
+                    state.activity_pose = list(state.current_pose)
+                    state.aligned_at_target = True
+                    state.target_reached = True
+                    self._log_phase_wait(
+                        state,
+                        "waiting for adjacent SmartObject ingress passage",
+                        now,
+                    )
+                    continue
+                if (
+                    self._scenario_takeover_enabled()
+                    and (
+                        directive is None
+                        or directive.directive_type != DirectiveType.MOVE_TO_OBJECT
+                    )
+                ):
+                    continue
+                if self._start_resource_approach(state, now):
+                    self.get_logger().info(
+                        f"{state.agent_id} acquired local passage to {state.resource_id}."
+                    )
+                continue
+
+            if state.current_phase == "QUEUEING":
+                resource = self.resources.resources[state.resource_id]
+                if self._scenario_takeover_enabled():
+                    directive = self._scenario_directive(state.agent_id)
+                    if (
+                        directive is None
+                        or directive.directive_type != DirectiveType.MOVE_TO_OBJECT
+                    ):
+                        continue
+                elif resource.occupied_by != state.agent_id:
+                    continue
+                if not self._start_resource_approach(state, now):
+                    continue
+                self.get_logger().info(
+                    f"{state.agent_id} released from semantic wait to {state.resource_id}."
+                )
                 continue
 
             if state.current_phase == "WALK_TO_URINAL":
@@ -2567,63 +2806,78 @@ class ToiletDirectorNode(Node):
                 continue
 
             if state.current_phase == "USING_URINAL":
-                exit_pose = list(state.exit_pose or state.current_pose)
-                exit_yaw = float(state.exit_yaw)
-                use_exit_portal = self._uses_portal_controller()
-                move_target = self._portal_staging_pose() if use_exit_portal else exit_pose
-                move_path = (
-                    self._exit_staging_path(state)
-                    if use_exit_portal
-                    else self._path_points_for_move(
+                directive = self._notify_scenario_activity_complete(state, now)
+                if (
+                    self._scenario_takeover_enabled()
+                    and directive is not None
+                    and directive.directive_type == DirectiveType.MOVE_TO_PASSAGE
+                ):
+                    if not self._acquire_portal(state, "exiting", now):
+                        self._log_phase_wait(
+                            state,
+                            "waiting for serialized room exit corridor",
+                            now,
+                        )
+                        continue
+                    passage_pose = self._scenario_adapter.passage_staging_pose(
+                        state.resource_id
+                    )
+                    passage_yaw = self._scenario_adapter.passage_staging_yaw(
+                        state.resource_id
+                    )
+                    if passage_pose is None:
+                        self._release_portal(
+                            state,
+                            "missing SmartObject egress staging pose",
+                        )
+                        self._log_phase_wait(
+                            state,
+                            "missing SmartObject egress staging pose",
+                            now,
+                        )
+                        continue
+                    passage_path = self._path_points_for_move(
                         agent_id=state.agent_id,
                         start_pose=state.current_pose,
-                        goal_pose=exit_pose,
+                        goal_pose=passage_pose,
                     )
-                )
-                if move_path is None:
+                    if passage_path is None or not self._send_move(
+                        agent_id=state.agent_id,
+                        goal_pose=passage_pose,
+                        velocity=state.velocity,
+                        orientation=float(passage_yaw or state.target_yaw),
+                        path_points_override=passage_path,
+                        intent_phase="WALK_FROM_PASSAGE",
+                    ):
+                        self._release_portal(
+                            state,
+                            "SmartObject egress command rejected",
+                        )
+                        continue
+                    state.current_phase = "WALK_FROM_PASSAGE"
+                    state.target_pose = list(passage_pose)
+                    state.target_yaw = float(passage_yaw or state.target_yaw)
+                    state.reached_deadline = self._estimate_arrival_deadline(
+                        state.current_pose,
+                        state.target_pose,
+                        state.velocity,
+                        now=now,
+                    )
+                    state.aligned_at_target = False
+                    state.target_reached = False
                     continue
-                next_phase = "WALK_TO_EXIT_STAGING" if use_exit_portal else "EXITING"
-                if not self._send_move(
-                    agent_id=state.agent_id,
-                    goal_pose=move_target,
-                    velocity=state.velocity,
-                    orientation=self._portal_exit_yaw() if use_exit_portal else exit_yaw,
-                    path_points_override=move_path,
-                    intent_phase=next_phase,
-                ):
-                    continue
-                directive = self._notify_scenario_activity_complete(state, now)
                 if (
                     self._scenario_takeover_enabled()
                     and directive is not None
                     and directive.directive_type != DirectiveType.MOVE_TO_EXIT
                 ):
-                    self.get_logger().error(
-                        f"E1 scenario runtime rejected exit transition for {state.agent_id}: "
-                        f"directive={directive.directive_type.value}"
+                    self._log_phase_wait(
+                        state,
+                        "waiting for adjacent SmartObject egress passage",
+                        now,
                     )
                     continue
-                promoted = None
-                if not self._scenario_takeover_enabled():
-                    promoted = self.resources.release(state.agent_id, state.resource_id)
-                elif self._scenario_adapter is not None:
-                    promoted = self.resources.resources[state.resource_id].occupied_by
-                state.current_phase = next_phase
-                state.target_pose = move_target
-                state.target_yaw = self._portal_exit_yaw() if use_exit_portal else exit_yaw
-                state.reached_deadline = self._estimate_arrival_deadline(
-                    state.current_pose,
-                    state.target_pose,
-                    state.velocity,
-                    now=now,
-                )
-                state.aligned_at_target = False
-                state.target_reached = False
-                self.get_logger().info(
-                    f"{state.agent_id} leaving {state.resource_id} for "
-                    f"{'exit staging' if use_exit_portal else 'direct walkable-map exit'}; "
-                    f"next queued={promoted}"
-                )
+                self._start_exit_motion(state, now)
                 continue
 
             if state.current_phase == "WALK_TO_EXIT_STAGING":
@@ -2849,6 +3103,13 @@ class ToiletDirectorNode(Node):
                                     self.motion_backend,
                                     "agent_radius_m",
                                     self.robot_yield_pedestrian_radius_m,
+                                )
+                            ),
+                            body_half_length_m=float(
+                                getattr(
+                                    self.motion_backend,
+                                    "agent_half_length_m",
+                                    0.0,
                                 )
                             ),
                             timestamp_sec=observed_at,

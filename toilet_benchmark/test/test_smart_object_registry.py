@@ -1,9 +1,13 @@
+import pytest
+
 from toilet_benchmark.scenario import (
     ClaimStatus,
     ObjectKind,
     SmartObject,
     SmartObjectRegistry,
     SmartObjectSlot,
+    OrientedRegion,
+    PassageStatus,
 )
 
 
@@ -78,3 +82,87 @@ def test_releasing_queued_claim_compacts_remaining_queue():
     remaining = registry.claim_for_agent("agent_03")
     assert remaining.queue_index == 0
     assert remaining.slot_id == "urinal_1:queue:1"
+
+
+def _oriented_urinal(object_id, x, *, passage_half_width=0.42):
+    return SmartObject(
+        object_id=object_id,
+        kind=ObjectKind.URINAL,
+        interaction_slots=(
+            SmartObjectSlot(
+                f"{object_id}:use",
+                (x, 1.0, 0.5 * 3.141592653589793),
+                occupancy_region=OrientedRegion(
+                    center_xy=(x, 1.0),
+                    yaw=0.5 * 3.141592653589793,
+                    half_length=0.42,
+                    half_width=0.26,
+                ),
+                passage_region=OrientedRegion(
+                    center_xy=(x, 0.55),
+                    yaw=0.5 * 3.141592653589793,
+                    half_length=0.45,
+                    half_width=passage_half_width,
+                ),
+            ),
+        ),
+    )
+
+
+def test_oriented_station_occupancy_does_not_block_non_overlapping_neighbor():
+    registry = SmartObjectRegistry(
+        (_oriented_urinal("urinal_1", 0.0), _oriented_urinal("urinal_2", 0.77))
+    )
+
+    assert registry.occupancy_conflicts("urinal_1") == ()
+    assert registry.claim("urinal_1", "agent_01").status == ClaimStatus.ACQUIRED
+    assert registry.claim("urinal_2", "agent_02").status == ClaimStatus.ACQUIRED
+
+
+def test_overlapping_oriented_station_occupancy_retries_after_owner_release():
+    registry = SmartObjectRegistry(
+        (_oriented_urinal("urinal_1", 0.0), _oriented_urinal("urinal_2", 0.40))
+    )
+    owner = registry.claim("urinal_1", "agent_01")
+
+    blocked = registry.claim("urinal_2", "agent_02")
+    assert blocked.status == ClaimStatus.REJECTED
+    assert blocked.reason == "oriented_occupancy_conflict"
+
+    registry.release(owner.claim_id)
+    assert registry.claim("urinal_2", "agent_02").status == ClaimStatus.ACQUIRED
+
+
+def test_adjacent_ingress_is_concurrent_but_egress_is_serialized():
+    registry = SmartObjectRegistry(
+        (_oriented_urinal("urinal_1", 0.0), _oriented_urinal("urinal_2", 0.77))
+    )
+
+    first = registry.acquire_passage("urinal_1", "agent_01", direction="ingress")
+    concurrent = registry.acquire_passage("urinal_2", "agent_02", direction="ingress")
+
+    assert registry.passage_conflicts("urinal_1") == ("urinal_2",)
+    assert first.status == PassageStatus.ACQUIRED
+    assert concurrent.status == PassageStatus.ACQUIRED
+
+    assert registry.release_passage("agent_01") is True
+    assert registry.release_passage("agent_02") is True
+    first_exit = registry.acquire_passage("urinal_1", "agent_01", direction="egress")
+    blocked = registry.acquire_passage("urinal_2", "agent_02", direction="egress")
+    assert first_exit.status == PassageStatus.ACQUIRED
+    assert blocked.status == PassageStatus.BLOCKED
+    assert blocked.blocked_by_agent_id == "agent_01"
+
+    assert registry.release_passage("agent_01") is True
+    resumed = registry.acquire_passage("urinal_2", "agent_02", direction="egress")
+    assert resumed.status == PassageStatus.ACQUIRED
+
+
+def test_passage_holding_pose_is_outside_the_arbitrated_corridor():
+    registry = SmartObjectRegistry((_oriented_urinal("urinal_1", 0.0),))
+
+    staging = registry.passage_staging_pose("urinal_1")
+    holding = registry.passage_holding_pose("urinal_1", offset_m=0.45)
+
+    assert staging == pytest.approx((0.0, 0.10, 0.5 * 3.141592653589793))
+    assert holding == pytest.approx((0.0, -0.35, 0.5 * 3.141592653589793))

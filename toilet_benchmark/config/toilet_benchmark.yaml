@@ -24,6 +24,16 @@ queue_policy:
 scenario_runtime:
   mode: shadow
   shadow_strict: false
+  smart_object_geometry:
+    # Canonical oriented human capsule used by local hard safety and semantic
+    # station occupancy. Keep these aligned with physx_diff_contact.yaml.
+    pedestrian_radius_m: 0.26
+    pedestrian_half_length_m: 0.16
+    # The passage is the body-width corridor immediately behind a station.
+    # Overlapping adjacent passages are tokenized; resource use remains concurrent.
+    passage_depth_m: 0.90
+    passage_clearance_m: 0.16
+    passage_holding_offset_m: 0.45
 
 director:
   live_pose_topic: /isaac/pedestrian_states
@@ -112,8 +122,9 @@ path_planner:
   # Global planning uses this oriented footprint instead of the conservative
   # circular robot_obstacle_radius_m. The circle remains for legacy yield
   # checks that do not have a heading-aware footprint.
-  robot_footprint_half_length_m: 0.36
-  robot_footprint_half_width_m: 0.27
+  # Matches the main bridge profile guard: 0.70 x 0.42 m plus 0.02 m margin.
+  robot_footprint_half_length_m: 0.37
+  robot_footprint_half_width_m: 0.23
   robot_stationary_speed_threshold_mps: 0.05
   robot_stationary_soft_clearance_m: 0.05
   robot_moving_soft_clearance_m: 0.12
@@ -131,6 +142,7 @@ motion_backend:
   # --motion-backend local_motion; the default HuNav/Isaac behavior is unchanged.
   local_motion:
     compute_hz: 10.0
+    external_motion_topic: /isaac/pedestrian_external_motion
     state_timeout_sec: 0.5
     # MovePed is an asynchronous service. Keep the external command alive
     # across short service/Isaac frame stalls so locomotion does not alternate

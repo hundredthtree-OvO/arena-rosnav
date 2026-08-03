@@ -1,4 +1,4 @@
-"""Reservation-only Smart Objects for toilet resources and queues."""
+"""Smart Object ownership plus deterministic oriented-passage arbitration."""
 
 from __future__ import annotations
 
@@ -16,9 +16,51 @@ class ObjectKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class OrientedRegion:
+    """Planar oriented box used for semantic occupancy and passage conflicts."""
+
+    center_xy: tuple[float, float]
+    yaw: float
+    half_length: float
+    half_width: float
+
+    def __post_init__(self) -> None:
+        values = (*self.center_xy, self.yaw, self.half_length, self.half_width)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("oriented region values must be finite")
+        if self.half_length < 0.0 or self.half_width < 0.0:
+            raise ValueError("oriented region half extents must be non-negative")
+
+    def intersects(self, other: "OrientedRegion") -> bool:
+        axes = (*self._axes(), *other._axes())
+        delta = (
+            float(other.center_xy[0]) - float(self.center_xy[0]),
+            float(other.center_xy[1]) - float(self.center_xy[1]),
+        )
+        for axis in axes:
+            separation = abs(delta[0] * axis[0] + delta[1] * axis[1])
+            if separation > self._projection_radius(axis) + other._projection_radius(axis) + 1e-9:
+                return False
+        return True
+
+    def _axes(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        forward = (math.cos(float(self.yaw)), math.sin(float(self.yaw)))
+        return forward, (-forward[1], forward[0])
+
+    def _projection_radius(self, axis: tuple[float, float]) -> float:
+        forward, lateral = self._axes()
+        return (
+            self.half_length * abs(forward[0] * axis[0] + forward[1] * axis[1])
+            + self.half_width * abs(lateral[0] * axis[0] + lateral[1] * axis[1])
+        )
+
+
+@dataclass(frozen=True)
 class SmartObjectSlot:
     slot_id: str
     pose: tuple[float, float, float]
+    occupancy_region: OrientedRegion | None = None
+    passage_region: OrientedRegion | None = None
 
     def __post_init__(self) -> None:
         if not self.slot_id:
@@ -51,6 +93,21 @@ class ClaimStatus(str, Enum):
     ACQUIRED = "acquired"
     QUEUED = "queued"
     REJECTED = "rejected"
+
+
+class PassageStatus(str, Enum):
+    ACQUIRED = "acquired"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class PassageResult:
+    status: PassageStatus
+    object_id: str
+    agent_id: str
+    direction: str
+    blocked_by_agent_id: str | None = None
+    blocked_by_object_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +149,11 @@ class SmartObjectRegistry:
         self._owners: dict[str, dict[str, str]] = {}
         self._queues: dict[str, list[str]] = {}
         self._claim_sequence = 0
+        self._occupancy_conflicts: dict[str, set[str]] = {}
+        self._passage_conflicts: dict[str, set[str]] = {}
+        self._passage_by_object: dict[str, PassageResult] = {}
+        self._passage_by_agent: dict[str, PassageResult] = {}
+        self._occupied_agents: set[str] = set()
         for smart_object in objects:
             self.register(smart_object)
 
@@ -101,6 +163,17 @@ class SmartObjectRegistry:
         self._objects[smart_object.object_id] = smart_object
         self._owners[smart_object.object_id] = {}
         self._queues[smart_object.object_id] = []
+        self._occupancy_conflicts[smart_object.object_id] = set()
+        self._passage_conflicts[smart_object.object_id] = set()
+        for other_id, other in self._objects.items():
+            if other_id == smart_object.object_id:
+                continue
+            if self._objects_overlap(smart_object, other, passage=False):
+                self._occupancy_conflicts[smart_object.object_id].add(other_id)
+                self._occupancy_conflicts[other_id].add(smart_object.object_id)
+            if self._objects_overlap(smart_object, other, passage=True):
+                self._passage_conflicts[smart_object.object_id].add(other_id)
+                self._passage_conflicts[other_id].add(smart_object.object_id)
 
     def reset(self) -> None:
         self._claims: dict[str, _Claim] = {}
@@ -112,6 +185,9 @@ class SmartObjectRegistry:
             object_id: [] for object_id in self._objects
         }
         self._claim_sequence = 0
+        self._passage_by_object = {}
+        self._passage_by_agent = {}
+        self._occupied_agents = set()
 
     def get(self, object_id: str) -> SmartObject:
         try:
@@ -144,6 +220,17 @@ class SmartObjectRegistry:
                 )
             return self._to_result(existing)
 
+        blocked_by_occupancy = any(
+            self._owners[conflicting_id]
+            for conflicting_id in self._occupancy_conflicts[object_id]
+        )
+        if blocked_by_occupancy:
+            return ClaimResult(
+                ClaimStatus.REJECTED,
+                object_id,
+                agent_id,
+                reason="oriented_occupancy_conflict",
+            )
         free_slot = next(
             (
                 slot
@@ -174,12 +261,137 @@ class SmartObjectRegistry:
         claim_id = self._agent_claims.get(agent_id)
         return None if claim_id is None else self._to_result(self._claims[claim_id])
 
+    def occupancy_conflicts(self, object_id: str) -> tuple[str, ...]:
+        self.get(object_id)
+        return tuple(sorted(self._occupancy_conflicts[object_id]))
+
+    def passage_conflicts(self, object_id: str) -> tuple[str, ...]:
+        self.get(object_id)
+        return tuple(sorted(self._passage_conflicts[object_id]))
+
+    def passage_staging_pose(self, object_id: str) -> tuple[float, float, float] | None:
+        """Return the outer centerline of the object's local passage corridor."""
+        smart_object = self.get(object_id)
+        for slot in smart_object.interaction_slots:
+            region = slot.passage_region
+            if region is None:
+                continue
+            return (
+                float(region.center_xy[0]) - math.cos(region.yaw) * region.half_length,
+                float(region.center_xy[1]) - math.sin(region.yaw) * region.half_length,
+                float(region.yaw),
+            )
+        return None
+
+    def passage_holding_pose(
+        self,
+        object_id: str,
+        *,
+        offset_m: float,
+    ) -> tuple[float, float, float] | None:
+        """Return a waiting point behind the passage, outside its tokenized area."""
+        staging = self.passage_staging_pose(object_id)
+        if staging is None:
+            return None
+        offset = max(0.0, float(offset_m))
+        return (
+            float(staging[0]) - math.cos(float(staging[2])) * offset,
+            float(staging[1]) - math.sin(float(staging[2])) * offset,
+            float(staging[2]),
+        )
+
+    def requires_passage_arbitration(self, object_id: str) -> bool:
+        smart_object = self.get(object_id)
+        return any(
+            slot.passage_region is not None
+            for slot in smart_object.interaction_slots
+        )
+
+    def mark_occupied(self, agent_id: str) -> None:
+        claim = self.claim_for_agent(agent_id)
+        if claim is None or claim.status != ClaimStatus.ACQUIRED:
+            raise ValueError(f"{agent_id} has no acquired Smart Object claim")
+        self._occupied_agents.add(agent_id)
+
+    def mark_vacated(self, agent_id: str) -> None:
+        self._occupied_agents.discard(agent_id)
+
+    def acquire_passage(
+        self,
+        object_id: str,
+        agent_id: str,
+        *,
+        direction: str,
+    ) -> PassageResult:
+        self.get(object_id)
+        if direction not in {"ingress", "egress"}:
+            raise ValueError("passage direction must be ingress or egress")
+        existing = self._passage_by_agent.get(agent_id)
+        if existing is not None:
+            if existing.object_id == object_id and existing.direction == direction:
+                return existing
+            return PassageResult(
+                PassageStatus.BLOCKED,
+                object_id,
+                agent_id,
+                direction,
+                blocked_by_agent_id=existing.agent_id,
+                blocked_by_object_id=existing.object_id,
+            )
+        # Ingress is independent across resources so waiters are not parked in
+        # the shared aisle. Egress below briefly serializes overlapping lanes
+        # while bodies back away and turn; continuous local-motion geometry
+        # remains responsible for all other cross-object separation.
+        conflict_ids = {object_id}
+        if direction == "egress":
+            # Adjacent users may approach and use their resources in parallel,
+            # but two bodies turning/backing out of overlapping station lanes
+            # need a short deterministic order.
+            conflict_ids.update(self._passage_conflicts[object_id])
+        blocker = next(
+            (
+                self._passage_by_object[conflict_id]
+                for conflict_id in sorted(conflict_ids)
+                if conflict_id in self._passage_by_object
+            ),
+            None,
+        )
+        if blocker is not None:
+            return PassageResult(
+                PassageStatus.BLOCKED,
+                object_id,
+                agent_id,
+                direction,
+                blocked_by_agent_id=blocker.agent_id,
+                blocked_by_object_id=blocker.object_id,
+            )
+        result = PassageResult(
+            PassageStatus.ACQUIRED,
+            object_id,
+            agent_id,
+            direction,
+        )
+        self._passage_by_object[object_id] = result
+        self._passage_by_agent[agent_id] = result
+        return result
+
+    def release_passage(self, agent_id: str) -> bool:
+        result = self._passage_by_agent.pop(agent_id, None)
+        if result is None:
+            return False
+        self._passage_by_object.pop(result.object_id, None)
+        return True
+
+    def passage_for_agent(self, agent_id: str) -> PassageResult | None:
+        return self._passage_by_agent.get(agent_id)
+
     def release(self, claim_id: str, *, reason: str | None = None) -> ReleaseResult:
         del reason  # Reserved for audit adapters; registry semantics do not depend on it.
         claim = self._claims.get(claim_id)
         if claim is None:
             return ReleaseResult(False, "", "")
         smart_object = self._objects[claim.object_id]
+        self._occupied_agents.discard(claim.agent_id)
         promoted: _Claim | None = None
 
         if claim.status == ClaimStatus.ACQUIRED:
@@ -257,4 +469,48 @@ class SmartObjectRegistry:
             claim_id=claim.claim_id,
             slot_id=claim.slot_id,
             queue_index=queue_index,
+        )
+
+    @staticmethod
+    def _objects_overlap(
+        first: SmartObject,
+        second: SmartObject,
+        *,
+        passage: bool,
+    ) -> bool:
+        first_occupancy = tuple(
+            region
+            for slot in first.interaction_slots
+            if (region := slot.occupancy_region) is not None
+        )
+        second_occupancy = tuple(
+            region
+            for slot in second.interaction_slots
+            if (region := slot.occupancy_region) is not None
+        )
+        if not passage:
+            return any(
+                a.intersects(b)
+                for a in first_occupancy
+                for b in second_occupancy
+            )
+        first_passage = tuple(
+            region
+            for slot in first.interaction_slots
+            if (region := slot.passage_region) is not None
+        )
+        second_passage = tuple(
+            region
+            for slot in second.interaction_slots
+            if (region := slot.passage_region) is not None
+        )
+        return any(
+            a.intersects(b)
+            for first_regions, second_regions in (
+                (first_passage, second_passage),
+                (first_passage, second_occupancy),
+                (first_occupancy, second_passage),
+            )
+            for a in first_regions
+            for b in second_regions
         )

@@ -20,6 +20,9 @@ class AgentSnapshot:
     vy: float = 0.0
     wz: float = 0.0
     radius_m: float = 0.3
+    body_half_length_m: float = 0.0
+    box_half_length_m: float = 0.0
+    box_half_width_m: float = 0.0
     timestamp_sec: float = 0.0
     source: str = "unknown"
 
@@ -37,12 +40,20 @@ class AgentSnapshot:
             self.vy,
             self.wz,
             self.radius_m,
+            self.body_half_length_m,
+            self.box_half_length_m,
+            self.box_half_width_m,
             self.timestamp_sec,
         )
         if not all(math.isfinite(float(value)) for value in numeric_values):
             raise ValueError("agent snapshot values must be finite")
-        if self.radius_m < 0.0:
-            raise ValueError("radius_m must be non-negative")
+        if min(
+            self.radius_m,
+            self.body_half_length_m,
+            self.box_half_length_m,
+            self.box_half_width_m,
+        ) < 0.0:
+            raise ValueError("agent geometry dimensions must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +66,9 @@ class AgentSnapshot:
             "vy": float(self.vy),
             "wz": float(self.wz),
             "radius_m": float(self.radius_m),
+            "body_half_length_m": float(self.body_half_length_m),
+            "box_half_length_m": float(self.box_half_length_m),
+            "box_half_width_m": float(self.box_half_width_m),
             "timestamp_sec": float(self.timestamp_sec),
             "source": self.source,
         }
@@ -71,6 +85,9 @@ class AgentSnapshot:
             vy=float(value.get("vy", 0.0)),
             wz=float(value.get("wz", 0.0)),
             radius_m=float(value.get("radius_m", 0.3)),
+            body_half_length_m=float(value.get("body_half_length_m", 0.0)),
+            box_half_length_m=float(value.get("box_half_length_m", 0.0)),
+            box_half_width_m=float(value.get("box_half_width_m", 0.0)),
             timestamp_sec=float(value.get("timestamp_sec", 0.0)),
             source=str(value.get("source", "unknown")),
         )

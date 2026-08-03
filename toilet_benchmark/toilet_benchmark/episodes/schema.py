@@ -35,6 +35,31 @@ def _numeric_tuple(value: Sequence[Any], length: int, field_name: str) -> tuple[
 
 
 @dataclass(frozen=True)
+class PedestrianHoldSpec:
+    waypoint_index: int
+    duration_sec: float
+
+    def __post_init__(self) -> None:
+        if int(self.waypoint_index) < 0:
+            raise ValueError("pedestrian hold waypoint_index must be non-negative")
+        if float(self.duration_sec) <= 0.0:
+            raise ValueError("pedestrian hold duration_sec must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "waypoint_index": int(self.waypoint_index),
+            "duration_sec": float(self.duration_sec),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "PedestrianHoldSpec":
+        return cls(
+            waypoint_index=int(value["waypoint_index"]),
+            duration_sec=float(value["duration_sec"]),
+        )
+
+
+@dataclass(frozen=True)
 class RobotEpisodeSpec:
     model: str
     start_pose: tuple[float, float, float, float]
@@ -91,6 +116,10 @@ class PedestrianEpisodeSpec:
     character: str | None = None
     start_reference: str | None = None
     start_pose: tuple[float, float, float] | None = None
+    start_yaw: float | None = None
+    route_waypoints: tuple[tuple[float, float, float], ...] = ()
+    holds: tuple[PedestrianHoldSpec, ...] = ()
+    constrain_to_path: bool = False
     behavior: PedestrianBehaviorSpec = field(default_factory=PedestrianBehaviorSpec)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,11 +134,20 @@ class PedestrianEpisodeSpec:
             value["start_reference"] = self.start_reference
         if self.start_pose is not None:
             value["start_pose"] = list(self.start_pose)
+        if self.start_yaw is not None:
+            value["start_yaw"] = float(self.start_yaw)
+        if self.route_waypoints:
+            value["route_waypoints"] = [list(point) for point in self.route_waypoints]
+        if self.holds:
+            value["holds"] = [hold.to_dict() for hold in self.holds]
+        if self.constrain_to_path:
+            value["constrain_to_path"] = True
         return value
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PedestrianEpisodeSpec":
         start_pose = value.get("start_pose")
+        route_waypoints = value.get("route_waypoints", ())
         return cls(
             agent_id=str(value["agent_id"]),
             semantic_goal=str(value["semantic_goal"]),
@@ -124,6 +162,20 @@ class PedestrianEpisodeSpec:
                 if start_pose is not None
                 else None
             ),
+            start_yaw=(
+                float(value["start_yaw"])
+                if value.get("start_yaw") is not None
+                else None
+            ),
+            route_waypoints=tuple(
+                _numeric_tuple(point, 3, "pedestrian.route_waypoint")
+                for point in route_waypoints
+            ),
+            holds=tuple(
+                PedestrianHoldSpec.from_mapping(item)
+                for item in value.get("holds", ())
+            ),
+            constrain_to_path=bool(value.get("constrain_to_path", False)),
             behavior=PedestrianBehaviorSpec.from_mapping(value.get("behavior", {})),
         )
 

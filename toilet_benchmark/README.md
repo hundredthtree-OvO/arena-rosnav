@@ -9,6 +9,11 @@ benchmark 已完成。
 完整文档入口见 [`docs/README.md`](docs/README.md)，内部控制权和冻结接口以
 [`pedestrian_ecosystem_architecture_cn.md`](docs/pedestrian_ecosystem_architecture_cn.md)
 为准。
+路线编辑器和运行链路清理的执行边界见
+[`docs/route_editor_runtime_cleanup_plan_cn.md`](docs/route_editor_runtime_cleanup_plan_cn.md)。
+阶段 3 的独立 Qt 2D Route Editor 位于同一仓库的 sibling 包
+`toilet_benchmark_ui`，不属于核心 benchmark 运行时依赖；RViz 继续用于 LiDAR、TF
+和 3D 场景诊断。
 
 ## 当前边界
 

@@ -179,6 +179,93 @@ Sampled RVO 不再只做动态碰撞二值过滤：安全候选还会惩罚低�
 3. 修复门口视觉包络连续命中，穿模 gate 通过前不得提升为默认 backend；
 4. 将 `0.31 m/s` 保留为当前隔离基线，另做 `0.6/0.9/1.2 m/s` 直线与转弯标定。
 
+### 2.5 有向硬几何与 SmartObject 通行契约
+
+已完成第一版统一，不再用一个圆同时代表底盘、人体站位和社会距离：
+
+- 机器人硬几何为有向矩形，主链路采用 `forward/rear=0.37 m`、
+  `left/right=0.23 m`，与 `physx_diff_contact` profile 的 `0.70 x 0.42 m`
+  footprint 加 `0.02 m` margin 一致；
+- 行人硬几何为有向胶囊，`radius=0.26 m`、`half_length=0.16 m`。bridge
+  对机器人做连续 box-capsule 扫掠，local-motion 对机器人和 peer 使用同一形状语义；
+- `sampled_rvo.dynamic_clearance_target_m` 仍是软舒适距离，可以随静态净空收缩；
+  有向胶囊、机器人矩形和静态 swept envelope 是硬边界，不随拥挤度缩小；
+- SmartObject interaction slot 会生成最终人体占用 OBB；只有两个最终占用 OBB
+  真实相交时才拒绝并发 claim；
+- interaction slot 后方另生成 passage OBB。相邻 passage 或 passage 与已激活的占用
+  OBB 相交时，`ScenarioRuntime` 分别为 ingress/egress 发 token；SmartObject claim
+  只是预订，只有 agent 到达并开始使用后才成为真实人体占用；
+- 通行采用局部 staging，而不是从入口预订整条路线：agent 先走全局路线到 passage
+  外沿，取得 ingress token 后才进入最终站位；离开时取得 egress token，走到同一
+  staging 后立即释放，再重接出口路线。因此 token 只串行化冲突局部段，不会把
+  入口到小便池或小便池到出口的整段运动串行化；
+- takeover 下，`WAIT_AT_QUEUE` 与 `WAIT_FOR_PASSAGE` 是两个显式指令。前者表示资源
+  容量排队，后者表示已经到达局部 staging 但通道仍被占用；未取得 token 时 director
+  不得因为 legacy `occupied_by` 已同步就提前下发最终站位路径。
+
+配置面位于 `toilet_benchmark.yaml:scenario_runtime.smart_object_geometry`；bridge 对应值位于
+`scripts/profiles/modes/physx_diff_contact.yaml:pedestrians.hard_body_*`。这两处是同一契约的
+进程边界表示，修改人体尺寸时必须同时更新并运行 profile wiring 与 ScenarioRuntime 测试。
+场景中的通道方向位于 `toilet_semantics.yaml:urinals[*].smart_object_geometry`：
+`body_yaw` 表示最终人体包络朝向，`passage_yaw` 表示从室内 staging 指向站位的通道轴。
+这两个几何角度不得复用 AnimGraph 的角色 root yaw；后者可能包含模型局部朝向补偿。
+
+当前仍保留两个验收边界：默认配置还是 `scenario_runtime.mode: shadow`，现场验证 passage
+仲裁必须显式使用 `--scenario-runtime takeover`。早期固定 seed `12345` 的 4 人 smoke 曾出现
+4/4 完成，但该结果没有覆盖等待者占据相邻 egress 和高频 service 传输饱和，不能视为 passage
+生命周期已经通过。
+
+该 smoke 的视觉外包络 gate 仍未通过：39 个静态重叠样本、最长连续 7 帧，local-motion
+还记录到最小 peer clearance `-0.18 m`。这不是重新放宽 SmartObject token 的理由；它表明
+规划层胶囊契约到 AnimGraph 实际 root/骨骼扫掠之间仍缺少最终 embodiment 闭环。后续应在
+bridge 对实际 pedestrian-pedestrian 与 pedestrian-static 扫掠做同形状裁剪，并收紧既有
+static overlap-recovery，而不是继续扩大社会力或 SmartObject passage OBB。
+
+### 2.6 四人失败基线与流式控制/安全等待修正（2026-08-02）
+
+复测目录：
+
+```text
+/tmp/toilet_pipeline_runs/20260802_151721_regular_disabled
+```
+
+该轮在 240 秒后超时：只有 `toilet_agent_02` 完成退出，`agent_01` 停在 `EXITING`，
+`agent_03` 停在 `WALK_FROM_PASSAGE`，`agent_04` 在相邻资源 passage 外沿等待且未到达目标。
+240 个 local-motion 诊断中有 41 个不可行，`agent_03` 可行率仅 `58.8%`；视觉外包络
+出现 75 个静态重叠样本、最长连续 39 帧。该结果确认两个独立根因：
+
+- ingress token 在 agent 到达 passage staging 后才申请，失败者会直接停在相邻 egress 的
+  实体通道中；
+- local-motion 以每人 10 Hz 通过 `MovePed` service 发送逐帧 external-motion，240/240 个
+  诊断采样均有 service inflight，四人控制无法维持稳定闭环。
+
+第一轮修正保持冻结接口不变：
+
+- local-motion 通过 `/isaac/pedestrian_external_motion` 发布一个 `KEEP_LAST(1)`、
+  `BEST_EFFORT` 的 JSON batch；一个 world tick 的所有 active agent 共用一个消息，带
+  `stream_id + sequence`，bridge 丢弃旧批次。`MovePed` 只保留低频路径、stop 和 direct-pose
+  兼容命令；
+- executive 在任务分配时先申请 ingress token。成功者直接前往 interaction pose；失败者才
+  前往 passage 外的 holding pose。holding 默认比 passage 外沿再后退 `0.45 m`，不会停在
+  tokenized corridor 上；egress 仍走原 staging 并在清空后释放 token。
+
+这两个修正只消除通信饱和和确定性局部互锁，不宣称 sampled-RVO 已达到自然多人运动门槛。
+下一次 live gate 必须分别检查 stream 状态持续发布、holding 不占 egress、走停次数和视觉
+穿模；通过后才评估严格 ORCA/HRVO 或短时域轨迹优化器。
+
+2026-08-02 四人固定目标复测进一步收窄了 SmartObject 边界：不同资源的 ingress 不再共享
+房间级 passage lock，四人可以并行进入并使用不同小便池；相邻资源只在 egress 的后退/转身
+阶段短时串行，到达 passage staging 后立即释放。此前把相邻使用者的整个 service time 当作
+通道锁，会把等待者停在主通道并制造同步走停和闭环死锁。
+
+同次复测还修复了 external-motion 的静态硬安全漏洞：几何层返回的 partial overlap recovery
+不能按原始完整速度执行，否则会越过裁剪位置继续加深穿模。当前 sampled-RVO 只接受完整可
+执行的恢复步。扩大静止机器人全局 soft clearance 的尝试会把多人路线共同挤向墙面，已经
+撤销。固定原点机器人四人复测还确认多个 EXITING actor 会在室内走廊形成对称死锁，因此
+稳定基线把已有 `serialize_exit_corridor` 的获取点前移到 SmartObject egress：资源使用仍
+并行，离场一次放行一人，令牌在完成 portal crossing 后释放。该保守策略用于数采基线，
+后续由基于相位/走廊的确定性通行优先级替换，而不是继续增加统一安全半径。
+
 ## 3. 微场景矩阵
 
 所有 local backend 必须在相同世界快照、目标和随机 seed 下运行：

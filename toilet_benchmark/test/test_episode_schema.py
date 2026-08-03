@@ -9,6 +9,11 @@ from toilet_benchmark.episodes.schema import (
     BENCHMARK_SCHEMA_VERSION,
     CollisionPolicy,
     EpisodeSpec,
+    PedestrianBehaviorSpec,
+    PedestrianEpisodeSpec,
+    PedestrianHoldSpec,
+    RobotEpisodeSpec,
+    TerminationSpec,
     TrackType,
     episode_from_manual_selection,
 )
@@ -130,7 +135,47 @@ class TestEpisodeSchema(unittest.TestCase):
                 track="unknown",
             )
 
+    def test_authored_routes_and_holds_round_trip(self):
+        episode = EpisodeSpec(
+            episode_id="narrow_head_on",
+            scene_id="shenxinfu_841837",
+            task_type="authored_route",
+            track=TrackType.INTERACTIVE,
+            seed=42,
+            robot=RobotEpisodeSpec(
+                model="xms_mecanum",
+                start_pose=(0.0, -1.5, 0.03, 0.0),
+                goal_pose=(0.0, -1.5, 0.0),
+            ),
+            pedestrians=(
+                PedestrianEpisodeSpec(
+                    agent_id="toilet_agent_01",
+                    semantic_goal="route_terminal",
+                    character="character_a",
+                    start_pose=(-3.8, -0.9, 0.0),
+                    start_yaw=0.0,
+                    route_waypoints=(
+                        (-3.8, -0.9, 0.0),
+                        (-2.5, -0.9, 0.0),
+                        (-1.5, -0.9, 0.0),
+                    ),
+                    holds=(PedestrianHoldSpec(waypoint_index=1, duration_sec=2.0),),
+                    constrain_to_path=True,
+                    behavior=PedestrianBehaviorSpec(walking_speed_mps=0.8),
+                ),
+            ),
+            termination=TerminationSpec(timeout_sec=60.0, goal_tolerance_m=0.3),
+            assets={"walkable_map": "shenxinfu_841837.walkable.json"},
+        )
+
+        payload = episode.to_dict()
+        restored = EpisodeSpec.from_mapping(payload)
+
+        self.assertEqual(restored, episode)
+        self.assertEqual(payload["pedestrians"][0]["start_yaw"], 0.0)
+        self.assertEqual(payload["pedestrians"][0]["holds"][0]["waypoint_index"], 1)
+        self.assertTrue(payload["pedestrians"][0]["constrain_to_path"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

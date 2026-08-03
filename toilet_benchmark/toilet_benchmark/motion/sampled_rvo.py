@@ -170,6 +170,23 @@ class SampledRvoLocalMotion:
         backward_rejected_count = len(safe) - len(forward_safe)
         if forward_safe:
             safe = forward_safe
+        elif not self._has_current_overlap(request.agent, neighbors):
+            return LocalMotionResult(
+                velocity_xy=(0.0, 0.0),
+                heading_rad=request.agent.yaw,
+                feasible=False,
+                reason="yielding: no forward collision-free velocity",
+                diagnostics={
+                    "candidate_count": len(candidates),
+                    "safe_candidate_count": geometry_safe_count,
+                    "neighbor_count": len(neighbors),
+                    "boundary_candidate_count": boundary_candidate_count,
+                    "dynamic_rejected_count": len(candidates) - len(dynamic_safe),
+                    "static_rejected_count": len(dynamic_safe) - geometry_safe_count,
+                    "backward_rejected_count": backward_rejected_count,
+                    "yielding_without_reverse": True,
+                },
+            )
         if not safe:
             return LocalMotionResult(
                 velocity_xy=(0.0, 0.0),
@@ -420,13 +437,15 @@ class SampledRvoLocalMotion:
             )
         except RuntimeError:
             return False, -math.inf
+        # The external-motion adapter executes the sampled velocity itself; it
+        # does not consume GeometrySafetyResult.position_xy.  Accepting a
+        # partially clipped recovery would therefore apply the *unclipped*
+        # velocity and can deepen a static overlap.  A recovery candidate is
+        # safe here only when its complete step is monotonic and executable.
         accepted = bool(
-            result.recovering_overlap
-            or (
-                not result.clipped
-                and result.applied_fraction
-                >= float(self.config.geometry_min_fraction)
-            )
+            not result.clipped
+            and result.applied_fraction
+            >= float(self.config.geometry_min_fraction)
         )
         return accepted, float(result.minimum_clearance_m)
 
@@ -465,13 +484,14 @@ class SampledRvoLocalMotion:
         )
         for neighbor in neighbors:
             relative_position = (neighbor.x - agent.x, neighbor.y - agent.y)
-            current_distance = math.hypot(*relative_position)
-            required = (
-                agent.radius_m
-                + neighbor.radius_m
-                + max(0.0, float(self.config.clearance_m))
+            current_clearance = self._pair_clearance(
+                agent,
+                (agent.x, agent.y),
+                agent.yaw,
+                neighbor,
+                (neighbor.x, neighbor.y),
+                neighbor.yaw,
             )
-            current_clearance = current_distance - required
             if current_clearance >= -1e-9:
                 predicted_clearance = self._dynamic_clearance(
                     agent,
@@ -500,11 +520,21 @@ class SampledRvoLocalMotion:
                 and str(agent.agent_id) < str(neighbor.agent_id)
             ):
                 return False, min(minimum_clearance, current_clearance), recovering_neighbors
-            future_distance = math.hypot(
-                relative_position[0] + relative_velocity[0] * recovery_horizon,
-                relative_position[1] + relative_velocity[1] * recovery_horizon,
+            future_clearance = self._pair_clearance(
+                agent,
+                (
+                    agent.x + velocity[0] * recovery_horizon,
+                    agent.y + velocity[1] * recovery_horizon,
+                ),
+                self._velocity_heading(velocity, agent.yaw),
+                neighbor,
+                (
+                    neighbor.x + neighbor.vx * recovery_horizon,
+                    neighbor.y + neighbor.vy * recovery_horizon,
+                ),
+                self._velocity_heading((neighbor.vx, neighbor.vy), neighbor.yaw),
             )
-            separation_gain = future_distance - current_distance
+            separation_gain = future_clearance - current_clearance
             separation_rate = (
                 relative_position[0] * relative_velocity[0]
                 + relative_position[1] * relative_velocity[1]
@@ -553,16 +583,185 @@ class SampledRvoLocalMotion:
                 else 0.0
             )
             closest = (
-                relative_position[0] + relative_velocity[0] * closest_time,
-                relative_position[1] + relative_velocity[1] * closest_time,
+                agent.x + velocity[0] * closest_time,
+                agent.y + velocity[1] * closest_time,
             )
-            required = (
-                agent.radius_m
-                + neighbor.radius_m
-                + max(0.0, float(self.config.clearance_m))
+            neighbor_closest = (
+                neighbor.x + neighbor.vx * closest_time,
+                neighbor.y + neighbor.vy * closest_time,
             )
-            minimum = min(minimum, math.hypot(*closest) - required)
+            minimum = min(
+                minimum,
+                self._pair_clearance(
+                    agent,
+                    closest,
+                    self._velocity_heading(velocity, agent.yaw),
+                    neighbor,
+                    neighbor_closest,
+                    self._velocity_heading((neighbor.vx, neighbor.vy), neighbor.yaw),
+                ),
+            )
         return minimum
+
+    def _has_current_overlap(
+        self,
+        agent: AgentSnapshot,
+        neighbors: tuple[AgentSnapshot, ...],
+    ) -> bool:
+        return any(
+            self._pair_clearance(
+                agent,
+                (agent.x, agent.y),
+                agent.yaw,
+                neighbor,
+                (neighbor.x, neighbor.y),
+                neighbor.yaw,
+            )
+            < -1e-9
+            for neighbor in neighbors
+        )
+
+    def _pair_clearance(
+        self,
+        agent: AgentSnapshot,
+        agent_xy: Point2D,
+        agent_yaw: float,
+        neighbor: AgentSnapshot,
+        neighbor_xy: Point2D,
+        neighbor_yaw: float,
+    ) -> float:
+        margin = max(0.0, float(self.config.clearance_m))
+        if neighbor.box_half_length_m > 0.0 and neighbor.box_half_width_m > 0.0:
+            return self._capsule_box_clearance(
+                capsule=agent,
+                capsule_xy=agent_xy,
+                capsule_yaw=agent_yaw,
+                box=neighbor,
+                box_xy=neighbor_xy,
+                box_yaw=neighbor_yaw,
+            ) - margin
+        first = self._capsule_segment(agent, agent_xy, agent_yaw)
+        second = self._capsule_segment(neighbor, neighbor_xy, neighbor_yaw)
+        return (
+            self._segment_distance(first[0], first[1], second[0], second[1])
+            - float(agent.radius_m)
+            - float(neighbor.radius_m)
+            - margin
+        )
+
+    @staticmethod
+    def _velocity_heading(velocity: Point2D, fallback: float) -> float:
+        return (
+            float(fallback)
+            if math.hypot(*velocity) <= 0.03
+            else math.atan2(float(velocity[1]), float(velocity[0]))
+        )
+
+    @staticmethod
+    def _capsule_segment(
+        actor: AgentSnapshot,
+        position: Point2D,
+        yaw: float,
+    ) -> tuple[Point2D, Point2D]:
+        offset_x = float(actor.body_half_length_m) * math.cos(float(yaw))
+        offset_y = float(actor.body_half_length_m) * math.sin(float(yaw))
+        return (
+            (float(position[0]) - offset_x, float(position[1]) - offset_y),
+            (float(position[0]) + offset_x, float(position[1]) + offset_y),
+        )
+
+    def _capsule_box_clearance(
+        self,
+        *,
+        capsule: AgentSnapshot,
+        capsule_xy: Point2D,
+        capsule_yaw: float,
+        box: AgentSnapshot,
+        box_xy: Point2D,
+        box_yaw: float,
+    ) -> float:
+        start, end = self._capsule_segment(capsule, capsule_xy, capsule_yaw)
+        half_length = max(0.01, float(capsule.body_half_length_m))
+        spacing = 0.05
+        samples = max(2, int(math.ceil((2.0 * half_length) / spacing)))
+        minimum = math.inf
+        c = math.cos(float(box_yaw))
+        s = math.sin(float(box_yaw))
+        for index in range(samples + 1):
+            fraction = index / samples
+            point = (
+                start[0] + (end[0] - start[0]) * fraction,
+                start[1] + (end[1] - start[1]) * fraction,
+            )
+            dx = point[0] - float(box_xy[0])
+            dy = point[1] - float(box_xy[1])
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+            outside_x = max(abs(local_x) - float(box.box_half_length_m), 0.0)
+            outside_y = max(abs(local_y) - float(box.box_half_width_m), 0.0)
+            if outside_x > 0.0 or outside_y > 0.0:
+                signed_distance = math.hypot(outside_x, outside_y)
+            else:
+                signed_distance = -min(
+                    float(box.box_half_length_m) - abs(local_x),
+                    float(box.box_half_width_m) - abs(local_y),
+                )
+            minimum = min(minimum, signed_distance)
+        return minimum - float(capsule.radius_m)
+
+    @classmethod
+    def _segment_distance(
+        cls,
+        a0: Point2D,
+        a1: Point2D,
+        b0: Point2D,
+        b1: Point2D,
+    ) -> float:
+        if cls._segments_intersect(a0, a1, b0, b1):
+            return 0.0
+        return min(
+            cls._point_segment_distance(a0, b0, b1),
+            cls._point_segment_distance(a1, b0, b1),
+            cls._point_segment_distance(b0, a0, a1),
+            cls._point_segment_distance(b1, a0, a1),
+        )
+
+    @staticmethod
+    def _point_segment_distance(point: Point2D, start: Point2D, end: Point2D) -> float:
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            return math.dist(point, start)
+        fraction = max(
+            0.0,
+            min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_sq),
+        )
+        return math.hypot(
+            point[0] - (start[0] + fraction * dx),
+            point[1] - (start[1] + fraction * dy),
+        )
+
+    @staticmethod
+    def _segments_intersect(a0: Point2D, a1: Point2D, b0: Point2D, b1: Point2D) -> bool:
+        def cross(origin, first, second):
+            return (
+                (first[0] - origin[0]) * (second[1] - origin[1])
+                - (first[1] - origin[1]) * (second[0] - origin[0])
+            )
+
+        c1 = cross(a0, a1, b0)
+        c2 = cross(a0, a1, b1)
+        c3 = cross(b0, b1, a0)
+        c4 = cross(b0, b1, a1)
+        if max(abs(c1), abs(c2), abs(c3), abs(c4)) <= 1e-9:
+            return not (
+                max(a0[0], a1[0]) < min(b0[0], b1[0]) - 1e-9
+                or max(b0[0], b1[0]) < min(a0[0], a1[0]) - 1e-9
+                or max(a0[1], a1[1]) < min(b0[1], b1[1]) - 1e-9
+                or max(b0[1], b1[1]) < min(a0[1], a1[1]) - 1e-9
+            )
+        return c1 * c2 <= 0.0 and c3 * c4 <= 0.0
 
     def _score_velocity(
         self,

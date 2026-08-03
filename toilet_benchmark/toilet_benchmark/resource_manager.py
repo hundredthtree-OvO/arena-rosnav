@@ -17,6 +17,8 @@ class Resource:
     category: str
     position: list[float]
     yaw: float = 0.0
+    body_yaw: float | None = None
+    passage_yaw: float | None = None
     scene_prim: str = ""
     queue_slots: list[QueueSlot] = field(default_factory=list)
     occupied_by: str | None = None

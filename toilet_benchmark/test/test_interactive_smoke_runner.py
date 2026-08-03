@@ -398,6 +398,7 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         self.assertEqual(_robot_intervention_arg("dynamic-crossing"), "dynamic_crossing")
         self.assertEqual(_robot_intervention_arg("dynamic_crossing"), "dynamic_crossing")
         self.assertEqual(_robot_intervention_arg("parked-away"), "parked_away")
+        self.assertEqual(_robot_intervention_arg("fixed-origin"), "fixed_origin")
         self.assertEqual(
             _robot_intervention_arg("occupied-passage"),
             "occupied_passage",
@@ -445,6 +446,14 @@ class InteractiveSmokeRunnerTests(unittest.TestCase):
         self.assertEqual(resolved.reset_pose[:3], (0.0, -0.8, 0.03))
         self.assertAlmostEqual(resolved.reset_pose[3], math.pi / 2.0)
         self.assertEqual(resolved.motion_sec, 5.0)
+
+    def test_default_smoke_targets_distinct_resources_for_multi_agent_runs(self):
+        parsed = _build_parser().parse_args([])
+
+        self.assertEqual(
+            parsed.target_resource,
+            "urinal_1,urinal_2,urinal_3,urinal_4",
+        )
 
     def test_dynamic_crossing_profile_resolution_honors_selection_and_overrides(self):
         clear_profile, clear_name = resolve_dynamic_crossing_profile("crossing_clear")

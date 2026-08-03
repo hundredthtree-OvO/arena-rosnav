@@ -37,6 +37,7 @@ setup(
             "hunav_phase0_smoke = toilet_benchmark.hunav_phase0_smoke:main",
             "hunav_isaac_mirror = toilet_benchmark.hunav_isaac_mirror:main",
             "walkable_map_publisher = toilet_benchmark.walkable_map:main",
+            "toilet_authored_scenario = toilet_benchmark.tracks.authored_scenario:main",
         ]
     },
 )

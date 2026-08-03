@@ -181,6 +181,8 @@ class EmbodimentPort(Protocol):
 - `RoutePlan` 是静态/语义可行路线，带 map/version hash，不包含动画状态。
 - `LocalMotionResult` 返回速度、heading、可行性和结构化诊断，不直接写场景。
 - `MotionCommand` 是 motion 到 embodiment 的唯一运动命令。
+- 高频 interactive motion 必须批量、latest-only 传输；ROS service 只承载低频生命周期或
+  离散命令，不能作为多人逐帧速度控制总线。
 
 ## 5. 随机性与复现
 
@@ -288,6 +290,11 @@ backend，并在 HuNav 原始输出之后、GeometrySafety 之前建立默认关
 shadow 只比较相同世界快照下的速度结果，不改变 Isaac motion authority。该候选目前是
 dependency-free 几何基线，不宣称实现完整 ORCA；只有通过固定微场景和 Isaac visual
 envelope gate 后，才允许以显式配置进入 takeover。
+
+2026-08-02 的四人复测进一步冻结两条约束：局部 passage 的 admission 必须发生在冲突区
+之外，被阻挡者只能停在显式 holding region；所有 active agent 的逐帧 `MotionCommand` 必须
+作为同一 world tick 的批次交给 embodiment，禁止恢复逐人高频 service 往返。当前 sampled
+velocity-obstacle 仍是 E2 对照基线，不是 Interactive 默认解。
 
 ### E3：表现层
 

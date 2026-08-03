@@ -2086,6 +2086,7 @@ def _robot_intervention_arg(value: str) -> str:
     allowed = {
         "none",
         "parked_away",
+        "fixed_origin",
         "crossing",
         "dynamic_crossing",
         "occupied_passage",
@@ -2093,7 +2094,7 @@ def _robot_intervention_arg(value: str) -> str:
     if normalized not in allowed:
         raise argparse.ArgumentTypeError(
             "robot intervention must be one of: "
-            "none, parked_away, crossing, dynamic_crossing, occupied_passage"
+            "none, parked_away, fixed_origin, crossing, dynamic_crossing, occupied_passage"
         )
     return normalized
 
@@ -2190,7 +2191,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override arrival.seed in the isolated per-run benchmark YAML.",
     )
-    parser.add_argument("--target-resource", default="urinal_1")
+    parser.add_argument(
+        "--target-resource",
+        default="urinal_1,urinal_2,urinal_3,urinal_4",
+        help=(
+            "Comma-separated deterministic resource order. Multiple agents rotate "
+            "through this list; pass one id explicitly for a queue stress test."
+        ),
+    )
     parser.add_argument("--initial-agents", type=int, default=1)
     parser.add_argument(
         "--scenario-runtime",
@@ -2508,6 +2516,24 @@ def main(args: Sequence[str] | None = None) -> int:
                 event="robot_parked_away_pose_requested",
             ):
                 raise RuntimeError("robot parked-away intervention was rejected")
+            time.sleep(max(0.0, parsed.intervention_settle_sec))
+            director_code = run_logged(
+                director_cmd,
+                cwd=paths.workspace,
+                env=env,
+                log_path=director_log,
+                timeout_sec=parsed.director_timeout_sec,
+            )
+        elif robot_intervention == "fixed_origin":
+            wait_for_robot_reset_service(env)
+            if not reset_robot_for_intervention(
+                parsed.intervention_blocking_pose,
+                cwd=paths.workspace,
+                env=env,
+                event_log=intervention_log,
+                event="robot_fixed_origin_pose_requested",
+            ):
+                raise RuntimeError("robot fixed-origin intervention was rejected")
             time.sleep(max(0.0, parsed.intervention_settle_sec))
             director_code = run_logged(
                 director_cmd,

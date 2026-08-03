@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from typing import Iterable, Mapping, Protocol
 
 from toilet_benchmark.domain.events import BenchmarkEvent
@@ -18,7 +19,13 @@ from toilet_benchmark.episodes.schema import (
 )
 
 from .runtime import RuntimeTickResult, ScenarioRuntime
-from .smart_objects import ObjectKind, SmartObject, SmartObjectRegistry, SmartObjectSlot
+from .smart_objects import (
+    ObjectKind,
+    OrientedRegion,
+    SmartObject,
+    SmartObjectRegistry,
+    SmartObjectSlot,
+)
 from .templates import EnterUseExit
 
 
@@ -54,6 +61,8 @@ class LegacyResource(Protocol):
     category: str
     position: list[float]
     yaw: float
+    body_yaw: float | None
+    passage_yaw: float | None
     queue_slots: list[LegacyQueueSlot]
     occupied_by: str | None
 
@@ -71,6 +80,7 @@ class DirectorScenarioAdapter:
         *,
         exit_target_id: str,
         mode: ScenarioRuntimeMode | str = ScenarioRuntimeMode.TAKEOVER,
+        passage_holding_offset_m: float = 0.45,
     ):
         self.mode = mode if isinstance(mode, ScenarioRuntimeMode) else ScenarioRuntimeMode(mode)
         self.runtime = ScenarioRuntime(
@@ -79,6 +89,7 @@ class DirectorScenarioAdapter:
         )
         self._directives: dict[str, TaskDirective] = {}
         self._started = False
+        self._passage_holding_offset_m = max(0.0, float(passage_holding_offset_m))
 
     @classmethod
     def from_legacy_resources(
@@ -87,6 +98,11 @@ class DirectorScenarioAdapter:
         *,
         exit_target_id: str,
         mode: ScenarioRuntimeMode | str = ScenarioRuntimeMode.TAKEOVER,
+        pedestrian_radius_m: float = 0.26,
+        pedestrian_half_length_m: float = 0.16,
+        passage_depth_m: float = 0.90,
+        passage_clearance_m: float = 0.16,
+        passage_holding_offset_m: float = 0.45,
     ) -> "DirectorScenarioAdapter":
         objects = []
         for resource in manager.resources.values():
@@ -94,6 +110,16 @@ class DirectorScenarioAdapter:
                 "urinals": ObjectKind.URINAL,
                 "stalls": ObjectKind.TOILET_STALL,
             }.get(resource.category, ObjectKind.WAITING_AREA)
+            body_yaw = float(
+                resource.yaw
+                if getattr(resource, "body_yaw", None) is None
+                else resource.body_yaw
+            )
+            passage_yaw = float(
+                body_yaw
+                if getattr(resource, "passage_yaw", None) is None
+                else resource.passage_yaw
+            )
             objects.append(
                 SmartObject(
                     object_id=resource.resource_id,
@@ -105,6 +131,19 @@ class DirectorScenarioAdapter:
                                 float(resource.position[0]),
                                 float(resource.position[1]),
                                 float(resource.yaw),
+                            ),
+                            occupancy_region=cls._occupancy_region(
+                                resource.position,
+                                body_yaw,
+                                radius_m=pedestrian_radius_m,
+                                half_length_m=pedestrian_half_length_m,
+                            ),
+                            passage_region=cls._passage_region(
+                                resource.position,
+                                passage_yaw,
+                                radius_m=pedestrian_radius_m,
+                                depth_m=passage_depth_m,
+                                clearance_m=passage_clearance_m,
                             ),
                         ),
                     ),
@@ -122,7 +161,48 @@ class DirectorScenarioAdapter:
                     tags=frozenset((resource.category,)),
                 )
             )
-        return cls(objects, exit_target_id=exit_target_id, mode=mode)
+        return cls(
+            objects,
+            exit_target_id=exit_target_id,
+            mode=mode,
+            passage_holding_offset_m=passage_holding_offset_m,
+        )
+
+    @staticmethod
+    def _occupancy_region(
+        pose,
+        yaw: float,
+        *,
+        radius_m: float,
+        half_length_m: float,
+    ) -> OrientedRegion:
+        return OrientedRegion(
+            center_xy=(float(pose[0]), float(pose[1])),
+            yaw=float(yaw),
+            half_length=max(0.0, float(half_length_m)) + max(0.0, float(radius_m)),
+            half_width=max(0.0, float(radius_m)),
+        )
+
+    @staticmethod
+    def _passage_region(
+        pose,
+        yaw: float,
+        *,
+        radius_m: float,
+        depth_m: float,
+        clearance_m: float,
+    ) -> OrientedRegion:
+        depth = max(0.0, float(depth_m))
+        center_offset = 0.5 * depth
+        return OrientedRegion(
+            center_xy=(
+                float(pose[0]) - math.cos(float(yaw)) * center_offset,
+                float(pose[1]) - math.sin(float(yaw)) * center_offset,
+            ),
+            yaw=float(yaw),
+            half_length=0.5 * depth,
+            half_width=max(0.0, float(radius_m)) + max(0.0, float(clearance_m)),
+        )
 
     def reset(
         self,
@@ -185,6 +265,32 @@ class DirectorScenarioAdapter:
 
     def directive_for(self, agent_id: str) -> TaskDirective | None:
         return self._directives.get(agent_id)
+
+    def passage_staging_pose(self, object_id: str) -> list[float] | None:
+        pose = self.runtime.registry.passage_staging_pose(object_id)
+        if pose is None:
+            return None
+        return [float(pose[0]), float(pose[1]), 0.0]
+
+    def passage_staging_yaw(self, object_id: str) -> float | None:
+        pose = self.runtime.registry.passage_staging_pose(object_id)
+        return None if pose is None else float(pose[2])
+
+    def passage_holding_pose(self, object_id: str) -> list[float] | None:
+        pose = self.runtime.registry.passage_holding_pose(
+            object_id,
+            offset_m=self._passage_holding_offset_m,
+        )
+        if pose is None:
+            return None
+        return [float(pose[0]), float(pose[1]), 0.0]
+
+    def passage_holding_yaw(self, object_id: str) -> float | None:
+        pose = self.runtime.registry.passage_holding_pose(
+            object_id,
+            offset_m=self._passage_holding_offset_m,
+        )
+        return None if pose is None else float(pose[2])
 
     def sync_legacy_resources(self, manager: LegacyResourceManager) -> None:
         snapshot = self.runtime.registry.snapshot()
@@ -267,6 +373,16 @@ class DirectorScenarioAdapter:
 
 
 _LEGACY_PHASES_BY_DIRECTIVE = {
+    DirectiveType.MOVE_TO_PASSAGE: frozenset(
+        {
+            "ACTIVATING",
+            "WALK_TO_ENTRY_CLEARANCE",
+            "QUEUEING",
+            "WALK_TO_PASSAGE",
+            "USING_URINAL",
+            "WALK_FROM_PASSAGE",
+        }
+    ),
     DirectiveType.MOVE_TO_OBJECT: frozenset(
         {
             "ACTIVATING",
@@ -277,6 +393,9 @@ _LEGACY_PHASES_BY_DIRECTIVE = {
         }
     ),
     DirectiveType.WAIT_AT_QUEUE: frozenset(
+        {"ACTIVATING", "WALK_TO_ENTRY_CLEARANCE", "QUEUEING"}
+    ),
+    DirectiveType.WAIT_FOR_PASSAGE: frozenset(
         {"ACTIVATING", "WALK_TO_ENTRY_CLEARANCE", "QUEUEING"}
     ),
     DirectiveType.START_ACTIVITY: frozenset({"USING_URINAL"}),

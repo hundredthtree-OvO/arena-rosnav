@@ -31,6 +31,9 @@ def _agent(
     vx: float = 0.0,
     vy: float = 0.0,
     radius_m: float = 0.30,
+    body_half_length_m: float = 0.0,
+    box_half_length_m: float = 0.0,
+    box_half_width_m: float = 0.0,
 ) -> AgentSnapshot:
     return AgentSnapshot(
         agent_id=agent_id,
@@ -41,6 +44,9 @@ def _agent(
         vx=vx,
         vy=vy,
         radius_m=radius_m,
+        body_half_length_m=body_half_length_m,
+        box_half_length_m=box_half_length_m,
+        box_half_width_m=box_half_width_m,
         timestamp_sec=10.0,
         source="test",
     )
@@ -199,6 +205,38 @@ def test_hold_behavior_outputs_zero_velocity():
     assert result.velocity_xy == (0.0, 0.0)
 
 
+def test_hard_dynamic_clearance_uses_capsule_against_oriented_robot_box():
+    _, _, SampledRvoLocalMotion, SampledRvoConfig = _motion_api()
+    planner = SampledRvoLocalMotion(SampledRvoConfig(clearance_m=0.0))
+    pedestrian = _agent(
+        "agent_01",
+        x=0.0,
+        y=0.67,
+        yaw=-0.5 * math.pi,
+        radius_m=0.22,
+        body_half_length_m=0.16,
+    )
+    robot = _agent(
+        "robot",
+        x=0.0,
+        y=0.0,
+        radius_m=0.0,
+        box_half_length_m=0.40,
+        box_half_width_m=0.30,
+    )
+
+    clearance = planner._pair_clearance(
+        pedestrian,
+        (pedestrian.x, pedestrian.y),
+        pedestrian.yaw,
+        robot,
+        (robot.x, robot.y),
+        robot.yaw,
+    )
+
+    assert clearance < 0.0
+
+
 def test_head_on_two_agents_produce_non_colliding_side_biased_velocities():
     _, _, SampledRvoLocalMotion, SampledRvoConfig = _motion_api()
     planner = SampledRvoLocalMotion(SampledRvoConfig())
@@ -273,6 +311,27 @@ def test_impossible_encirclement_returns_zero_and_infeasible():
     assert result.feasible is False
 
 
+def test_non_overlapping_blocker_yields_instead_of_reversing():
+    _, _, SampledRvoLocalMotion, SampledRvoConfig = _motion_api()
+    planner = SampledRvoLocalMotion(
+        SampledRvoConfig(
+            angular_samples=8,
+            minimum_forward_speed_fraction=0.8,
+        )
+    )
+
+    result = planner.step(
+        _local_motion_request(
+            agent=_agent("agent_01", x=0.0, y=0.0, vx=0.8),
+            peers=(_agent("agent_02", x=0.8, y=0.0),),
+        )
+    )
+
+    assert result.velocity_xy == (0.0, 0.0)
+    assert result.feasible is False
+    assert result.diagnostics["yielding_without_reverse"] is True
+
+
 def test_existing_overlap_allows_only_route_compatible_separation():
     _, _, SampledRvoLocalMotion, SampledRvoConfig = _motion_api()
     planner = SampledRvoLocalMotion(SampledRvoConfig())
@@ -315,6 +374,35 @@ def test_repeated_identical_input_returns_identical_result():
     second = planner.step(request)
 
     assert first == second
+
+
+def test_partial_static_overlap_recovery_is_not_executed_as_a_full_step():
+    _, _, SampledRvoLocalMotion, SampledRvoConfig = _motion_api()
+    from toilet_benchmark.motion import GeometrySafetyResult
+
+    class PartialRecoveryGeometry:
+        def project(self, request):
+            del request
+            return GeometrySafetyResult(
+                position_xy=(0.01, 0.0),
+                applied_fraction=0.25,
+                clipped=True,
+                minimum_clearance_m=-0.05,
+                recovering_overlap=True,
+            )
+
+    planner = SampledRvoLocalMotion(
+        SampledRvoConfig(),
+        geometry_safety=PartialRecoveryGeometry(),
+    )
+
+    result = planner.step(
+        _local_motion_request(agent=_agent("agent_01", x=0.0, y=0.0))
+    )
+
+    assert result.feasible is False
+    assert result.velocity_xy == (0.0, 0.0)
+    assert result.diagnostics["static_rejected_count"] > 0
 
 
 def test_invalid_solver_configuration_is_rejected():

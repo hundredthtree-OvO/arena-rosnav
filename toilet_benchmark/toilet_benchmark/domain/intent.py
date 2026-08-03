@@ -9,8 +9,10 @@ from .task import TaskPhase
 
 
 class DirectiveType(str, Enum):
+    MOVE_TO_PASSAGE = "move_to_passage"
     MOVE_TO_OBJECT = "move_to_object"
     WAIT_AT_QUEUE = "wait_at_queue"
+    WAIT_FOR_PASSAGE = "wait_for_passage"
     START_ACTIVITY = "start_activity"
     MOVE_TO_EXIT = "move_to_exit"
     RETIRE = "retire"
@@ -30,4 +32,3 @@ class TaskDirective:
     def __post_init__(self) -> None:
         if not self.agent_id:
             raise ValueError("agent_id must not be empty")
-

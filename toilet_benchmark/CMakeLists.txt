@@ -35,6 +35,7 @@ install(
     scripts/toilet_replay
     scripts/toilet_replay_export
     scripts/toilet_replay_isaac
+    scripts/toilet_authored_scenario
     scripts/pedestrian_diagnostic_recorder
     scripts/walkable_map_publisher
   DESTINATION lib/${PROJECT_NAME}

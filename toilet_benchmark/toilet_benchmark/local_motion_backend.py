@@ -25,7 +25,7 @@ from .motion import (
     SweptEnvelopeGeometrySafety,
 )
 from .motion.swept_envelope import SweptEnvelope, SweptEnvelopeConfig
-from .motion_backend import IsaacPeopleBackend
+from .motion_backend import ExternalMotionStreamPublisher, IsaacPeopleBackend
 from .polyline_lookahead import PolylineLookaheadTracker
 
 
@@ -55,6 +55,15 @@ class LocalMotionBackend:
         self._logger = node.get_logger()
         self._config = dict(config or {})
         self._isaac = IsaacPeopleBackend(node, move_service_name)
+        self._external_stream = ExternalMotionStreamPublisher(
+            node,
+            str(
+                self._config.get(
+                    "external_motion_topic",
+                    "/isaac/pedestrian_external_motion",
+                )
+            ),
+        )
         self._compute_hz = max(1.0, float(self._config.get("compute_hz", 10.0)))
         self._state_timeout_sec = max(
             0.1, float(self._config.get("state_timeout_sec", 0.5))
@@ -89,6 +98,15 @@ class LocalMotionBackend:
         behavior_cfg = dict(self._config.get("behavior", {}) or {})
         sampled_cfg = dict(self._config.get("sampled_rvo", {}) or {})
         safety_cfg = dict(self._config.get("safety", {}) or {})
+        self._agent_half_length_m = max(
+            0.0,
+            float(
+                safety_cfg.get("swept_envelope", {}).get(
+                    "half_length_m",
+                    0.16,
+                )
+            ),
+        )
         envelope_cfg = SweptEnvelopeConfig.from_mapping(
             safety_cfg.get("swept_envelope", {}) or {}
         )
@@ -158,8 +176,7 @@ class LocalMotionBackend:
         self._robot: AgentSnapshot | None = None
         self._trackers: dict[str, PolylineLookaheadTracker] = {}
         self._settled: set[str] = set()
-        self._pending = {}
-        self._latest_external: dict[str, MotionCommand] = {}
+        self._stream_batch: dict[str, MotionCommand] = {}
         self._commanded_velocity: dict[str, tuple[float, float]] = {}
         self._last_tick_at = time.monotonic()
         self._last_diagnostic_at: dict[str, float] = {}
@@ -178,6 +195,10 @@ class LocalMotionBackend:
     @property
     def agent_radius_m(self) -> float:
         return self._agent_radius_m
+
+    @property
+    def agent_half_length_m(self) -> float:
+        return self._agent_half_length_m
 
     def set_walkable_planner(self, planner) -> None:
         self._geometry.bind(planner)
@@ -199,12 +220,13 @@ class LocalMotionBackend:
     def send(self, command: MotionCommand, done_callback=None):
         agent_id = str(command.agent_id)
         if command.use_direct_pose or command.stop:
+            self._external_stream.cancel((agent_id,))
+            self._stream_batch.pop(agent_id, None)
+            self._commanded_velocity.pop(agent_id, None)
             if command.stop:
                 self._commands.pop(agent_id, None)
                 self._trackers.pop(agent_id, None)
                 self._settled.discard(agent_id)
-                self._latest_external.pop(agent_id, None)
-                self._commanded_velocity.pop(agent_id, None)
             return self._isaac.send(command, done_callback)
         self._commands[agent_id] = command
         self._trackers.pop(agent_id, None)
@@ -213,12 +235,12 @@ class LocalMotionBackend:
 
     def remove_agent(self, agent_id: str) -> None:
         agent_id = str(agent_id)
+        self._external_stream.cancel((agent_id,))
         self._commands.pop(agent_id, None)
         self._snapshots.pop(agent_id, None)
         self._trackers.pop(agent_id, None)
         self._settled.discard(agent_id)
-        self._pending.pop(agent_id, None)
-        self._latest_external.pop(agent_id, None)
+        self._stream_batch.pop(agent_id, None)
         self._commanded_velocity.pop(agent_id, None)
 
     def allows_director_stall_recovery(self, agent_id: str) -> bool:
@@ -242,6 +264,8 @@ class LocalMotionBackend:
             if snapshot is None or now - snapshot.timestamp_sec > self._state_timeout_sec:
                 continue
             self._step_agent(command, snapshot, now, dt)
+        self._external_stream.publish(tuple(self._stream_batch.values()))
+        self._stream_batch.clear()
 
     def _step_agent(
         self,
@@ -280,7 +304,11 @@ class LocalMotionBackend:
             planner_id="director_global_route",
         )
         peers = tuple(
-            item
+            replace(
+                item,
+                vx=float(self._commanded_velocity.get(other_id, (item.vx, item.vy))[0]),
+                vy=float(self._commanded_velocity.get(other_id, (item.vx, item.vy))[1]),
+            )
             for other_id, item in self._snapshots.items()
             if other_id != command.agent_id
             and now - item.timestamp_sec <= self._state_timeout_sec
@@ -334,7 +362,6 @@ class LocalMotionBackend:
         self._queue_external(command.agent_id, external)
         if now - self._last_diagnostic_at.get(command.agent_id, 0.0) >= 1.0:
             self._last_diagnostic_at[command.agent_id] = now
-            pending = self._pending.get(command.agent_id)
             self._logger.info(
                 "Local motion diagnostics: "
                 f"agent={command.agent_id}, phase={command.phase or 'UNSPECIFIED'}, "
@@ -344,7 +371,7 @@ class LocalMotionBackend:
                 f"remaining_m={target.remaining_m:.3f}, "
                 f"static_clearance_m="
                 f"{float(result.motion.diagnostics.get('minimum_static_clearance_m', math.nan)):.3f}, "
-                f"service_inflight={pending is not None and not pending.done()}, "
+                "service_inflight=False, "
                 f"static_rejected={result.motion.diagnostics.get('static_rejected_count', 0)}, "
                 f"dynamic_rejected={result.motion.diagnostics.get('dynamic_rejected_count', 0)}, "
                 f"dynamic_clearance_m="
@@ -360,7 +387,8 @@ class LocalMotionBackend:
                 f"pose=({snapshot.x:.3f},{snapshot.y:.3f}), "
                 f"robot_fresh={robot is not None}, "
                 f"robot_distance_m="
-                f"{math.hypot(robot.x - snapshot.x, robot.y - snapshot.y) if robot is not None else math.inf:.3f}"
+                f"{math.hypot(robot.x - snapshot.x, robot.y - snapshot.y) if robot is not None else math.inf:.3f}, "
+                "transport=stream_batch"
             )
 
     def _send_terminal_alignment(
@@ -393,14 +421,8 @@ class LocalMotionBackend:
         self._queue_external(command.agent_id, external)
 
     def _queue_external(self, agent_id: str, command: MotionCommand) -> None:
-        """Keep planner cadence independent from the ROS service round trip."""
-        self._latest_external[agent_id] = command
-        pending = self._pending.get(agent_id)
-        if pending is not None and not pending.done():
-            return
-        latest = self._latest_external.pop(agent_id, None)
-        if latest is not None:
-            self._pending[agent_id] = self._isaac.send(latest)
+        """Coalesce each agent to one command in the current world tick."""
+        self._stream_batch[str(agent_id)] = command
 
     def _fresh_robot(self, now: float) -> AgentSnapshot | None:
         if self._robot is None:

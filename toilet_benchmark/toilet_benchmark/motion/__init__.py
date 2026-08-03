@@ -20,6 +20,7 @@ from .geometry import SweptEnvelopeGeometrySafety
 from .behavior_policy import ContextualBehaviorConfig, ContextualBehaviorPolicy
 from .sampled_rvo import SampledRvoConfig, SampledRvoLocalMotion
 from .pipeline import LocalMotionPipeline, LocalMotionTickResult
+from .route_edit import ResumePolicy, RouteEdit, SubgoalCommand
 
 __all__ = [
     "BehaviorDecision",
@@ -38,7 +39,10 @@ __all__ = [
     "LocalMotionResult",
     "LocalMotionTickResult",
     "RoutePlan",
+    "RouteEdit",
+    "ResumePolicy",
     "SampledRvoConfig",
     "SampledRvoLocalMotion",
+    "SubgoalCommand",
     "SweptEnvelopeGeometrySafety",
 ]
