@@ -59,6 +59,8 @@ def test_scenario_draft_exports_two_independent_pedestrians() -> None:
     ]
     assert restored.actor("toilet_agent_01").holds[0].duration_sec == 2.0
     assert episode.task_type == "authored_route"
+    assert episode.pedestrians[0].start_yaw == pytest.approx(math.pi / 2.0)
+    assert episode.pedestrians[1].start_yaw == pytest.approx(-math.pi / 2.0)
 
 
 def test_scenario_validation_reports_missing_spawn_and_invalid_hold() -> None:

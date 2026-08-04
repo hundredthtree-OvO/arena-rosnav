@@ -2,10 +2,12 @@ session:
   output_root: /home/stardust/resources/arena_ws/data/toilet_manual
   operator_id: operator_01
   seed: 42
-  selection_mode: round_robin
-  fixed_scenario_id: robot_urinal_3_ped_urinal_3
+  selection_mode: fixed
+  fixed_scenario_id: narrow_head_on_001
   max_episodes: 0
   inter_episode_delay_sec: 1.0
+  parking_timeout_sec: 5.0
+  authored_runtime_exit_timeout_sec: 60.0
 
 episode:
   timeout_sec: 120.0
@@ -24,16 +26,17 @@ robot:
   control_hold_service: /isaac/set_mecanum_control_hold
   odom_topic: /odom
 
+# Manual collection does not alter operator commands before contact. A zero-margin
+# robot/pedestrian envelope contact immediately fails and finalizes the episode.
+collision_policy:
+  pedestrian_robot: detect_and_fail
+  hard_guard_service: /isaac/set_pedestrian_hard_guard
+
 pedestrian:
+  # Cleanup service settings only. Actors and characters come from EpisodeSpec.
   agent_id: toilet_agent_01
-  count: 2
-  character_name: original_female_adult_business_02
-  character_pool:
-    - original_female_adult_business_02
-    - original_female_adult_medical_01
+  count: 1
   parking_service: /isaac/delete_prim
-  semantics_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_semantics.yaml
-  benchmark_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/toilet_benchmark.yaml
 
 recording:
   enabled: true
@@ -54,42 +57,21 @@ recording:
     - /isaac/pedestrian_states
     - /toilet_benchmark/collection_status
     - /isaac/pedestrian_hard_guard_events
+    - /isaac/pedestrian_contact_events
     - /isaac/scene_collision_events
 
 events:
+  pedestrian_status_topic: /toilet_benchmark/pedestrian_runtime_status
   hard_guard_topic: /isaac/pedestrian_hard_guard_events
+  pedestrian_contact_topic: /isaac/pedestrian_contact_events
   scene_collision_topic: /isaac/scene_collision_events
 
-# These starts are initial candidates placed in the open aisle in front of each
-# urinal. Validate them in the current USD before a formal collection session.
+scenario_source:
+  # Default collection path: the Route Editor EpisodeSpec is the scenario truth.
+  mode: authored_route
+
 scenarios:
-  - id: robot_urinal_1_ped_urinal_1
+  - id: narrow_head_on_001
     enabled: true
     weight: 1.0
-    robot_start: [2.86, 0.75, 0.03, -1.5708]
-    robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_ids: [urinal_1, urinal_2]
-  - id: robot_urinal_2_ped_urinal_2
-    enabled: true
-    weight: 1.0
-    robot_start: [2.09, 0.75, 0.03, -1.5708]
-    robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_ids: [urinal_2, urinal_3]
-  - id: robot_urinal_3_ped_urinal_3
-    enabled: true
-    weight: 1.0
-    robot_start: [1.31, 0.75, 0.03, -1.5708]
-    robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_ids: [urinal_3, urinal_4]
-  - id: robot_urinal_4_ped_urinal_4
-    enabled: true
-    weight: 1.0
-    robot_start: [0.51, 0.75, 0.03, -1.5708]
-    robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_ids: [urinal_4, urinal_5]
-  - id: robot_urinal_5_ped_urinal_5
-    enabled: true
-    weight: 1.0
-    robot_start: [-0.31, 0.75, 0.03, -1.5708]
-    robot_goal: [-3.8, -0.91, 0.0]
-    pedestrian_target_urinal_ids: [urinal_5, urinal_4]
+    episode_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark_ui/examples/narrow_head_on_001.json

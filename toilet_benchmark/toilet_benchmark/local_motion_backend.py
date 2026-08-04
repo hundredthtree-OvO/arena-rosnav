@@ -25,7 +25,8 @@ from .motion import (
     SweptEnvelopeGeometrySafety,
 )
 from .motion.swept_envelope import SweptEnvelope, SweptEnvelopeConfig
-from .motion_backend import ExternalMotionStreamPublisher, IsaacPeopleBackend
+from .external_motion_stream import ExternalMotionStreamPublisher
+from .motion_backend import IsaacPeopleBackend
 from .polyline_lookahead import PolylineLookaheadTracker
 
 

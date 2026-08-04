@@ -4,7 +4,7 @@ from toilet_benchmark.domain.task import (
     EXTERNAL_MOTION_LOCOMOTION,
     MotionCommand,
 )
-from toilet_benchmark.motion_backend import ExternalMotionStreamPublisher
+from toilet_benchmark.external_motion_stream import ExternalMotionStreamPublisher
 
 
 class _Publisher:

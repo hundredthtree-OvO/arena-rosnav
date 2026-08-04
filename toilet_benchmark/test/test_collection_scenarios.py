@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 import yaml
@@ -172,3 +173,44 @@ class TestCollectionScenarios(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             load_manual_collection_config(self._write_config(payload))
+
+    def test_authored_route_derives_runtime_contract_from_episode(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        episode_path = Path(tmpdir.name) / "authored.json"
+        episode_path.write_text(
+            json.dumps(
+                {
+                    "task_type": "authored_route",
+                    "robot": {
+                        "start_pose": [1.0, 2.0, 0.03, 1.57],
+                        "goal_pose": [-3.8, -0.9, 0.0],
+                    },
+                    "pedestrians": [
+                        {"agent_id": "toilet_agent_01"},
+                        {"agent_id": "toilet_agent_02"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = self._base_payload()
+        payload["scenario_source"] = {"mode": "authored_route"}
+        payload["scenarios"] = [
+            {
+                "id": "authored",
+                "enabled": True,
+                "weight": 1.0,
+                "episode_path": str(episode_path),
+            }
+        ]
+
+        config = load_manual_collection_config(self._write_config(payload))
+        scenario = config.scenarios[0]
+
+        self.assertEqual(scenario.source_mode, "authored_route")
+        self.assertEqual(scenario.robot_start, (1.0, 2.0, 0.03, 1.57))
+        self.assertEqual(scenario.robot_goal, (-3.8, -0.9, 0.0))
+        self.assertEqual(scenario.pedestrian_agent_ids, ("toilet_agent_01", "toilet_agent_02"))
+        self.assertEqual(len(scenario.episode_sha256), 64)
+        self.assertEqual(scenario.pedestrian_target_urinal_ids, ())

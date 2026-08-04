@@ -9,6 +9,44 @@ from typing import Callable, Sequence
 from ..episodes.schema import PedestrianEpisodeSpec, PedestrianHoldSpec
 
 
+# Isaac People character roots face local -Y while authored routes use the
+# conventional +X planar heading. Keep this conversion at the route boundary.
+ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD = math.pi / 2.0
+
+
+def normalize_yaw(yaw: float) -> float:
+    return math.atan2(math.sin(float(yaw)), math.cos(float(yaw)))
+
+
+def route_heading_to_character_root_yaw(route_heading: float) -> float:
+    return normalize_yaw(float(route_heading) + ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD)
+
+
+def initial_character_root_yaw(
+    start_pose: Sequence[float],
+    route_waypoints: Sequence[Sequence[float]],
+) -> float:
+    """Derive the root yaw from the first non-degenerate route segment."""
+
+    cursor = (float(start_pose[0]), float(start_pose[1]))
+    for waypoint in route_waypoints:
+        target = (float(waypoint[0]), float(waypoint[1]))
+        if math.dist(cursor, target) <= 1e-4:
+            continue
+        heading = math.atan2(target[1] - cursor[1], target[0] - cursor[0])
+        return route_heading_to_character_root_yaw(heading)
+    raise ValueError("cannot derive character yaw from a degenerate route")
+
+
+def align_spec_start_yaw(spec: PedestrianEpisodeSpec) -> PedestrianEpisodeSpec:
+    if spec.start_pose is None:
+        raise ValueError(f"{spec.agent_id}: start_pose is required for yaw alignment")
+    return replace(
+        spec,
+        start_yaw=initial_character_root_yaw(spec.start_pose, spec.route_waypoints),
+    )
+
+
 def expand_authored_route(
     spec: PedestrianEpisodeSpec,
     planner: Callable[[Sequence[float], Sequence[float]], Sequence[Sequence[float]]],
@@ -63,11 +101,11 @@ def expand_authored_route(
         )
         for hold in spec.holds
     )
-    return replace(
+    return align_spec_start_yaw(replace(
         spec,
         route_waypoints=tuple(expanded),
         holds=remapped_holds,
-    )
+    ))
 
 
 @dataclass
@@ -77,6 +115,11 @@ class RouteRuntime:
     boundary_cursor: int = 0
     state: str = "WAITING_FOR_POSE"
     hold_until: float | None = None
+    generation: int = 1
+    command_generation: int = 0
+    activation_stable_samples: int = 0
+    activation_pose: tuple[float, float, float] | None = None
+    activation_yaw: float | None = None
 
     @classmethod
     def create(cls, spec: PedestrianEpisodeSpec) -> "RouteRuntime":
@@ -88,7 +131,10 @@ class RouteRuntime:
             raise ValueError(f"{spec.agent_id}: a hold cannot target the spawn waypoint")
         if boundaries[-1] > last:
             raise ValueError(f"{spec.agent_id}: hold waypoint is outside the route")
-        return cls(spec=spec, boundary_indices=tuple(boundaries))
+        return cls(
+            spec=spec,
+            boundary_indices=tuple(boundaries),
+        )
 
     @property
     def current_boundary(self) -> int:
@@ -102,8 +148,66 @@ class RouteRuntime:
     def complete(self) -> bool:
         return self.state == "COMPLETE"
 
+    def observe_activation(
+        self,
+        pose: Sequence[float],
+        metadata: dict[str, str],
+        *,
+        position_tolerance_m: float,
+        position_stability_m: float,
+        yaw_tolerance_rad: float,
+        yaw_stability_rad: float,
+        required_samples: int,
+    ) -> bool:
+        """Accept reactivation only after several stable simulator samples."""
+
+        try:
+            generation = int(metadata.get("embodiment_generation", "0"))
+            yaw = float(metadata.get("yaw_rad", "nan"))
+        except (TypeError, ValueError):
+            self.reset_activation_observation()
+            return False
+        expected_yaw = float(self.spec.start_yaw or 0.0)
+        start = self.spec.route_waypoints[0]
+        valid = (
+            generation > 0
+            and metadata.get("reactivation_ready", "").lower() == "true"
+            and metadata.get("motion_state", "").lower() == "idle"
+            and math.isfinite(yaw)
+            and math.hypot(float(pose[0]) - start[0], float(pose[1]) - start[1])
+            <= position_tolerance_m
+            and abs(_angle_difference(yaw, expected_yaw)) <= yaw_tolerance_rad
+        )
+        if not valid:
+            self.reset_activation_observation()
+            return False
+
+        current_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+        if self.activation_pose is not None:
+            position_step = math.dist(current_pose[:2], self.activation_pose[:2])
+            yaw_step = abs(_angle_difference(yaw, float(self.activation_yaw)))
+            if position_step > position_stability_m or yaw_step > yaw_stability_rad:
+                self.reset_activation_observation()
+
+        self.generation = generation
+        self.activation_pose = current_pose
+        self.activation_yaw = yaw
+        self.activation_stable_samples += 1
+        return self.activation_stable_samples >= max(1, int(required_samples))
+
+    def reset_activation_observation(self) -> None:
+        self.activation_stable_samples = 0
+        self.activation_pose = None
+        self.activation_yaw = None
+
     def segment(self) -> tuple[tuple[float, float, float], ...]:
         return self.spec.route_waypoints[self.previous_boundary : self.current_boundary + 1]
+
+    def execution_segment(self) -> tuple[tuple[float, float, float], ...]:
+        """Return only forward targets; the actor already occupies the boundary start."""
+        return self.spec.route_waypoints[
+            self.previous_boundary + 1 : self.current_boundary + 1
+        ]
 
     def hold_duration(self) -> float | None:
         for hold in self.spec.holds:
@@ -135,3 +239,7 @@ class RouteRuntime:
         self.boundary_cursor += 1
         self.state = "MOVING"
         return "dispatch"
+
+
+def _angle_difference(lhs: float, rhs: float) -> float:
+    return math.atan2(math.sin(lhs - rhs), math.cos(lhs - rhs))

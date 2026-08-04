@@ -193,7 +193,7 @@ class TestEpisodeValidatorManifestSplits(unittest.TestCase):
             {item.episode_id: item.episode_hash for item in filled.entries},
         )
 
-    def test_repository_manual_config_converts_all_five_scenarios(self):
+    def test_repository_manual_config_converts_default_authored_scenario(self):
         config_path = Path(__file__).parents[1] / "config" / "manual_collection.yaml"
         config = load_manual_collection_config(config_path)
 
@@ -202,7 +202,7 @@ class TestEpisodeValidatorManifestSplits(unittest.TestCase):
             scene_id="shenxinfu_841837",
         )
 
-        self.assertEqual(len(episodes), 5)
+        self.assertEqual(len(episodes), 1)
         self.assertEqual(
             [episode.episode_id for episode in episodes],
             [
@@ -210,6 +210,9 @@ class TestEpisodeValidatorManifestSplits(unittest.TestCase):
                 for scenario in config.enabled_scenarios()
             ],
         )
+        self.assertEqual(episodes[0].task_type, "authored_route")
+        self.assertEqual(len(episodes[0].pedestrians), 2)
+        self.assertEqual(episodes[0].metadata["source"], "manual_collection_authored_route")
         self.assertTrue(all(not validate_episode(episode) for episode in episodes))
 
 

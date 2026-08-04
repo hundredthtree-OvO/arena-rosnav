@@ -36,8 +36,7 @@
 
 ## 文档清理规则
 
-当前不直接删除“看起来旧”的文档：索引、启动说明、实验证据和迁移决策仍可能被
-回归、Replay 或后续对照使用。清理时先执行引用扫描，并满足路线计划中“无 setup
-入口、无测试引用、无操作面引用、完成 shadow 对照并保留回退 tag”的门槛；之后优先
-移动到 `docs/experiments/`，确认无引用后再删除。这样不会因为清理文档改变现有
-benchmark 的可复现入口。
+Git 是旧实现和旧文档的归档。当前规范吸收仍有效的实验结论后，可直接删除 HuNav、
+People Navigation、旧 director 和失败 guard 尝试对应的历史操作文档，不再要求 shadow
+对照或在仓库内保留回退副本。删除前只检查当前 setup entry point、authored runtime、
+测试和 README 是否仍有引用。

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from toilet_benchmark.collection_scenarios import ManualCollectionConfig, ScenarioSelection
@@ -272,6 +274,32 @@ def episode_from_manual_selection(
     pedestrian_start_reference: str = "entrance_main",
 ) -> EpisodeSpec:
     track_type = track if isinstance(track, TrackType) else TrackType(track)
+    if selection.scenario.source_mode == "authored_route":
+        if selection.scenario.episode_path is None:
+            raise ValueError("authored-route scenario is missing episode_path")
+        authored = EpisodeSpec.from_mapping(
+            json.loads(Path(selection.scenario.episode_path).read_text(encoding="utf-8"))
+        )
+        return replace(
+            authored,
+            benchmark_version=benchmark_version,
+            episode_id=episode_id,
+            scene_id=scene_id,
+            track=track_type,
+            seed=selection.seed,
+            termination=TerminationSpec(
+                timeout_sec=config.episode.timeout_sec,
+                goal_tolerance_m=config.episode.goal_tolerance_m,
+                collision_policy=CollisionPolicy.TERMINATE,
+            ),
+            metadata={
+                **authored.metadata,
+                "source": "manual_collection_authored_route",
+                "source_episode_path": selection.scenario.episode_path,
+                "source_episode_sha256": selection.scenario.episode_sha256,
+                "selection_index": selection.selection_index,
+            },
+        )
     targets = selection.scenario.pedestrian_target_urinal_ids
     characters = config.pedestrian.character_pool
     pedestrians = tuple(

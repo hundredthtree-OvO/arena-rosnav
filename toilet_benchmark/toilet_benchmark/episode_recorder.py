@@ -208,14 +208,29 @@ class EpisodeRecorder:
                     cwd=str(episode_dir),
                     start_new_session=True,
                 )
-        self._episode_manifest = self._build_episode_manifest(
-            context=context,
-            status="running",
-            ended_at=None,
-            termination_reason=None,
-            extra={},
-        )
-        _yaml_safe_dump_atomic(self._episode_manifest_path, asdict(self._episode_manifest))
+        try:
+            self._episode_manifest = self._build_episode_manifest(
+                context=context,
+                status="running",
+                ended_at=None,
+                termination_reason=None,
+                extra={},
+            )
+            _yaml_safe_dump_atomic(self._episode_manifest_path, asdict(self._episode_manifest))
+        except Exception:
+            self._stop_bag_process()
+            self._current_episode = None
+            self._episode_manifest = None
+            self._episode_manifest_path = None
+            self._events_path = None
+            self._events_count = 0
+            self._bag_process = None
+            self._bag_command = None
+            try:
+                episode_dir.rmdir()
+            except OSError:
+                pass
+            raise
         return context
 
     def record_event(self, event_type: str, payload: Mapping[str, Any] | None = None, *, timestamp: str | None = None) -> None:
@@ -322,6 +337,7 @@ class EpisodeRecorder:
         extra: Mapping[str, Any],
     ) -> EpisodeManifest:
         scenario = context.selection.scenario
+        agent_ids = scenario.pedestrian_agent_ids or self._config.pedestrian.agent_ids
         return EpisodeManifest(
             session_id=context.session_id,
             episode_id=context.episode_id,
@@ -338,11 +354,11 @@ class EpisodeRecorder:
                 "weight": scenario.weight,
                 "robot_start": list(scenario.robot_start),
                 "robot_goal": list(scenario.robot_goal),
-                "pedestrian_target_urinal_id": scenario.pedestrian_target_urinal_id,
-                "pedestrian_target_urinal_ids": list(scenario.pedestrian_target_urinal_ids),
-                "pedestrian_count": self._config.pedestrian.count,
-                "pedestrian_agent_ids": list(self._config.pedestrian.agent_ids),
-                "pedestrian_character_pool": list(self._config.pedestrian.character_pool),
+                "source_mode": scenario.source_mode,
+                "episode_path": scenario.episode_path,
+                "episode_sha256": scenario.episode_sha256,
+                "pedestrian_count": len(agent_ids),
+                "pedestrian_agent_ids": list(agent_ids),
                 "selection_index": context.selection.selection_index,
                 "enabled_index": context.selection.enabled_index,
                 "selection_seed": context.selection.seed,

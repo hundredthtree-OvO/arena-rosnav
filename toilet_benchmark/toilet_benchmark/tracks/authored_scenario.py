@@ -15,6 +15,8 @@ from isaacsim_msgs.srv import DeletePrim, Pedestrian, ResetRobot
 from people_msgs.msg import People
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 from ..domain.task import MotionCommand
 from ..episodes.schema import EpisodeSpec
@@ -36,6 +38,8 @@ class AuthoredScenarioNode(Node):
         people_topic: str = "/isaac/pedestrian_states",
         skip_robot_reset: bool = False,
         planner_radius_m: float = 0.30,
+        status_topic: str = "/toilet_benchmark/pedestrian_runtime_status",
+        cancel_service: str = "/toilet_authored_scenario/cancel",
     ) -> None:
         super().__init__("toilet_authored_scenario")
         if episode.task_type != "authored_route":
@@ -55,16 +59,38 @@ class AuthoredScenarioNode(Node):
         }
         self._poses: dict[str, tuple[float, float, float]] = {}
         self._pose_times: dict[str, float] = {}
+        self._pose_metadata: dict[str, dict[str, str]] = {}
         self._backend = IsaacPeopleBackend(self, move_service)
         self._spawn_client = self.create_client(Pedestrian, spawn_service)
         self._reset_client = self.create_client(ResetRobot, reset_service)
         self._retire_client = self.create_client(DeletePrim, retire_service)
+        self._status_pub = self.create_publisher(String, status_topic, 10) if status_topic else None
+        self._cancel_service = self.create_service(Trigger, cancel_service, self._cancel_cb)
+        self._active_announced: set[str] = set()
+        self._retire_retry_at: dict[str, float] = {}
+        self._retire_inflight: set[str] = set()
+        self._cancel_requested = False
+        self._cancel_stop_sent: set[str] = set()
+        self._cancel_stable_samples: dict[str, int] = {}
+        self._cancel_last_pose: dict[str, tuple[float, float, float]] = {}
+        self._departure_started_at: dict[str, float] = {}
+        self._departure_max_lateral_m: dict[str, float] = {}
+        self._departure_reported: set[str] = set()
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(People, people_topic, self._people_cb, qos)
         self._timer = self.create_timer(0.1, self._tick)
         self._started_at = time.monotonic()
         self._spawned = False
         self._finished = False
+        self._activation_tolerance_m = 0.15
+        self._activation_stable_samples = 4
+        self._activation_position_stability_m = 0.02
+        self._activation_yaw_tolerance_rad = 0.20
+        self._activation_yaw_stability_rad = 0.08
+        self._boundary_ack_tolerance_m = min(
+            0.15,
+            float(self.episode.termination.goal_tolerance_m),
+        )
         self.exit_code = 1
 
     @property
@@ -107,7 +133,8 @@ class AuthoredScenarioNode(Node):
 
     def _spawn_pedestrians(self, timeout_sec: float) -> None:
         request = Pedestrian.Request()
-        for spec in self.episode.pedestrians:
+        for runtime in self._runtimes.values():
+            spec = runtime.spec
             if spec.start_pose is None:
                 raise ValueError(f"{spec.agent_id}: start_pose is required")
             person = Person()
@@ -133,11 +160,18 @@ class AuthoredScenarioNode(Node):
             if observation.identifier in self._runtimes:
                 self._poses[observation.identifier] = observation.position
                 self._pose_times[observation.identifier] = observed_at
+                self._pose_metadata[observation.identifier] = dict(observation.metadata)
 
     def _tick(self) -> None:
         if not self._spawned or self._finished:
             return
         now = time.monotonic()
+        if self._cancel_requested:
+            self._advance_cancel()
+            if all(runtime.complete for runtime in self._runtimes.values()):
+                self.get_logger().info("Authored scenario cancelled after stable pedestrian retirement")
+                self._finish(0)
+            return
         if now - self._started_at > self.episode.termination.timeout_sec:
             self.get_logger().error("Authored scenario timed out")
             self._finish(1)
@@ -146,6 +180,11 @@ class AuthoredScenarioNode(Node):
             if runtime.complete:
                 continue
             if runtime.state == "RETIRING":
+                if (
+                    agent_id not in self._retire_inflight
+                    and now >= self._retire_retry_at.get(agent_id, 0.0)
+                ):
+                    self._request_retire(runtime)
                 continue
             if runtime.state == "HOLDING":
                 action = runtime.release_hold(now)
@@ -158,10 +197,45 @@ class AuthoredScenarioNode(Node):
             if pose is None or now - self._pose_times.get(agent_id, 0.0) > 2.0:
                 continue
             if runtime.state == "WAITING_FOR_POSE":
+                metadata = self._pose_metadata.get(agent_id, {})
+                if not runtime.observe_activation(
+                    pose,
+                    metadata,
+                    position_tolerance_m=self._activation_tolerance_m,
+                    position_stability_m=self._activation_position_stability_m,
+                    yaw_tolerance_rad=self._activation_yaw_tolerance_rad,
+                    yaw_stability_rad=self._activation_yaw_stability_rad,
+                    required_samples=self._activation_stable_samples,
+                ):
+                    continue
+                self.get_logger().info(
+                    f"{agent_id} activation stabilized: "
+                    f"generation={runtime.generation}, "
+                    f"samples={runtime.activation_stable_samples}, "
+                    f"pose=({pose[0]:.3f},{pose[1]:.3f}), "
+                    f"yaw={runtime.activation_yaw:.3f}"
+                )
                 self._dispatch(runtime)
                 continue
+            if runtime.state == "WAITING_FOR_EXECUTION":
+                metadata = self._pose_metadata.get(agent_id, {})
+                try:
+                    generation = int(metadata.get("embodiment_generation", "0"))
+                    command_generation = int(metadata.get("command_generation", "0"))
+                except ValueError:
+                    continue
+                if (
+                    generation != runtime.generation
+                    or command_generation < runtime.command_generation
+                    or metadata.get("motion_state", "").lower() != "executing"
+                ):
+                    continue
+                runtime.state = "MOVING"
+                self._announce_active(runtime)
+                continue
+            self._observe_departure(runtime, pose, now)
             target = runtime.spec.route_waypoints[runtime.current_boundary]
-            if math.hypot(pose[0] - target[0], pose[1] - target[1]) > self.episode.termination.goal_tolerance_m:
+            if math.hypot(pose[0] - target[0], pose[1] - target[1]) > self._boundary_ack_tolerance_m:
                 continue
             action = runtime.arrive(now)
             self._send_stop(runtime)
@@ -178,11 +252,99 @@ class AuthoredScenarioNode(Node):
             self.get_logger().info("Authored scenario completed")
             self._finish(0)
 
+    def _cancel_cb(self, _request, response):
+        if self._finished:
+            response.success = True
+            response.message = "authored scenario is already finished"
+            return response
+        self._cancel_requested = True
+        self._publish_status("pedestrian_cancel_requested", episode_id=self.episode.episode_id)
+        response.success = True
+        response.message = "graceful pedestrian cancellation accepted"
+        return response
+
+    def _advance_cancel(self) -> None:
+        for agent_id, runtime in self._runtimes.items():
+            if runtime.complete:
+                continue
+            if runtime.state == "RETIRING":
+                if agent_id not in self._retire_inflight:
+                    self._request_retire(runtime)
+                continue
+            pose = self._poses.get(agent_id)
+            metadata = self._pose_metadata.get(agent_id, {})
+            if pose is None:
+                continue
+            if agent_id not in self._cancel_stop_sent:
+                self._send_stop_at_pose(runtime, pose, metadata)
+                self._cancel_stop_sent.add(agent_id)
+                self._cancel_last_pose[agent_id] = pose
+                self._cancel_stable_samples[agent_id] = 0
+                runtime.state = "CANCELLING"
+                continue
+            previous = self._cancel_last_pose.get(agent_id, pose)
+            stable = (
+                metadata.get("motion_state", "").lower() == "idle"
+                and math.dist(previous[:2], pose[:2]) <= 0.01
+            )
+            self._cancel_last_pose[agent_id] = pose
+            self._cancel_stable_samples[agent_id] = (
+                self._cancel_stable_samples.get(agent_id, 0) + 1 if stable else 0
+            )
+            if self._cancel_stable_samples[agent_id] >= 4:
+                self._retire(runtime, reason="graceful cancellation reached stable idle")
+
+    def _send_stop_at_pose(
+        self,
+        runtime: RouteRuntime,
+        pose: Sequence[float],
+        metadata: dict[str, str],
+    ) -> None:
+        try:
+            yaw = float(metadata.get("yaw_rad", runtime.spec.start_yaw or 0.0))
+        except (TypeError, ValueError):
+            yaw = float(runtime.spec.start_yaw or 0.0)
+        self._backend.send(
+            MotionCommand(
+                agent_id=runtime.spec.agent_id,
+                goal_pose=tuple(float(value) for value in pose[:3]),
+                path_points=(),
+                velocity=0.0,
+                orientation=yaw,
+                stop=True,
+                constrain_to_path=runtime.spec.constrain_to_path,
+                phase="AUTHORED_CANCEL",
+            )
+        )
+
     def _dispatch(self, runtime: RouteRuntime) -> None:
-        segment = runtime.segment()
+        segment = runtime.execution_segment()
+        if not segment:
+            raise RuntimeError(
+                f"{runtime.spec.agent_id}: authored motion segment has no forward targets"
+            )
         target = segment[-1]
         speed = runtime.spec.behavior.walking_speed_mps or 0.8
-        yaw = math.atan2(segment[-1][1] - segment[-2][1], segment[-1][0] - segment[-2][0])
+        heading_start = runtime.spec.route_waypoints[runtime.previous_boundary]
+        heading_end = segment[-1] if len(segment) == 1 else segment[-2]
+        yaw = math.atan2(
+            segment[-1][1] - heading_end[1],
+            segment[-1][0] - heading_end[0],
+        )
+        if len(segment) == 1:
+            yaw = math.atan2(
+                segment[-1][1] - heading_start[1],
+                segment[-1][0] - heading_start[0],
+            )
+        metadata = self._pose_metadata.get(runtime.spec.agent_id, {})
+        try:
+            baseline_generation = int(metadata.get("command_generation", "0"))
+        except ValueError:
+            baseline_generation = 0
+        runtime.command_generation = baseline_generation + 1
+        if runtime.spec.agent_id not in self._departure_started_at:
+            self._departure_started_at[runtime.spec.agent_id] = time.monotonic()
+            self._departure_max_lateral_m[runtime.spec.agent_id] = 0.0
         self._backend.send(
             MotionCommand(
                 agent_id=runtime.spec.agent_id,
@@ -195,10 +357,84 @@ class AuthoredScenarioNode(Node):
                 behavior=runtime.spec.behavior.behavior_type,
             )
         )
-        runtime.state = "MOVING"
+        runtime.state = (
+            "MOVING"
+            if runtime.spec.agent_id in self._active_announced
+            else "WAITING_FOR_EXECUTION"
+        )
         self.get_logger().info(
             f"{runtime.spec.agent_id} dispatched segment "
-            f"{runtime.previous_boundary}->{runtime.current_boundary}"
+            f"{runtime.previous_boundary}->{runtime.current_boundary}, "
+            f"generation={runtime.generation}, "
+            f"command_generation={runtime.command_generation}, "
+            "transport=people_pathpoints"
+        )
+
+    def _observe_departure(
+        self,
+        runtime: RouteRuntime,
+        pose: Sequence[float],
+        now: float,
+    ) -> None:
+        agent_id = runtime.spec.agent_id
+        started_at = self._departure_started_at.get(agent_id)
+        if started_at is None or agent_id in self._departure_reported:
+            return
+        start, forward_target = runtime.spec.route_waypoints[:2]
+        dx, dy = forward_target[0] - start[0], forward_target[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return
+        ux, uy = dx / length, dy / length
+        offset_x, offset_y = float(pose[0]) - start[0], float(pose[1]) - start[1]
+        progress = offset_x * ux + offset_y * uy
+        lateral = abs(-offset_x * uy + offset_y * ux)
+        self._departure_max_lateral_m[agent_id] = max(
+            self._departure_max_lateral_m.get(agent_id, 0.0), lateral
+        )
+        elapsed = now - started_at
+        if elapsed < 2.0:
+            return
+        self._departure_reported.add(agent_id)
+        metadata = self._pose_metadata.get(agent_id, {})
+        try:
+            observed_yaw = float(metadata.get("yaw_rad", "nan"))
+        except (TypeError, ValueError):
+            observed_yaw = math.nan
+        fields = {
+            "agent_id": agent_id,
+            "episode_id": self.episode.episode_id,
+            "generation": runtime.generation,
+            "elapsed_sec": round(elapsed, 4),
+            "forward_progress_m": round(progress, 4),
+            "lateral_offset_m": round(lateral, 4),
+            "max_lateral_offset_m": round(self._departure_max_lateral_m[agent_id], 4),
+            "expected_root_yaw": round(float(runtime.spec.start_yaw or 0.0), 5),
+            "observed_root_yaw": None if not math.isfinite(observed_yaw) else round(observed_yaw, 5),
+        }
+        self.get_logger().info(
+            "Authored departure diagnostic: " + json.dumps(fields, sort_keys=True)
+        )
+        self._publish_status("pedestrian_departure_diagnostic", **fields)
+
+    def _announce_active(self, runtime: RouteRuntime) -> None:
+        if runtime.spec.agent_id in self._active_announced:
+            return
+        self._active_announced.add(runtime.spec.agent_id)
+        self._publish_status(
+            "pedestrian_active",
+            agent_id=runtime.spec.agent_id,
+            phase="AUTHORED_ROUTE",
+            episode_id=self.episode.episode_id,
+            generation=runtime.generation,
+            command_generation=runtime.command_generation,
+        )
+
+    def _publish_status(self, event: str, **fields) -> None:
+        if self._status_pub is None:
+            return
+        self._status_pub.publish(
+            String(data=json.dumps({"event": str(event), "source": "authored_route", **fields}, sort_keys=True))
         )
 
     def _send_stop(self, runtime: RouteRuntime) -> None:
@@ -218,20 +454,29 @@ class AuthoredScenarioNode(Node):
 
     def _retire(self, runtime: RouteRuntime, *, reason: str) -> None:
         runtime.state = "RETIRING"
-        request = DeletePrim.Request()
-        request.name = f"/World/Characters/{runtime.spec.agent_id}"
-        future = self._retire_client.call_async(request)
-        future.add_done_callback(
-            lambda result, agent_id=runtime.spec.agent_id: self._retire_done(
-                agent_id,
-                result,
-            )
-        )
+        self._retire_retry_at[runtime.spec.agent_id] = 0.0
+        self._request_retire(runtime)
         self.get_logger().info(
             f"Parking {runtime.spec.agent_id} after authored route: {reason}."
         )
 
+    def _request_retire(self, runtime: RouteRuntime) -> None:
+        agent_id = runtime.spec.agent_id
+        if agent_id in self._retire_inflight:
+            return
+        request = DeletePrim.Request()
+        request.name = f"/World/Characters/{agent_id}"
+        future = self._retire_client.call_async(request)
+        self._retire_inflight.add(agent_id)
+        future.add_done_callback(
+            lambda result, retired_agent=agent_id: self._retire_done(
+                retired_agent,
+                result,
+            )
+        )
+
     def _retire_done(self, agent_id: str, future) -> None:
+        self._retire_inflight.discard(agent_id)
         runtime = self._runtimes.get(agent_id)
         if runtime is None:
             return
@@ -242,13 +487,20 @@ class AuthoredScenarioNode(Node):
             success = False
             self.get_logger().error(f"Failed to park {agent_id}: {exc}")
         if not success:
-            self.get_logger().error(f"Bridge rejected parking {agent_id}")
-            self._finish(1)
+            self._retire_retry_at[agent_id] = time.monotonic() + 0.2
             return
         runtime.state = "COMPLETE"
+        self._retire_retry_at.pop(agent_id, None)
         self._poses.pop(agent_id, None)
         self._pose_times.pop(agent_id, None)
+        self._pose_metadata.pop(agent_id, None)
         self.get_logger().info(f"{agent_id} parked and removed from the visible scene.")
+        self._publish_status(
+            "pedestrian_retired",
+            agent_id=agent_id,
+            episode_id=self.episode.episode_id,
+            generation=runtime.generation,
+        )
 
     def _finish(self, exit_code: int) -> None:
         self.exit_code = int(exit_code)
@@ -300,6 +552,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-service", default="/isaac/reset_mecanum_episode")
     parser.add_argument("--retire-service", default="/isaac/delete_prim")
     parser.add_argument("--people-topic", default="/isaac/pedestrian_states")
+    parser.add_argument("--status-topic", default="/toilet_benchmark/pedestrian_runtime_status")
     parser.add_argument("--service-timeout-sec", type=float, default=20.0)
     parser.add_argument("--planner-radius-m", type=float, default=0.30)
     parser.add_argument("--skip-robot-reset", action="store_true")
@@ -333,6 +586,7 @@ def main(args: Sequence[str] | None = None) -> int:
             people_topic=namespace.people_topic,
             skip_robot_reset=namespace.skip_robot_reset,
             planner_radius_m=namespace.planner_radius_m,
+            status_topic=namespace.status_topic,
         )
         node.start(namespace.service_timeout_sec)
         while rclpy.ok() and not node.finished:

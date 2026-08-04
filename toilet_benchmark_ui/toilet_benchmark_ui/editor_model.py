@@ -16,6 +16,7 @@ from toilet_benchmark.episodes.schema import (
     TerminationSpec,
     TrackType,
 )
+from toilet_benchmark.tracks.authored_scenario_core import initial_character_root_yaw
 
 
 @dataclass(frozen=True)
@@ -303,13 +304,14 @@ class ScenarioDraft:
         for actor in self.pedestrians:
             if actor.spawn_pose is None:
                 raise ValueError(f"{actor.actor_id} spawn pose is required")
+            start_yaw = initial_character_root_yaw(actor.spawn_pose, actor.route)
             pedestrians.append(
                 PedestrianEpisodeSpec(
                     agent_id=actor.actor_id,
                     semantic_goal="route_terminal",
                     character=actor.character,
                     start_pose=actor.spawn_pose[:3],
-                    start_yaw=actor.spawn_pose[3],
+                    start_yaw=start_yaw,
                     route_waypoints=tuple(actor.route),
                     holds=tuple(
                         PedestrianHoldSpec(

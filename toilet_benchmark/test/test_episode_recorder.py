@@ -166,3 +166,72 @@ class TestEpisodeRecorder(unittest.TestCase):
         self.assertEqual(metadata["termination_reason"], "sigint")
         self.assertEqual(session_manifest["status"], "interrupted")
         self.assertEqual(metadata["event_count"], 1)
+
+    def test_authored_manifest_uses_episode_contract_without_urinal_fields(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name)
+        episode_path = root / "authored.json"
+        episode_path.write_text(
+            json.dumps(
+                {
+                    "task_type": "authored_route",
+                    "robot": {
+                        "start_pose": [1.0, 0.0, 0.03, 0.0],
+                        "goal_pose": [-3.8, -0.91, 0.0],
+                    },
+                    "pedestrians": [
+                        {"agent_id": "toilet_agent_01"},
+                        {"agent_id": "toilet_agent_02"},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = self._base_payload(root / "data")
+        payload["scenario_source"] = {"mode": "authored_route"}
+        payload["scenarios"] = [
+            {
+                "id": "authored",
+                "enabled": True,
+                "weight": 1.0,
+                "episode_path": str(episode_path),
+            }
+        ]
+        config = self._load_config(payload)
+        selection = ScenarioSelector(
+            config.scenarios, selection_mode="fixed", seed=config.session.seed
+        ).select()
+        recorder = EpisodeRecorder.from_config(config, session_id="authored_session")
+
+        recorder.start_episode(selection)
+        metadata_path = recorder.finalize_episode(status="succeeded")
+        scenario = yaml.safe_load(metadata_path.read_text(encoding="utf-8"))["scenario"]
+
+        self.assertEqual(scenario["source_mode"], "authored_route")
+        self.assertEqual(scenario["pedestrian_count"], 2)
+        self.assertEqual(
+            scenario["pedestrian_agent_ids"],
+            ["toilet_agent_01", "toilet_agent_02"],
+        )
+        self.assertNotIn("pedestrian_target_urinal_id", scenario)
+        self.assertNotIn("pedestrian_target_urinal_ids", scenario)
+
+    def test_start_failure_clears_partial_active_episode(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        config = self._load_config(self._base_payload(Path(tmpdir.name) / "data"))
+        selection = ScenarioSelector(
+            config.scenarios, selection_mode="fixed", seed=config.session.seed
+        ).select()
+        recorder = EpisodeRecorder.from_config(config, session_id="failed_session")
+        recorder._build_episode_manifest = lambda **_kwargs: (_ for _ in ()).throw(
+            ValueError("manifest failure")
+        )
+
+        with self.assertRaisesRegex(ValueError, "manifest failure"):
+            recorder.start_episode(selection)
+
+        self.assertFalse(recorder.has_active_episode)
+        with self.assertRaisesRegex(RuntimeError, "No active episode"):
+            recorder.finalize_episode(status="failed")

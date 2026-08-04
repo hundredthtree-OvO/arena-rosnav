@@ -1,5 +1,25 @@
 # 路线编辑器与运行链路清理计划
 
+## 2026-08-04 主线决策
+
+本计划不再冻结旧 People Navigation、HuNav/director 或双轨 compatibility 实现。Git 提交
+历史是唯一代码回退机制；仓库内不为回退保留第二套运行时、shadow 分支或旧状态机。
+
+第一交付目标收敛为一个可自动验收的 vertical slice：
+
+```text
+toilet_benchmark_ui/examples/narrow_head_on_001.json
+  -> authored ScenarioRuntime
+  -> 每个 agent 独立的路线游标和 episode generation
+  -> GlobalRouter + LocalMotionBackend
+  -> EmbodimentAdapter
+  -> Isaac AnimGraph（仅动画）/ 后续 SMPL-H
+```
+
+该 JSON 中的两个行人必须能在同一 bridge 内跨 episode 批量复现。事件、路线、速度和
+朝向的真值由 benchmark runtime 持有；不得再读取或复用 Isaac People 的 GoTo command、
+NavigationManager 路径游标或内部目标状态。
+
 ## 目标
 
 本计划为厕所社会导航 benchmark 增加一个独立的平面图路线编辑器，同时把行人事件、全局路线、局部运动和 Isaac 表现层的责任收敛到稳定接口。
@@ -14,7 +34,7 @@ route editor UI
   -> Isaac external_motion / AnimGraph / SMPL-H adapter
 ```
 
-## 阶段 0：基线冻结
+## 阶段 0：接口与验收夹具
 
 ### 冻结的操作面
 
@@ -34,15 +54,8 @@ python3 scripts/arena_scene_profile.py \
   spawn --phase physx_diff_contact
 ```
 
-当前基线运动入口：
-
-```bash
-ros2 run toilet_benchmark toilet_director_node \
-  --motion-backend hunav \
-  --initial-agents 1
-```
-
-`manual_collection_node`、`hunav_interactive_smoke` 和 Replay 入口继续作为已有 Track 的验证入口，不因 UI 清理而改变命令语义。
+默认验收入口是 `manual_collection_node` 加载 `narrow_head_on_001.json`。旧 director、
+HuNav smoke 和 Isaac People GoTo 不再属于必须保持的操作面。
 
 ### 基线记录内容
 
@@ -79,30 +92,20 @@ ros2 run toilet_benchmark toilet_director_node \
 - `motion/swept_envelope.py` 和几何安全接口；
 - `manual_collection_node.py`、recorder 和现有 benchmark CLI。
 
-### 暂存为 compatibility backend
+### 直接删除的旧运行链
 
-以下内容仍被现有入口或测试引用，第一轮只隔离职责，不直接删除：
+新 vertical slice 通过后，直接删除而不是封存：
 
-- `hunav_motion_backend.py`：当前 HuNav Interactive 兼容实现；
-- `hunav_adapter.py`：director 兼容状态镜像；
-- `hunav_isaac_mirror*.py`：HuNav/Isaac 对照工具；
-- `hunav_phase0_*.py`：隔离实验和安全投影工具；
-- `voxel_path_planner.py`：旧 `isaac_people` compatibility 路径；
-- portal recovery 和 `use_direct_pose`：只保留在 compatibility 生命周期边界。
+- `toilet_director_node` 的 People/HuNav/portal/voxel 运动分支；
+- `IsaacPeopleBackend` 的 GoTo/NavigationManager 路径所有权；
+- HuNav mirror、takeover 和 phase0 生产入口；
+- 为旧路径恢复服务的 stall recovery、direct-pose 对齐和重复 hard guard；
+- 不再被 setup entry point、authored runtime 或测试引用的配置与实验代码。
 
-当前连续运动主链使用 `walkable_map` 路线和 external motion；voxel 路径不能再作为新 UI 或新局部运动的隐式依赖。只有兼容 backend 明确选择时才允许使用它。
+删除前只要求：新链路完成下述 `narrow_head_on_001` 验收、当前改动形成 Git 提交、引用
+扫描通过。无需 shadow 对照，也不在源码中保留回退开关。
 
-### 后续可删除项
-
-只有满足以下条件后，才删除历史实验脚本、旧 portal/voxel 分支和重复配置：
-
-1. 固定 seed 单人、双人和 2-4 人 smoke 通过；
-2. Replay 轨迹和 Interactive 事件终态通过 validator；
-3. 新 backend 已覆盖旧入口需要的 spawn、hold、resume、terminal align 和 retire；
-4. 旧模块没有被 `rg`、setup entry point、测试或文档操作面引用；
-5. 完成一次 shadow 对照并保留可回退 tag。
-
-因此本阶段禁止使用 `git reset`、批量删除或覆盖用户未提交修改。
+历史文档可以删除；仍有设计价值的结论应先压缩进当前规范，而不是保留整套旧操作说明。
 
 ## 阶段 2：路线和 subgoal 契约
 
@@ -186,12 +189,90 @@ warning，而不是静默地把坐标变换成另一个 frame。
 
 ## 验收门槛
 
-- UI 不启动时，现有固定 seed 行为不改变；
+- 同一 bridge 连续执行至少 30 个 `narrow_head_on_001` episode；
+- 两名行人每轮出生误差、初始 yaw 和首段路线一致，不出现第二轮漂移；
+- 每名行人拥有独立 generation、路线游标、速度状态和终态，禁止共享 People command；
+- 行人先到先 retire，下一轮不继承上一轮路径、朝向或动画状态；
+- 机器人每轮 reset 后手柄可控，wheel actual、tire force 和 odom 均有效；
+- 固定 seed 的事件序列和路径在约定容差内可复现；
 - UI route edit 不产生瞬移或动画脱节；
 - 非法路线被拒绝并给出原因；
 - subgoal 结束后能回接原全局路线；
 - 同一个 seed、路线版本和 UI 操作时间线可以 Replay；
-- UI 关闭、重启或断开不会使 bridge 或 director 崩溃。
+- UI 关闭、重启或断开不会使 bridge 或 authored runtime 崩溃。
+
+### 首轮量化阈值
+
+- episode 完成率：`30/30`；
+- agent 激活位置误差：`<= 0.05 m`；
+- 激活 yaw 误差：`<= 0.10 rad`；
+- 跨 episode 非命令位移跳变：`<= 0.03 m`；
+- 行人静态几何穿透：`0`；
+- 行人间重叠：`0`；
+- robot reset 后命令非零但 odom 零响应：`0`；
+- `reset_apply_failed`、People cursor reuse 和 AnimGraph root reuse：`0`。
+
+## 后续实施顺序
+
+### P1：切断 People 的任务状态所有权
+
+1. `toilet_authored_scenario` 直接从 EpisodeSpec 建立每个 agent 的 `RoutePlan`；
+2. 每个 agent 持有独立的 generation、route cursor、phase 和 terminal state；
+3. benchmark 每个 phase 只提交一次冻结的完整 `PathPoints`；
+4. People/MotionMatching 只负责低层路径消费和动画，不生成语义目标、事件或终态；
+5. benchmark 使用实际 pose 判定 hold、下一 phase 和 retire，不读取 People 内部到达状态。
+
+当前实现状态（2026-08-04）：
+
+- `toilet_authored_scenario` 已为每个 agent 独立维护 generation、phase boundary、hold 和
+  terminal state；
+- authored runner 将 benchmark 规划出的整段 `PathPoints` 交给 People/MotionMatching，保留
+  Isaac 原生连续步态和转弯；
+- `/isaac/pedestrian_states` 用于出生确认和 benchmark-owned waypoint 到达判定；不读取
+  `NavigationManager` 的目标、路径游标或终态；
+- spawn/reactivate 和最终 park 仍复用 bridge 服务，这部分属于 embodiment 生命周期，不拥有路线；
+- P1 纯 Python 契约和 phase 状态测试已通过。跨 episode 复位握手与 30 轮 Isaac 验收属于 P2/P3，
+  不能用本阶段单测替代。
+
+### P2：确定性 episode reset
+
+1. 预生成固定数量角色，不增删 USD prim；
+2. 结束本轮后停止 motion、关闭碰撞代理并移至 parking pose；
+3. 清空 benchmark-owned motion buffer、route cursor 和 adapter 动画状态；
+4. 下一轮写入 spawn pose/yaw，等待固定 warmup frame，再提交 generation 对应的首条命令；
+5. reset 全程不 pause/play timeline，不重建机器人 PhysX。
+
+当前实现状态（2026-08-04）：
+
+- pooled `Person` 每次 reactivate 都递增独立 `embodiment_generation`；
+- bridge 在 `/isaac/pedestrian_states` 中发布 `embodiment_generation` 和
+  `reactivation_ready`，后者只有 AnimGraph ready、pose valid 且 4 帧 stabilization 完成后
+  才为 true；
+- authored runner 在看到有效 embodiment generation 和出生误差 `<= 0.15 m` 后，将第一段
+  完整 `PathPoints` 预提交到 Person 的 command generation；该命令在 4 帧 stabilization 内
+  只缓存、不执行；
+- warmup 结束后 bridge 派发缓存命令，状态话题必须回报同一 embodiment generation、预期
+  command generation 且 `motion_state=executing`，runner 才发布 `pedestrian_active`；
+- active/retired 状态携带同一个 embodiment generation，旧进程或旧 episode 的事件不能冒充
+  本轮角色；
+- manual collection 每轮清空 generation roster，并等待全部预期行人 active 后才释放机器人手柄；
+- park 仍要求 People command/path 完全 drain；整个过程不 pause timeline、不重建机器人 PhysX。
+
+上述握手和单元契约已完成；同一 bridge 的 5/30 轮 Isaac 量化验证仍分别属于 P2 收尾和 P3。
+
+### P3：双行人批量数采闭环
+
+1. `manual_collection_node` 默认加载 `narrow_head_on_001.json`；
+2. authored runtime 发布每名行人的 activated/retired/failed 明确终态；
+3. recorder 将 EpisodeSpec hash、seed、generation 和两条实际轨迹写入 metadata；
+4. 增加连续 30 轮 runner 和上述量化 gate；
+5. gate 通过后才允许扩展 UI 场景和人数。
+
+### P4：删除旧链路
+
+按 `rg -> setup.py -> tests -> docs` 顺序删除旧 director、HuNav、People Navigation、
+portal/voxel recovery 和失效文档；随后运行完整测试和一次 30 轮 Isaac 回归。P4 不建立
+compatibility package，也不保留禁用代码块。
 
 ## 本轮执行状态
 

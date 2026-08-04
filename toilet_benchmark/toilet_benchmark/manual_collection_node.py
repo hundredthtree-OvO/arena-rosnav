@@ -19,45 +19,36 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from std_msgs.msg import String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 
 from .collection_scenarios import ScenarioSelection, ScenarioSelector, load_manual_collection_config
 from .domain.events import decode_json_payload
 from .episode_recorder import EpisodeRecorder
 
 
+_AUTHORED_SCENARIO_NODE_NAME = "toilet_authored_scenario"
+_AUTHORED_CANCEL_SERVICE = "/toilet_authored_scenario/cancel"
+
+
 def _default_config_path() -> str:
     return os.path.join(get_package_share_directory("toilet_benchmark"), "config", "manual_collection.yaml")
 
 
-def _build_director_command(
+def _build_authored_scenario_command(
     *,
-    semantics_path: str,
-    benchmark_path: str,
-    pedestrian_count: int,
-    character_name: str,
-    character_pool: tuple[str, ...],
-    target_resource_ids: tuple[str, ...],
+    episode_path: str,
+    status_topic: str = "/toilet_benchmark/pedestrian_runtime_status",
 ) -> list[str]:
-    command = [
+    return [
         sys.executable,
         "-m",
-        "toilet_benchmark.toilet_director_node",
-        "--semantics",
-        semantics_path,
-        "--benchmark",
-        benchmark_path,
-        "--initial-agents",
-        str(pedestrian_count),
-        "--character-name",
-        character_name,
+        "toilet_benchmark.tracks.authored_scenario",
+        "--episode",
+        str(episode_path),
+        "--skip-robot-reset",
+        "--status-topic",
+        status_topic,
     ]
-    if character_pool:
-        command.extend(["--character-pool", ",".join(character_pool)])
-    for resource_id in target_resource_ids:
-        command.extend(["--target-resource", resource_id])
-    command.extend(["--status-topic", "/toilet_benchmark/director_status"])
-    return command
 
 
 def _yaw_from_quaternion(quaternion) -> float:
@@ -74,6 +65,16 @@ def _angle_distance(a: float, b: float) -> float:
 
 def _planar_distance(a, b) -> float:
     return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def _authored_runtime_nodes(nodes: list[tuple[str, str]]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            f"{namespace.rstrip('/')}/{name}" if namespace != "/" else f"/{name}"
+            for name, namespace in nodes
+            if name == _AUTHORED_SCENARIO_NODE_NAME
+        )
+    )
 
 
 class _ShutdownSignalLatch:
@@ -96,6 +97,16 @@ class ManualCollectionNode(Node):
         self.config_path = str(Path(config_path).expanduser().resolve())
         self.raw_config = yaml.safe_load(Path(self.config_path).read_text(encoding="utf-8")) or {}
         self.config = load_manual_collection_config(self.raw_config)
+        unsupported = [
+            scenario.id
+            for scenario in self.config.scenarios
+            if scenario.source_mode != "authored_route"
+        ]
+        if unsupported:
+            raise ValueError(
+                "manual collection only supports authored_route scenarios; "
+                f"unsupported scenarios: {unsupported}"
+            )
         self.selector = ScenarioSelector(
             self.config.scenarios,
             selection_mode=self.config.session.selection_mode,
@@ -125,11 +136,22 @@ class ManualCollectionNode(Node):
         episode_cfg = self.raw_config.get("episode", {}) or {}
         session_cfg = self.raw_config.get("session", {}) or {}
         events_cfg = self.raw_config.get("events", {}) or {}
+        collision_cfg = self.raw_config.get("collision_policy", {}) or {}
         self.robot_name = str(robot_cfg.get("name", "xms_mecanum"))
         self.reset_service_name = str(robot_cfg.get("reset_service", "/isaac/reset_mecanum_episode"))
         self.control_hold_service_name = str(
             robot_cfg.get("control_hold_service", "/isaac/set_mecanum_control_hold")
         )
+        self.hard_guard_service_name = str(
+            collision_cfg.get("hard_guard_service", "/isaac/set_pedestrian_hard_guard")
+        )
+        self.pedestrian_robot_collision_mode = str(
+            collision_cfg.get("pedestrian_robot", "detect_and_fail")
+        ).strip().lower()
+        if self.pedestrian_robot_collision_mode not in {"detect_and_fail", "hard_guard"}:
+            raise ValueError(
+                "collision_policy.pedestrian_robot must be detect_and_fail or hard_guard"
+            )
         self.odom_topic = str(robot_cfg.get("odom_topic", "/odom"))
         self.recording_enabled = recording_enabled
         self.bag_ready_timeout_sec = max(2.0, float(recording_cfg.get("ready_timeout_sec", 10.0)))
@@ -141,14 +163,13 @@ class ManualCollectionNode(Node):
             )
             if str(topic).strip()
         )
-        self.agent_ids = self.config.pedestrian.agent_ids
-        self.pedestrian_count = self.config.pedestrian.count
-        self.character_name = str(pedestrian_cfg.get("character_name", "original_female_adult_business_02"))
-        self.character_pool = self.config.pedestrian.character_pool
         self.parking_service_name = str(pedestrian_cfg.get("parking_service", "/isaac/delete_prim"))
-        self.semantics_path = str(pedestrian_cfg.get("semantics_path", ""))
-        self.benchmark_path = str(pedestrian_cfg.get("benchmark_path", ""))
         self.inter_episode_delay_sec = max(0.0, float(session_cfg.get("inter_episode_delay_sec", 1.0)))
+        self.parking_timeout_sec = max(1.0, float(session_cfg.get("parking_timeout_sec", 5.0)))
+        self.authored_runtime_exit_timeout_sec = max(
+            5.0,
+            float(session_cfg.get("authored_runtime_exit_timeout_sec", 60.0)),
+        )
         self.settle_min_stable_sec = max(0.0, float(episode_cfg.get("settle_min_stable_sec", 0.6)))
         self.settle_position_tolerance_m = max(
             0.01, float(episode_cfg.get("settle_position_tolerance_m", 0.08))
@@ -159,15 +180,34 @@ class ManualCollectionNode(Node):
         self.pedestrian_start_timeout_sec = max(
             2.0, float(episode_cfg.get("pedestrian_start_timeout_sec", 20.0))
         )
+        self.pedestrian_status_topic = str(
+            events_cfg.get(
+                "pedestrian_status_topic",
+                "/toilet_benchmark/pedestrian_runtime_status",
+            )
+        )
 
         self._reset_client = self.create_client(ResetRobot, self.reset_service_name)
         self._control_hold_client = self.create_client(SetBool, self.control_hold_service_name)
+        self._hard_guard_control_client = self.create_client(SetBool, self.hard_guard_service_name)
         self._parking_client = self.create_client(DeletePrim, self.parking_service_name)
+        self._authored_cancel_client = self.create_client(Trigger, _AUTHORED_CANCEL_SERVICE)
         self._odom_sub = self.create_subscription(Odometry, self.odom_topic, self._odom_cb, 20)
         self._hard_guard_sub = self.create_subscription(
             String,
             str(events_cfg.get("hard_guard_topic", "/isaac/pedestrian_hard_guard_events")),
             self._hard_guard_cb,
+            20,
+        )
+        self._pedestrian_contact_sub = self.create_subscription(
+            String,
+            str(
+                events_cfg.get(
+                    "pedestrian_contact_topic",
+                    "/isaac/pedestrian_contact_events",
+                )
+            ),
+            self._pedestrian_contact_cb,
             20,
         )
         self._scene_collision_sub = self.create_subscription(
@@ -182,10 +222,10 @@ class ManualCollectionNode(Node):
             self._reset_status_cb,
             20,
         )
-        self._director_status_sub = self.create_subscription(
+        self._pedestrian_status_sub = self.create_subscription(
             String,
-            "/toilet_benchmark/director_status",
-            self._director_status_cb,
+            self.pedestrian_status_topic,
+            self._pedestrian_status_cb,
             20,
         )
         self._status_pub = self.create_publisher(String, "/toilet_benchmark/collection_status", 10)
@@ -201,17 +241,31 @@ class ManualCollectionNode(Node):
         self._expected_reset_generation = 0
         self._reset_status_by_generation: dict[int, dict] = {}
         self._episode_started_at = 0.0
-        self._director_process: subprocess.Popen | None = None
+        self._pedestrian_process: subprocess.Popen | None = None
+        self._active_pedestrian_generations: dict[str, int] = {}
         self._episodes_finished = 0
         self._finishing = False
+        self._pending_parking: set[str] = set()
+        self._parking_inflight: set[str] = set()
+        self._parking_failures: list[str] = []
+        self._next_parking_retry_at = 0.0
         self._control_hold_enabled = False
         self._shutdown_requested = False
         self._last_status = None
         self.get_logger().info(
             f"Manual collection ready: config={self.config_path}, session={session_id}, "
             f"mode={self.selector.mode}, seed={self.selector.seed}, recording={recording_enabled}, "
-            f"pedestrians={self.pedestrian_count}"
+            f"scenario_source=authored_route, "
+            f"pedestrian_robot_collision={self.pedestrian_robot_collision_mode}"
         )
+
+    def _active_agent_ids(self) -> tuple[str, ...]:
+        if self._selection is None:
+            return ()
+        return self._selection.scenario.pedestrian_agent_ids
+
+    def _active_pedestrian_count(self) -> int:
+        return len(self._active_agent_ids())
 
     def _set_state(self, state: str) -> None:
         self._state = str(state)
@@ -225,7 +279,7 @@ class ManualCollectionNode(Node):
             "scenario_id": scenario_id,
             "episodes_finished": self._episodes_finished,
             "coverage": self.selector.coverage_counts,
-            "pedestrian_count": self.pedestrian_count,
+            "pedestrian_count": self._active_pedestrian_count(),
         }
         encoded = json.dumps(payload, sort_keys=True)
         if force or encoded != self._last_status:
@@ -253,12 +307,36 @@ class ManualCollectionNode(Node):
             return
         self.recorder.record_event("hard_guard_intervention", self._event_payload(message))
 
+    def _pedestrian_contact_cb(self, message: String) -> None:
+        if self._state != "RUNNING" or self._finishing:
+            return
+        payload = self._event_payload(message)
+        if str(payload.get("robot", "")) != self.robot_name:
+            return
+        self.get_logger().error(
+            "Robot-human contact detected; failing and holding this episode: "
+            f"pedestrian={payload.get('pedestrian')}, "
+            f"penetration_m={float(payload.get('penetration_m', 0.0)):.4f}."
+        )
+        self.recorder.record_event("robot_human_collision", payload)
+        self._finish_episode(
+            "failed",
+            "robot_human_collision",
+            extra={"collision": payload},
+            abort_pedestrian_runtime=True,
+        )
+
     def _scene_collision_cb(self, message: String) -> None:
         if self._state != "RUNNING" or self._finishing:
             return
         payload = self._event_payload(message)
         self.recorder.record_event("scene_collision", payload)
-        self._finish_episode("failed", "scene_collision", extra={"collision": payload})
+        self._finish_episode(
+            "failed",
+            "scene_collision",
+            extra={"collision": payload},
+            abort_pedestrian_runtime=True,
+        )
 
     def _reset_status_cb(self, message: String) -> None:
         payload = self._event_payload(message)
@@ -286,20 +364,33 @@ class ManualCollectionNode(Node):
                 extra={"reset_status": payload},
             )
 
-    def _director_status_cb(self, message: String) -> None:
+    def _pedestrian_status_cb(self, message: String) -> None:
         if self._state != "WAIT_PEDESTRIAN":
             return
         payload = self._event_payload(message)
-        if payload.get("event") != "pedestrian_active" or payload.get("agent_id") not in self.agent_ids:
+        if (
+            payload.get("event") != "pedestrian_active"
+            or payload.get("agent_id") not in self._active_agent_ids()
+        ):
             return
         if self._selection is None:
             return
-        if payload.get("resource_id") not in self._selection.scenario.pedestrian_target_urinal_ids:
-            return
+        scenario = self._selection.scenario
         active_agent_id = str(payload.get("agent_id"))
+        generation = int(payload.get("generation", 0) or 0)
+        if generation <= 0:
+            return
+        self._active_pedestrian_generations[active_agent_id] = generation
+        expected_agents = set(self._active_agent_ids())
+        if set(self._active_pedestrian_generations) != expected_agents:
+            self.get_logger().info(
+                f"Pedestrian {active_agent_id} generation {generation} is ready; "
+                f"waiting for {sorted(expected_agents - set(self._active_pedestrian_generations))}."
+            )
+            return
         self.get_logger().info(
-            f"Pedestrian {active_agent_id} is active at resource target {payload.get('resource_id')}; "
-            "releasing operator control while remaining pedestrians activate on schedule."
+            f"All pedestrians are active from {scenario.source_mode}: "
+            f"generations={self._active_pedestrian_generations}; releasing operator control."
         )
         self._request_control_release()
 
@@ -312,14 +403,34 @@ class ManualCollectionNode(Node):
             if (
                 self._reset_client.wait_for_service(timeout_sec=0.0)
                 and self._control_hold_client.wait_for_service(timeout_sec=0.0)
+                and self._hard_guard_control_client.wait_for_service(timeout_sec=0.0)
                 and self._parking_client.wait_for_service(timeout_sec=0.0)
             ):
-                self._next_episode_at = now
-                self._set_state("BETWEEN_EPISODES")
+                request = SetBool.Request()
+                request.data = self.pedestrian_robot_collision_mode == "hard_guard"
+                future = self._hard_guard_control_client.call_async(request)
+                future.add_done_callback(self._hard_guard_policy_done)
+                self._set_state("WAIT_GUARD_POLICY")
+            return
+        if self._state == "WAIT_GUARD_POLICY":
+            if now - self._state_started_at > self.bag_ready_timeout_sec:
+                self.request_shutdown("hard_guard_policy_timeout")
             return
         if self._state == "BETWEEN_EPISODES":
             if now >= self._next_episode_at:
                 self._begin_episode()
+            return
+        if self._state == "WAIT_PEDESTRIAN_PARK":
+            if now - self._state_started_at > self.parking_timeout_sec:
+                self.get_logger().error(
+                    f"Pedestrian parking timed out: pending={sorted(self._pending_parking)}"
+                )
+                self.request_shutdown("pedestrian_parking_timeout")
+            elif now >= self._next_parking_retry_at:
+                self._request_pending_pedestrian_parks()
+            return
+        if self._state == "WAIT_AUTHORED_RUNTIME_EXIT":
+            self._advance_authored_runtime_exit(now)
             return
         if self._state in {"WAIT_CONTROL_HOLD", "WAIT_CONTROL_RELEASE"}:
             if now - self._state_started_at > self.bag_ready_timeout_sec:
@@ -340,8 +451,8 @@ class ManualCollectionNode(Node):
             self._advance_running(now)
             return
         if self._state == "WAIT_PEDESTRIAN":
-            if self._director_process is not None and self._director_process.poll() not in (None, 0):
-                self._finish_episode("failed", "pedestrian_director_failed", episode_started=False)
+            if self._pedestrian_process is not None and self._pedestrian_process.poll() not in (None, 0):
+                self._finish_episode("failed", "pedestrian_runtime_failed", episode_started=False)
             elif now - self._state_started_at > self.pedestrian_start_timeout_sec:
                 self._finish_episode("failed", "pedestrian_start_timeout", episode_started=False)
 
@@ -356,6 +467,26 @@ class ManualCollectionNode(Node):
         future = self._control_hold_client.call_async(request)
         future.add_done_callback(self._control_hold_done)
         self._set_state("WAIT_CONTROL_HOLD")
+
+    def _hard_guard_policy_done(self, future) -> None:
+        if self._state != "WAIT_GUARD_POLICY":
+            return
+        try:
+            response = future.result()
+            accepted = bool(response.success)
+            message = str(response.message)
+        except Exception as exc:
+            accepted = False
+            message = str(exc)
+        if not accepted:
+            self.get_logger().error(f"Could not configure pedestrian hard guard: {message}")
+            self.request_shutdown("hard_guard_policy_rejected")
+            return
+        self.get_logger().info(
+            f"Manual collection pedestrian/robot policy applied: {message}"
+        )
+        self._next_episode_at = time.monotonic()
+        self._set_state("BETWEEN_EPISODES")
 
     def _control_hold_done(self, future) -> None:
         if self._state != "WAIT_CONTROL_HOLD":
@@ -398,8 +529,7 @@ class ManualCollectionNode(Node):
         self._set_state("RESETTING")
         self.get_logger().info(
             f"Resetting robot for selection {self._selection.selection_index}: "
-            f"scenario={scenario.id}, start={list(scenario.robot_start)}, "
-            f"pedestrian_targets={list(scenario.pedestrian_target_urinal_ids)}"
+            f"scenario={scenario.id}, start={list(scenario.robot_start)}"
         )
 
     def _reset_done(self, future) -> None:
@@ -522,30 +652,45 @@ class ManualCollectionNode(Node):
     def _start_pedestrian(self) -> None:
         if self._selection is None:
             return
-        command = _build_director_command(
-            semantics_path=self.semantics_path,
-            benchmark_path=self.benchmark_path,
-            pedestrian_count=self.pedestrian_count,
-            character_name=self.character_name,
-            character_pool=self.character_pool,
-            target_resource_ids=self._selection.scenario.pedestrian_target_urinal_ids,
+        scenario = self._selection.scenario
+        existing_runtimes = _authored_runtime_nodes(
+            self.get_node_names_and_namespaces()
         )
-        try:
-            self._director_process = subprocess.Popen(command, start_new_session=True)
-        except Exception as exc:
-            self.get_logger().error(f"Failed to start pedestrian director: {exc}")
+        if existing_runtimes:
+            message = (
+                "An authored pedestrian runtime is already running: "
+                f"{list(existing_runtimes)}. Stop the standalone "
+                "toilet_authored_scenario process; manual_collection_node "
+                "starts the same runner itself and must be the only route owner."
+            )
+            self.get_logger().error(message)
             self._finish_episode(
                 "failed",
-                "pedestrian_director_start_failed",
+                "pedestrian_runtime_already_running",
+                episode_started=False,
+                extra={"nodes": list(existing_runtimes), "message": message},
+            )
+            return
+        self._active_pedestrian_generations = {}
+        command = _build_authored_scenario_command(
+            episode_path=str(scenario.episode_path),
+            status_topic=self.pedestrian_status_topic,
+        )
+        try:
+            self._pedestrian_process = subprocess.Popen(command, start_new_session=True)
+        except Exception as exc:
+            self.get_logger().error(f"Failed to start pedestrian runtime: {exc}")
+            self._finish_episode(
+                "failed",
+                "pedestrian_runtime_start_failed",
                 episode_started=False,
                 extra={"message": str(exc)},
             )
             return
         self._set_state("WAIT_PEDESTRIAN")
         self.get_logger().info(
-            f"Started pedestrian director for scenario={self._selection.scenario.id}, "
-            f"agents={list(self.agent_ids)}, "
-            f"targets={list(self._selection.scenario.pedestrian_target_urinal_ids)}; "
+            f"Started pedestrian runtime={scenario.source_mode} for scenario={scenario.id}, "
+            f"agents={list(self._active_agent_ids())}; "
             "waiting for the first pedestrian_active before releasing operator control."
         )
 
@@ -584,9 +729,11 @@ class ManualCollectionNode(Node):
             "episode_started",
             {
                 "scenario_id": self._selection.scenario.id,
-                "pedestrian_count": self.pedestrian_count,
-                "pedestrian_agent_ids": list(self.agent_ids),
-                "pedestrian_targets": list(self._selection.scenario.pedestrian_target_urinal_ids),
+                "scenario_source": self._selection.scenario.source_mode,
+                "episode_path": self._selection.scenario.episode_path,
+                "episode_sha256": self._selection.scenario.episode_sha256,
+                "pedestrian_count": self._active_pedestrian_count(),
+                "pedestrian_agent_ids": list(self._active_agent_ids()),
             },
         )
         self._episode_started_at = time.monotonic()
@@ -600,10 +747,10 @@ class ManualCollectionNode(Node):
         if now - self._episode_started_at > self.config.episode.timeout_sec:
             self._finish_episode("failed", "episode_timeout")
             return
-        if self._director_process is not None:
-            return_code = self._director_process.poll()
+        if self._pedestrian_process is not None:
+            return_code = self._pedestrian_process.poll()
             if return_code not in (None, 0):
-                self._finish_episode("failed", "pedestrian_director_failed", extra={"return_code": return_code})
+                self._finish_episode("failed", "pedestrian_runtime_failed", extra={"return_code": return_code})
                 return
         if self._selection is None or self._latest_odom is None:
             return
@@ -615,9 +762,9 @@ class ManualCollectionNode(Node):
         ):
             self._finish_episode("succeeded", "robot_reached_goal")
 
-    def _stop_director(self) -> None:
-        process = self._director_process
-        self._director_process = None
+    def _stop_pedestrian_runtime(self) -> None:
+        process = self._pedestrian_process
+        self._pedestrian_process = None
         if process is None or process.poll() is not None:
             return
         try:
@@ -633,18 +780,100 @@ class ManualCollectionNode(Node):
                 except Exception:
                     pass
 
-    def _park_pedestrians(self) -> None:
+    def _advance_authored_runtime_exit(self, now: float) -> None:
+        process = self._pedestrian_process
+        return_code = None if process is None else process.poll()
+        if process is not None and return_code is None:
+            if now - self._state_started_at <= self.authored_runtime_exit_timeout_sec:
+                return
+            self.get_logger().error(
+                "Authored runtime did not retire its pedestrians within "
+                f"{self.authored_runtime_exit_timeout_sec:.1f}s; using forced parking fallback."
+            )
+            agent_ids = self._active_agent_ids()
+            self._stop_pedestrian_runtime()
+            self._start_pedestrian_parking(agent_ids)
+            return
+
+        self._pedestrian_process = None
+        if return_code in (None, 0):
+            self.get_logger().info(
+                "Authored runtime completed its own pedestrian retirement; "
+                "advancing to the next collection episode."
+            )
+            self._complete_episode_cleanup()
+            return
+
+        self.get_logger().error(
+            f"Authored runtime exited with code {return_code}; using forced parking fallback."
+        )
+        self._start_pedestrian_parking(self._active_agent_ids())
+
+    def _park_pedestrians_best_effort(self) -> None:
         if not self.context.ok():
             return
         if not self._parking_client.service_is_ready():
             return
-        for agent_id in self.agent_ids:
+        for agent_id in self._active_agent_ids():
             try:
                 request = DeletePrim.Request()
                 request.name = f"/World/Characters/{agent_id}"
                 self._parking_client.call_async(request)
             except Exception as exc:
                 self.get_logger().warning(f"Could not park pedestrian {agent_id} during cleanup: {exc}")
+
+    def _start_pedestrian_parking(self, agent_ids: tuple[str, ...]) -> None:
+        self._pending_parking = set(agent_ids)
+        self._parking_inflight = set()
+        self._parking_failures = []
+        if not self._pending_parking or not self._parking_client.service_is_ready():
+            self._complete_episode_cleanup()
+            return
+        self._set_state("WAIT_PEDESTRIAN_PARK")
+        self._request_pending_pedestrian_parks()
+
+    def _request_pending_pedestrian_parks(self) -> None:
+        self._next_parking_retry_at = time.monotonic() + 0.2
+        for agent_id in sorted(self._pending_parking - self._parking_inflight):
+            request = DeletePrim.Request()
+            request.name = f"/World/Characters/{agent_id}"
+            future = self._parking_client.call_async(request)
+            self._parking_inflight.add(agent_id)
+            future.add_done_callback(
+                lambda result, parked_agent=agent_id: self._pedestrian_park_done(
+                    parked_agent, result
+                )
+            )
+
+    def _pedestrian_park_done(self, agent_id: str, future) -> None:
+        self._parking_inflight.discard(agent_id)
+        if agent_id not in self._pending_parking:
+            return
+        try:
+            response = future.result()
+            success = bool(response is not None and response.ret)
+        except Exception as exc:
+            success = False
+            self.get_logger().error(f"Failed to park {agent_id}: {exc}")
+        if success:
+            self._pending_parking.discard(agent_id)
+        if not self._pending_parking:
+            self._complete_episode_cleanup()
+
+    def _complete_episode_cleanup(self) -> None:
+        if self._parking_failures:
+            self.get_logger().error(
+                f"Pedestrian parking failed: {sorted(self._parking_failures)}"
+            )
+            self._pending_parking.clear()
+            self.request_shutdown("pedestrian_parking_failed")
+            return
+        self._pending_parking.clear()
+        self._parking_inflight.clear()
+        self._selection = None
+        self._next_episode_at = time.monotonic() + self.inter_episode_delay_sec
+        self._finishing = False
+        self._set_state("BETWEEN_EPISODES")
 
     def _engage_control_hold_best_effort(self) -> None:
         if not self.context.ok():
@@ -666,6 +895,7 @@ class ManualCollectionNode(Node):
         *,
         episode_started: bool = True,
         extra: dict | None = None,
+        abort_pedestrian_runtime: bool = False,
     ) -> None:
         if self._finishing:
             return
@@ -677,23 +907,69 @@ class ManualCollectionNode(Node):
                 self.recorder.record_event("episode_finished", {"status": status, "reason": reason})
             except RuntimeError:
                 recording_prepared = False
-        self._stop_director()
-        self._park_pedestrians()
         if recording_prepared:
             self.recorder.finalize_episode(status=status, termination_reason=reason, extra=extra or {})
             self._episodes_finished += 1
         else:
             self.get_logger().error(f"Episode preparation failed before recording: {reason}")
         self.get_logger().info(f"Episode finished: status={status}, reason={reason}")
-        self._selection = None
-        self._next_episode_at = time.monotonic() + self.inter_episode_delay_sec
-        self._finishing = False
-        self._set_state("BETWEEN_EPISODES")
+        if abort_pedestrian_runtime:
+            process = self._pedestrian_process
+            if (
+                process is not None
+                and process.poll() is None
+                and self._authored_cancel_client.service_is_ready()
+            ):
+                future = self._authored_cancel_client.call_async(Trigger.Request())
+                future.add_done_callback(self._authored_cancel_done)
+                self._set_state("WAIT_AUTHORED_RUNTIME_EXIT")
+                self.get_logger().info(
+                    "Collision recorded as an immediate episode failure; waiting for "
+                    "the authored runtime to stop and park pedestrians gracefully."
+                )
+                return
+            agent_ids = self._active_agent_ids()
+            self.get_logger().warning(
+                "Authored cancel service is unavailable; using forced process stop and parking fallback."
+            )
+            self._stop_pedestrian_runtime()
+            self._start_pedestrian_parking(agent_ids)
+            return
+        process = self._pedestrian_process
+        if process is not None and process.poll() is None:
+            self._set_state("WAIT_AUTHORED_RUNTIME_EXIT")
+            self.get_logger().info(
+                "Waiting for authored runtime to finish its own People stop and pedestrian retirement."
+            )
+            return
+        self._advance_authored_runtime_exit(time.monotonic())
+
+    def _authored_cancel_done(self, future) -> None:
+        try:
+            response = future.result()
+            accepted = bool(response is not None and response.success)
+            message = "" if response is None else str(response.message)
+        except Exception as exc:
+            accepted = False
+            message = str(exc)
+        if accepted:
+            self.get_logger().info(f"Authored graceful cancellation accepted: {message}")
+            return
+        self.get_logger().error(
+            f"Authored graceful cancellation was rejected: {message}; using forced fallback."
+        )
+        agent_ids = self._active_agent_ids()
+        self._stop_pedestrian_runtime()
+        self._start_pedestrian_parking(agent_ids)
 
     def request_shutdown(self, reason: str = "operator_request") -> None:
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
+        if self._hard_guard_control_client.service_is_ready():
+            request = SetBool.Request()
+            request.data = True
+            self._hard_guard_control_client.call_async(request)
         self._engage_control_hold_best_effort()
 
         active_episode = self.recorder.has_active_episode
@@ -704,8 +980,8 @@ class ManualCollectionNode(Node):
                 self.get_logger().error(f"Failed to record shutdown event: {exc}")
 
         # Local subprocess cleanup must not depend on a live ROS context.
-        self._stop_director()
-        self._park_pedestrians()
+        self._stop_pedestrian_runtime()
+        self._park_pedestrians_best_effort()
 
         if active_episode:
             try:

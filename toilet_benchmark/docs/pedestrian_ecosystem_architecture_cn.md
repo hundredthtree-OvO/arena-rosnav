@@ -4,6 +4,10 @@
 冻结日期：2026-08-01
 适用范围：后续事件系统重构、Interactive Track、Replay Track 和表现层替换
 
+2026-08-04 决策补充：冻结的是领域职责和 `MotionCommand` 等外部契约，不冻结旧实现。
+旧 director、HuNav、Isaac People Navigation 和 compatibility backend 不作为源码回退面；
+新 authored-route vertical slice 通过后直接删除，回退仅使用 Git。
+
 ## 1. 目标
 
 厕所行人系统不是随机 waypoint crowd。它模拟具有明确意图、资源约束和事件生命周期的
@@ -301,6 +305,11 @@ velocity-obstacle 仍是 E2 对照基线，不是 Interactive 默认解。
 - 提取 Isaac AnimGraph adapter；
 - 接入 SMPL-H A/B；
 - 冻结 root/yaw、foot sliding 和视觉包络指标。
+
+E3 第一验收对象固定为 `toilet_benchmark_ui/examples/narrow_head_on_001.json`。Isaac
+AnimGraph 只消费 benchmark 生成的 root pose/yaw/speed/animation state，不执行 GoTo，
+不持有跨 episode 路径游标。每轮 reset 只重置 benchmark runtime 和表现层有限状态，禁止
+通过全局 timeline pause/play 重建 People Navigation。
 
 ### E4：事件库与生成器
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 import re
 from dataclasses import asdict, dataclass, field
@@ -99,10 +101,16 @@ class ScenarioConfig:
     robot_start: tuple[float, float, float, float]
     robot_goal: tuple[float, float, float]
     pedestrian_target_urinal_ids: tuple[str, ...]
+    source_mode: str = "legacy_enter_use_exit"
+    episode_path: str | None = None
+    episode_sha256: str | None = None
+    pedestrian_agent_ids: tuple[str, ...] = ()
 
     @property
     def pedestrian_target_urinal_id(self) -> str:
         """Backward-compatible primary target for single-pedestrian callers."""
+        if not self.pedestrian_target_urinal_ids:
+            raise ValueError("authored-route scenarios do not define a urinal target")
         return self.pedestrian_target_urinal_ids[0]
 
     @property
@@ -194,12 +202,64 @@ def _parse_target_urinal_ids(raw: Mapping[str, Any], *, index: int) -> tuple[str
     )
 
 
-def _parse_scenario(raw: Mapping[str, Any], *, index: int) -> ScenarioConfig:
+def _load_authored_scenario(path_value: Any, *, index: int) -> tuple:
+    path = Path(
+        _require_str(path_value, name=f"scenarios[{index}].episode_path")
+    ).expanduser().resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    root = _require_mapping(payload, name=f"scenarios[{index}].episode")
+    if root.get("task_type") != "authored_route":
+        raise ValueError(f"scenarios[{index}].episode must use task_type=authored_route")
+    robot = _require_mapping(root.get("robot"), name=f"scenarios[{index}].episode.robot")
+    pedestrians = _require_sequence(
+        root.get("pedestrians"), name=f"scenarios[{index}].episode.pedestrians"
+    )
+    if not pedestrians:
+        raise ValueError(f"scenarios[{index}].episode.pedestrians must not be empty")
+    agent_ids = tuple(
+        _require_str(
+            _require_mapping(item, name=f"scenarios[{index}].episode.pedestrians[{ped_index}]").get("agent_id"),
+            name=f"scenarios[{index}].episode.pedestrians[{ped_index}].agent_id",
+        )
+        for ped_index, item in enumerate(pedestrians)
+    )
+    if len(set(agent_ids)) != len(agent_ids):
+        raise ValueError(f"scenarios[{index}].episode contains duplicate pedestrian agent_id values")
+    return (
+        str(path),
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+        _parse_pose(robot.get("start_pose"), name=f"scenarios[{index}].episode.robot.start_pose", dims=4),
+        _parse_pose(robot.get("goal_pose"), name=f"scenarios[{index}].episode.robot.goal_pose", dims=3),
+        agent_ids,
+    )
+
+
+def _parse_scenario(raw: Mapping[str, Any], *, index: int, source_mode: str) -> ScenarioConfig:
     scenario_id = _require_str(raw.get("id"), name=f"scenarios[{index}].id")
     enabled = _require_bool(raw.get("enabled", True), name=f"scenarios[{index}].enabled")
     weight = _require_float(raw.get("weight", 1.0), name=f"scenarios[{index}].weight")
     if weight <= 0.0:
         raise ValueError(f"scenarios[{index}].weight must be greater than zero")
+    if source_mode == "authored_route":
+        episode_path, episode_sha256, robot_start, robot_goal, agent_ids = _load_authored_scenario(
+            raw.get("episode_path"), index=index
+        )
+        return ScenarioConfig(
+            id=scenario_id,
+            enabled=enabled,
+            weight=weight,
+            robot_start=robot_start,
+            robot_goal=robot_goal,
+            pedestrian_target_urinal_ids=(),
+            source_mode=source_mode,
+            episode_path=episode_path,
+            episode_sha256=episode_sha256,
+            pedestrian_agent_ids=agent_ids,
+        )
+    if source_mode != "legacy_enter_use_exit":
+        raise ValueError(
+            "scenario_source.mode must be authored_route or legacy_enter_use_exit"
+        )
     return ScenarioConfig(
         id=scenario_id,
         enabled=enabled,
@@ -207,6 +267,7 @@ def _parse_scenario(raw: Mapping[str, Any], *, index: int) -> ScenarioConfig:
         robot_start=_parse_pose(raw.get("robot_start"), name=f"scenarios[{index}].robot_start", dims=4),
         robot_goal=_parse_pose(raw.get("robot_goal"), name=f"scenarios[{index}].robot_goal", dims=3),
         pedestrian_target_urinal_ids=_parse_target_urinal_ids(raw, index=index),
+        source_mode=source_mode,
     )
 
 
@@ -219,8 +280,19 @@ def load_manual_collection_config(source: str | Path | Mapping[str, Any]) -> Man
     session = _parse_session(_require_mapping(root.get("session"), name="session"))
     episode = _parse_episode(_require_mapping(root.get("episode"), name="episode"))
     pedestrian = _parse_pedestrian(_require_mapping(root.get("pedestrian"), name="pedestrian"))
+    source_raw = _require_mapping(root.get("scenario_source", {}), name="scenario_source")
+    source_mode = _require_str(
+        source_raw.get("mode", "legacy_enter_use_exit"), name="scenario_source.mode"
+    )
     scenario_items = _require_sequence(root.get("scenarios"), name="scenarios")
-    scenarios = tuple(_parse_scenario(_require_mapping(item, name=f"scenarios[{index}]"), index=index) for index, item in enumerate(scenario_items))
+    scenarios = tuple(
+        _parse_scenario(
+            _require_mapping(item, name=f"scenarios[{index}]"),
+            index=index,
+            source_mode=source_mode,
+        )
+        for index, item in enumerate(scenario_items)
+    )
     if not scenarios:
         raise ValueError("scenarios must not be empty")
     if not any(scenario.enabled for scenario in scenarios):
