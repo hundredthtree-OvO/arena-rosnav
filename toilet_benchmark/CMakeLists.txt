@@ -38,6 +38,7 @@ install(
     scripts/toilet_authored_scenario
     scripts/pedestrian_diagnostic_recorder
     scripts/walkable_map_publisher
+    scripts/animgraph_phase_probe
   DESTINATION lib/${PROJECT_NAME}
 )
 

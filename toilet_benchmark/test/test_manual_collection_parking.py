@@ -83,6 +83,7 @@ class _Harness:
             pedestrian_agent_ids=("toilet_agent_01", "toilet_agent_02")
         )
         self._selection = SimpleNamespace(scenario=scenario)
+        self._runtime_agent_ids = ("toilet_agent_01__inc001", "toilet_agent_02__inc001")
         self._finishing = False
         self._pending_parking = set()
         self._parking_inflight = set()
@@ -129,6 +130,7 @@ def test_episode_waits_for_all_parks_after_bag_finalization():
 
     assert node._state == "BETWEEN_EPISODES"
     assert node._selection is None
+    assert node._runtime_agent_ids == ()
     assert not node._finishing
     assert node._episodes_finished == 1
 
@@ -178,6 +180,7 @@ class _ActivationHarness:
             source_mode="authored_route",
         )
         self._selection = SimpleNamespace(scenario=scenario)
+        self._runtime_agent_ids = ("toilet_agent_01__inc001", "toilet_agent_02__inc001")
         self._state = "WAIT_PEDESTRIAN"
         self._active_pedestrian_generations = {}
         self.release_count = 0
@@ -197,7 +200,7 @@ def test_operator_control_waits_for_every_pedestrian_generation():
             data=json.dumps(
                 {
                     "event": "pedestrian_active",
-                    "agent_id": "toilet_agent_01",
+                    "agent_id": "toilet_agent_01__inc001",
                     "generation": 2,
                 }
             )
@@ -210,7 +213,7 @@ def test_operator_control_waits_for_every_pedestrian_generation():
             data=json.dumps(
                 {
                     "event": "pedestrian_active",
-                    "agent_id": "toilet_agent_02",
+                    "agent_id": "toilet_agent_02__inc001",
                     "generation": 5,
                 }
             )
@@ -218,8 +221,8 @@ def test_operator_control_waits_for_every_pedestrian_generation():
     )
     assert node.release_count == 1
     assert node._active_pedestrian_generations == {
-        "toilet_agent_01": 2,
-        "toilet_agent_02": 5,
+        "toilet_agent_01__inc001": 2,
+        "toilet_agent_02__inc001": 5,
     }
 
 

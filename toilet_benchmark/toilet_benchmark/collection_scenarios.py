@@ -60,7 +60,7 @@ class SessionConfig:
     operator_id: str
     seed: int
     selection_mode: str = "round_robin"
-    max_episodes: int = 0
+    max_episodes: int = 10
     fixed_scenario_id: str | None = None
 
 
@@ -139,12 +139,15 @@ class ScenarioSelection:
 
 
 def _parse_session(raw: Mapping[str, Any]) -> SessionConfig:
+    max_episodes = _require_int(raw.get("max_episodes", 10), name="session.max_episodes")
+    if max_episodes < 0:
+        raise ValueError("session.max_episodes must be >= 0")
     return SessionConfig(
         output_root=Path(_require_str(raw.get("output_root"), name="session.output_root")),
         operator_id=_require_str(raw.get("operator_id"), name="session.operator_id"),
         seed=_require_int(raw.get("seed"), name="session.seed"),
         selection_mode=_require_str(raw.get("selection_mode", "round_robin"), name="session.selection_mode"),
-        max_episodes=_require_int(raw.get("max_episodes", 0), name="session.max_episodes"),
+        max_episodes=max_episodes,
         fixed_scenario_id=(
             None
             if raw.get("fixed_scenario_id") is None

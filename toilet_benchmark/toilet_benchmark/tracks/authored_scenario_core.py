@@ -6,12 +6,30 @@ from dataclasses import dataclass, replace
 import math
 from typing import Callable, Sequence
 
-from ..episodes.schema import PedestrianEpisodeSpec, PedestrianHoldSpec
+from ..episodes.schema import EpisodeSpec, PedestrianEpisodeSpec, PedestrianHoldSpec
 
 
 # Isaac People character roots face local -Y while authored routes use the
 # conventional +X planar heading. Keep this conversion at the route boundary.
 ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD = math.pi / 2.0
+
+
+def with_agent_id_suffix(episode: EpisodeSpec, suffix: str) -> EpisodeSpec:
+    """Create fresh runtime identities without changing authored route semantics."""
+
+    suffix = str(suffix).strip()
+    if not suffix:
+        return episode
+    if not suffix.isascii() or not suffix.replace("_", "").isalnum():
+        raise ValueError("agent id suffix may only contain letters, digits, and underscores")
+    return replace(
+        episode,
+        pedestrians=tuple(
+            replace(spec, agent_id=f"{spec.agent_id}{suffix}")
+            for spec in episode.pedestrians
+        ),
+        metadata={**episode.metadata, "runtime_agent_id_suffix": suffix},
+    )
 
 
 def normalize_yaw(yaw: float) -> float:

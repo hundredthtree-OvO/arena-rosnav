@@ -23,7 +23,11 @@ from ..episodes.schema import EpisodeSpec
 from ..motion_backend import IsaacPeopleBackend
 from ..pedestrian_state_stream import observations_from_message
 from ..walkable_map_planner import WalkableMapPlanner, WalkableMapPlannerConfig
-from .authored_scenario_core import RouteRuntime, expand_authored_route
+from .authored_scenario_core import (
+    RouteRuntime,
+    expand_authored_route,
+    with_agent_id_suffix,
+)
 
 
 class AuthoredScenarioNode(Node):
@@ -553,6 +557,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--retire-service", default="/isaac/delete_prim")
     parser.add_argument("--people-topic", default="/isaac/pedestrian_states")
     parser.add_argument("--status-topic", default="/toilet_benchmark/pedestrian_runtime_status")
+    parser.add_argument("--agent-id-suffix", default="")
     parser.add_argument("--service-timeout-sec", type=float, default=20.0)
     parser.add_argument("--planner-radius-m", type=float, default=0.30)
     parser.add_argument("--skip-robot-reset", action="store_true")
@@ -563,7 +568,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(args: Sequence[str] | None = None) -> int:
     namespace = _parser().parse_args(args)
     try:
-        episode = load_authored_episode(namespace.episode)
+        episode = with_agent_id_suffix(
+            load_authored_episode(namespace.episode),
+            namespace.agent_id_suffix,
+        )
         planned_specs = plan_episode_routes(
             episode,
             planner_radius_m=namespace.planner_radius_m,
@@ -571,6 +579,7 @@ def main(args: Sequence[str] | None = None) -> int:
         runtimes = [RouteRuntime.create(spec) for spec in planned_specs]
         if namespace.validate_only:
             print(json.dumps({
+                "agent_ids": [runtime.spec.agent_id for runtime in runtimes],
                 "episode_id": episode.episode_id,
                 "pedestrian_count": len(runtimes),
                 "valid": True,

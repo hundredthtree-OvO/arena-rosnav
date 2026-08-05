@@ -4,7 +4,9 @@ session:
   seed: 42
   selection_mode: fixed
   fixed_scenario_id: narrow_head_on_001
-  max_episodes: 0
+  # Each episode uses a fresh Isaac People incarnation. Restart the bridge
+  # between sessions to release the parked AnimGraph instances.
+  max_episodes: 10
   inter_episode_delay_sec: 1.0
   parking_timeout_sec: 5.0
   authored_runtime_exit_timeout_sec: 60.0

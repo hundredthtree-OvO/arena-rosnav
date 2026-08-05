@@ -38,6 +38,7 @@ setup(
             "hunav_isaac_mirror = toilet_benchmark.hunav_isaac_mirror:main",
             "walkable_map_publisher = toilet_benchmark.walkable_map:main",
             "toilet_authored_scenario = toilet_benchmark.tracks.authored_scenario:main",
+            "animgraph_phase_probe = toilet_benchmark.animgraph_phase_probe:main",
         ]
     },
 )

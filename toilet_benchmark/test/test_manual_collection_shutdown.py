@@ -15,6 +15,14 @@ class TestShutdownSignalLatch(unittest.TestCase):
         self.assertIn("--skip-robot-reset", command)
         self.assertNotIn("toilet_benchmark.toilet_director_node", command)
 
+    def test_authored_command_can_request_a_fresh_incarnation(self):
+        command = _build_authored_scenario_command(
+            episode_path="/tmp/episode.json",
+            agent_id_suffix="__inc003",
+        )
+
+        self.assertEqual(command[-2:], ["--agent-id-suffix", "__inc003"])
+
     def test_sigint_requests_operator_interrupt_without_raising(self):
         latch = _ShutdownSignalLatch()
 

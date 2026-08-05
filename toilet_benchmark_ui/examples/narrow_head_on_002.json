@@ -1,0 +1,131 @@
+{
+  "schema_version": "toilet-social-nav-0.1",
+  "benchmark_version": "0.1.0",
+  "episode_id": "narrow_head_on_001",
+  "scene_id": "shenxinfu_841837",
+  "task_type": "authored_route",
+  "track": "interactive",
+  "seed": 42,
+  "robot": {
+    "model": "xms_mecanum",
+    "start_pose": [
+      1.8817686543193979,
+      0.526637411534006,
+      0.03,
+      3.141592653589793
+    ],
+    "goal_pose": [
+      1.8817686543193979,
+      0.526637411534006,
+      3.141592653589793
+    ]
+  },
+  "pedestrians": [
+    {
+      "agent_id": "toilet_agent_01",
+      "semantic_goal": "route_terminal",
+      "behavior": {
+        "type": "regular",
+        "configuration": "custom",
+        "group_id": -1,
+        "walking_speed_mps": 0.8
+      },
+      "character": "original_female_adult_business_02",
+      "start_pose": [
+        0.4315503137080432,
+        0.8449780228877177,
+        0.0
+      ],
+      "start_yaw": 1.5707963267948966,
+      "route_waypoints": [
+        [
+          0.7941048988608816,
+          0.8449780228877177,
+          0.0
+        ],
+        [
+          1.2893014054111003,
+          0.6769649224510363,
+          0.0
+        ],
+        [
+          1.0151747678565144,
+          0.3674671058571497,
+          0.0
+        ],
+        [
+          -3.591921302012481,
+          -0.9147381343175229,
+          0.0
+        ]
+      ],
+      "holds": [
+        {
+          "waypoint_index": 0,
+          "duration_sec": 2.0
+        }
+      ],
+      "constrain_to_path": true
+    },
+    {
+      "agent_id": "toilet_agent_02",
+      "semantic_goal": "route_terminal",
+      "behavior": {
+        "type": "regular",
+        "configuration": "custom",
+        "group_id": -1,
+        "walking_speed_mps": 0.5
+      },
+      "character": "original_female_adult_business_02",
+      "start_pose": [
+        2.836790488380533,
+        0.9068775862064946,
+        0.0
+      ],
+      "start_yaw": -0.11710874456686705,
+      "route_waypoints": [
+        [
+          2.819104898860882,
+          0.7565500752894643,
+          0.0
+        ],
+        [
+          2.6687773879438517,
+          0.3586243110973246,
+          0.0
+        ],
+        [
+          1.253930226371799,
+          0.323253132058023,
+          0.0
+        ],
+        [
+          -3.5653929177330053,
+          -0.9324237238371735,
+          0.0
+        ]
+      ],
+      "holds": [
+        {
+          "waypoint_index": 1,
+          "duration_sec": 2.0
+        }
+      ],
+      "constrain_to_path": true
+    }
+  ],
+  "termination": {
+    "timeout_sec": 90.0,
+    "goal_tolerance_m": 0.3,
+    "collision_policy": "terminate"
+  },
+  "difficulty": {
+    "pedestrian_count": 2
+  },
+  "assets": {
+    "walkable_map": "/home/stardust/resources/arena_ws/arena_assets/navigation/shenxinfu_841837.walkable.json"
+  },
+  "metadata": {
+    "source": "toilet_benchmark_ui"
+  }
+}

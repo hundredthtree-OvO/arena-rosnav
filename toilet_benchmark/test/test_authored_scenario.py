@@ -3,15 +3,21 @@ import math
 import pytest
 
 from toilet_benchmark.episodes.schema import (
+    CollisionPolicy,
+    EpisodeSpec,
     PedestrianBehaviorSpec,
     PedestrianEpisodeSpec,
     PedestrianHoldSpec,
+    RobotEpisodeSpec,
+    TerminationSpec,
+    TrackType,
 )
 from toilet_benchmark.tracks.authored_scenario_core import (
     RouteRuntime,
     expand_authored_route,
     initial_character_root_yaw,
     route_heading_to_character_root_yaw,
+    with_agent_id_suffix,
 )
 
 
@@ -100,6 +106,26 @@ def test_character_root_yaw_uses_isaac_people_heading_convention() -> None:
         (1.0, 2.0, 0.0),
         ((1.0, 2.0, 0.0), (0.0, 2.0, 0.0)),
     ) == pytest.approx(-math.pi / 2.0)
+
+
+def test_runtime_agent_suffix_preserves_route_and_changes_identity() -> None:
+    source = _spec()
+    episode = EpisodeSpec(
+        episode_id="test",
+        scene_id="scene",
+        task_type="authored_route",
+        track=TrackType.INTERACTIVE,
+        seed=1,
+        robot=RobotEpisodeSpec("robot", (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        pedestrians=(source,),
+        termination=TerminationSpec(30.0, 0.2, CollisionPolicy.TERMINATE),
+    )
+
+    runtime = with_agent_id_suffix(episode, "__inc007")
+
+    assert runtime.pedestrians[0].agent_id == "agent_01__inc007"
+    assert runtime.pedestrians[0].route_waypoints == source.route_waypoints
+    assert episode.pedestrians[0].agent_id == "agent_01"
 
 
 def test_activation_requires_consecutive_ready_idle_stable_samples() -> None:

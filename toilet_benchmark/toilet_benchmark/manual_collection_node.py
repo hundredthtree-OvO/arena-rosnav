@@ -38,8 +38,9 @@ def _build_authored_scenario_command(
     *,
     episode_path: str,
     status_topic: str = "/toilet_benchmark/pedestrian_runtime_status",
+    agent_id_suffix: str = "",
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "toilet_benchmark.tracks.authored_scenario",
@@ -49,6 +50,9 @@ def _build_authored_scenario_command(
         "--status-topic",
         status_topic,
     ]
+    if agent_id_suffix:
+        command.extend(["--agent-id-suffix", str(agent_id_suffix)])
+    return command
 
 
 def _yaw_from_quaternion(quaternion) -> float:
@@ -113,7 +117,11 @@ class ManualCollectionNode(Node):
             seed=self.config.session.seed,
             fixed_scenario_id=self.config.session.fixed_scenario_id,
         )
-        session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S") + f"_seed{self.config.session.seed}"
+        session_id = (
+            datetime.now().strftime("session_%Y%m%d_%H%M%S_%f")
+            + f"_seed{self.config.session.seed}"
+        )
+        self._incarnation_session_token = session_id
         recording_cfg = self.raw_config.get("recording", {}) or {}
         recording_enabled = bool(recording_cfg.get("enabled", True)) if record_bag is None else bool(record_bag)
         topics = [str(topic) for topic in recording_cfg.get("topics", []) if str(topic).strip()]
@@ -243,6 +251,8 @@ class ManualCollectionNode(Node):
         self._episode_started_at = 0.0
         self._pedestrian_process: subprocess.Popen | None = None
         self._active_pedestrian_generations: dict[str, int] = {}
+        self._runtime_agent_ids: tuple[str, ...] = ()
+        self._incarnation_counter = 0
         self._episodes_finished = 0
         self._finishing = False
         self._pending_parking: set[str] = set()
@@ -260,6 +270,9 @@ class ManualCollectionNode(Node):
         )
 
     def _active_agent_ids(self) -> tuple[str, ...]:
+        runtime_ids = tuple(getattr(self, "_runtime_agent_ids", ()))
+        if runtime_ids:
+            return runtime_ids
         if self._selection is None:
             return ()
         return self._selection.scenario.pedestrian_agent_ids
@@ -672,9 +685,18 @@ class ManualCollectionNode(Node):
             )
             return
         self._active_pedestrian_generations = {}
+        self._incarnation_counter += 1
+        incarnation_suffix = (
+            f"__{self._incarnation_session_token}_e{self._incarnation_counter:03d}"
+        )
+        self._runtime_agent_ids = tuple(
+            f"{agent_id}{incarnation_suffix}"
+            for agent_id in scenario.pedestrian_agent_ids
+        )
         command = _build_authored_scenario_command(
             episode_path=str(scenario.episode_path),
             status_topic=self.pedestrian_status_topic,
+            agent_id_suffix=incarnation_suffix,
         )
         try:
             self._pedestrian_process = subprocess.Popen(command, start_new_session=True)
@@ -734,6 +756,9 @@ class ManualCollectionNode(Node):
                 "episode_sha256": self._selection.scenario.episode_sha256,
                 "pedestrian_count": self._active_pedestrian_count(),
                 "pedestrian_agent_ids": list(self._active_agent_ids()),
+                "pedestrian_source_agent_ids": list(
+                    self._selection.scenario.pedestrian_agent_ids
+                ),
             },
         )
         self._episode_started_at = time.monotonic()
@@ -870,6 +895,7 @@ class ManualCollectionNode(Node):
             return
         self._pending_parking.clear()
         self._parking_inflight.clear()
+        self._runtime_agent_ids = ()
         self._selection = None
         self._next_episode_at = time.monotonic() + self.inter_episode_delay_sec
         self._finishing = False

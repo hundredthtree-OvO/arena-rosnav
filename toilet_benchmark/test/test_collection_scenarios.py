@@ -81,6 +81,21 @@ class TestCollectionScenarios(unittest.TestCase):
         self.assertEqual(config.scenarios[0].pedestrian_target_urinal_ids, ("urinal_3",))
         self.assertEqual([scenario.id for scenario in config.enabled_scenarios()], ["left", "right"])
 
+    def test_session_defaults_to_ten_episodes(self):
+        payload = self._base_payload()
+        del payload["session"]["max_episodes"]
+
+        config = load_manual_collection_config(self._write_config(payload))
+
+        self.assertEqual(config.session.max_episodes, 10)
+
+    def test_negative_session_episode_limit_is_rejected(self):
+        payload = self._base_payload()
+        payload["session"]["max_episodes"] = -1
+
+        with self.assertRaisesRegex(ValueError, "session.max_episodes must be >= 0"):
+            load_manual_collection_config(self._write_config(payload))
+
     def test_loader_accepts_multiple_pedestrians_and_target_resources(self):
         payload = self._base_payload()
         payload["pedestrian"].update(
