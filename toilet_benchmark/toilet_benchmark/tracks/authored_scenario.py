@@ -16,7 +16,7 @@ from people_msgs.msg import People
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 from ..domain.task import MotionCommand
 from ..episodes.schema import EpisodeSpec
@@ -44,6 +44,8 @@ class AuthoredScenarioNode(Node):
         planner_radius_m: float = 0.30,
         status_topic: str = "/toilet_benchmark/pedestrian_runtime_status",
         cancel_service: str = "/toilet_authored_scenario/cancel",
+        hard_guard_service: str = "/isaac/set_pedestrian_hard_guard",
+        pedestrian_robot_policy: str = "detect_and_fail",
     ) -> None:
         super().__init__("toilet_authored_scenario")
         if episode.task_type != "authored_route":
@@ -52,6 +54,15 @@ class AuthoredScenarioNode(Node):
             raise ValueError("authored scenario needs at least one pedestrian")
         self.episode = episode
         self.skip_robot_reset = bool(skip_robot_reset)
+        self.pedestrian_robot_policy = str(pedestrian_robot_policy).strip().lower()
+        if self.pedestrian_robot_policy not in {
+            "detect_and_fail",
+            "hard_guard",
+            "inherit",
+        }:
+            raise ValueError(
+                "pedestrian_robot_policy must be detect_and_fail, hard_guard, or inherit"
+            )
         planned_specs = plan_episode_routes(episode, planner_radius_m=planner_radius_m)
         for spec, planned in zip(episode.pedestrians, planned_specs):
             self.get_logger().info(
@@ -68,6 +79,7 @@ class AuthoredScenarioNode(Node):
         self._spawn_client = self.create_client(Pedestrian, spawn_service)
         self._reset_client = self.create_client(ResetRobot, reset_service)
         self._retire_client = self.create_client(DeletePrim, retire_service)
+        self._hard_guard_client = self.create_client(SetBool, hard_guard_service)
         self._status_pub = self.create_publisher(String, status_topic, 10) if status_topic else None
         self._cancel_service = self.create_service(Trigger, cancel_service, self._cancel_cb)
         self._active_announced: set[str] = set()
@@ -102,6 +114,7 @@ class AuthoredScenarioNode(Node):
         return self._finished
 
     def start(self, service_timeout_sec: float = 20.0) -> None:
+        self._configure_pedestrian_robot_policy(service_timeout_sec)
         if not self._spawn_client.wait_for_service(timeout_sec=service_timeout_sec):
             raise RuntimeError("spawn pedestrian service is unavailable")
         if not self._backend.wait_for_service(service_timeout_sec):
@@ -117,7 +130,30 @@ class AuthoredScenarioNode(Node):
         self._started_at = time.monotonic()
         self.get_logger().info(
             f"Authored scenario started: episode={self.episode.episode_id}, "
-            f"pedestrians={len(self._runtimes)}, seed={self.episode.seed}"
+            f"pedestrians={len(self._runtimes)}, seed={self.episode.seed}, "
+            f"pedestrian_robot_policy={self.pedestrian_robot_policy}"
+        )
+
+    def _configure_pedestrian_robot_policy(self, timeout_sec: float) -> None:
+        if self.pedestrian_robot_policy == "inherit":
+            self.get_logger().info(
+                "Authored scenario inherits the bridge pedestrian hard-guard state."
+            )
+            return
+        if not self._hard_guard_client.wait_for_service(timeout_sec=timeout_sec):
+            raise RuntimeError("pedestrian hard-guard control service is unavailable")
+        request = SetBool.Request()
+        request.data = self.pedestrian_robot_policy == "hard_guard"
+        future = self._hard_guard_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+        response = future.result() if future.done() else None
+        if response is None or not bool(response.success):
+            message = "" if response is None else str(response.message)
+            raise RuntimeError(
+                f"Isaac rejected pedestrian robot policy: {message or 'no response'}"
+            )
+        self.get_logger().info(
+            f"Authored pedestrian/robot policy applied: {response.message}"
         )
 
     def _reset_robot(self, timeout_sec: float) -> None:
@@ -561,6 +597,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-timeout-sec", type=float, default=20.0)
     parser.add_argument("--planner-radius-m", type=float, default=0.30)
     parser.add_argument("--skip-robot-reset", action="store_true")
+    parser.add_argument(
+        "--pedestrian-robot-policy",
+        choices=("detect_and_fail", "hard_guard", "inherit"),
+        default="detect_and_fail",
+        help=(
+            "detect_and_fail disables predictive stopping to match manual collection; "
+            "hard_guard enables it; inherit leaves the bridge state unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--hard-guard-service",
+        default="/isaac/set_pedestrian_hard_guard",
+    )
     parser.add_argument("--validate-only", action="store_true")
     return parser
 
@@ -596,6 +645,8 @@ def main(args: Sequence[str] | None = None) -> int:
             skip_robot_reset=namespace.skip_robot_reset,
             planner_radius_m=namespace.planner_radius_m,
             status_topic=namespace.status_topic,
+            hard_guard_service=namespace.hard_guard_service,
+            pedestrian_robot_policy=namespace.pedestrian_robot_policy,
         )
         node.start(namespace.service_timeout_sec)
         while rclpy.ok() and not node.finished:

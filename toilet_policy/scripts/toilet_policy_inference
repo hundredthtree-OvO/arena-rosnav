@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ISAAC_SIM_ROOT="${ISAAC_SIM_ROOT:-/home/stardust/resources/isaac-sim-4.5.0}"
+if [[ ! -x "${ISAAC_SIM_ROOT}/python.sh" ]]; then
+  echo "Isaac Sim Python not found: ${ISAAC_SIM_ROOT}/python.sh" >&2
+  exit 1
+fi
+
+exec "${ISAAC_SIM_ROOT}/python.sh" -m toilet_policy.inference "$@"

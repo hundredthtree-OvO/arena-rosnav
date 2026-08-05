@@ -39,6 +39,7 @@ install(
     scripts/pedestrian_diagnostic_recorder
     scripts/walkable_map_publisher
     scripts/animgraph_phase_probe
+    scripts/toilet_dataset
   DESTINATION lib/${PROJECT_NAME}
 )
 

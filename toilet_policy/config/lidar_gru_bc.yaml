@@ -1,0 +1,13 @@
+dataset:
+  sample_rate_hz: 10.0
+  beam_count: 721
+model:
+  type: lidar_gru
+  state_size: 8
+  hidden_size: 128
+training:
+  sequence_length: 8
+  batch_size: 64
+  epochs: 20
+  learning_rate: 0.0003
+  seed: 42

@@ -1,0 +1,17 @@
+toilet_policy_inference:
+  ros__parameters:
+    checkpoint: /home/stardust/resources/arena_ws/data/toilet_policy/models/lidar_gru_v0_gpu_150/best.pt
+    front_scan_topic: /front_scan
+    rear_scan_topic: /rear_scan
+    odom_topic: /odom
+    preview_topic: /toilet_policy/cmd_vel_preview
+    command_topic: /cmd_vel_gamepad_diff
+    diagnostics_topic: /toilet_policy/diagnostics
+    goal_pose: [-3.8, -0.91, 0.0]
+    closed_loop: false
+    publish_rate_hz: 10.0
+    sensor_timeout_sec: 0.35
+    goal_tolerance_m: 0.35
+    max_linear_mps: 0.4
+    max_angular_rps: 0.8
+    device: auto

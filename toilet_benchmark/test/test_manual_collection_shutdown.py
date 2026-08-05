@@ -13,6 +13,8 @@ class TestShutdownSignalLatch(unittest.TestCase):
 
         self.assertIn("toilet_benchmark.tracks.authored_scenario", command)
         self.assertIn("--skip-robot-reset", command)
+        self.assertIn("--pedestrian-robot-policy", command)
+        self.assertIn("detect_and_fail", command)
         self.assertNotIn("toilet_benchmark.toilet_director_node", command)
 
     def test_authored_command_can_request_a_fresh_incarnation(self):

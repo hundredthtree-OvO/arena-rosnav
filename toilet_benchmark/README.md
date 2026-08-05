@@ -233,6 +233,11 @@ ros2 run toilet_benchmark manual_collection_node \
   --config /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/manual_collection.yaml
 ```
 
+`toilet_authored_scenario` 默认使用 `--pedestrian-robot-policy detect_and_fail`，
+与手动数采一致：关闭预测性人机 hard guard，行人不会只因接近机器人而停车；
+实际接触仍由事件话题供数采或评测判负。需要恢复提前停车时显式传入
+`--pedestrian-robot-policy hard_guard`，调试 bridge 原始状态时使用 `inherit`。
+
 生成和校验固定 episode manifest：
 
 ```bash

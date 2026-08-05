@@ -49,6 +49,8 @@ def _build_authored_scenario_command(
         "--skip-robot-reset",
         "--status-topic",
         status_topic,
+        "--pedestrian-robot-policy",
+        "detect_and_fail",
     ]
     if agent_id_suffix:
         command.extend(["--agent-id-suffix", str(agent_id_suffix)])
