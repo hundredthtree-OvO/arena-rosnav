@@ -116,8 +116,8 @@ ros2 run ros2isaacsim export_walkable_map \
 ## 在线执行场景
 
 保存的 JSON 由 `toilet_benchmark` 的 authored scenario runner 执行。它负责机器人 reset、
-稳定 ID 行人 spawn/reactivate、路线分段、停留、终点判定和退出；不要同时启动
-`toilet_director_node` 控制同一批 actor。
+稳定 ID 行人 spawn/reactivate、路线分段、停留、终点判定和退出；同一批 actor 不应由
+其他运行器同时控制。
 
 当前 runner 的 phase、停留和终态由 benchmark 自己持有。每个 phase 将 UI 路线展开后的
 完整 `PathPoints` 一次性交给 People/MotionMatching，以保留 Isaac 原生连续步态；实际 pose
@@ -145,8 +145,8 @@ ros2 run toilet_benchmark manual_collection_node \
   --config /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark/config/manual_collection.yaml
 ```
 
-要换成 UI 新保存的场景，只需修改 `scenarios[*].episode_path`；不要同时手动启动 director
-或 authored runner。数采节点仍只负责 reset、录包、机器人到达判定和碰撞失败，行人执行
+要换成 UI 新保存的场景，只需修改 `scenarios[*].episode_path`；不要同时手动启动
+authored runner。数采节点仍只负责 reset、录包、机器人到达判定和碰撞失败，行人执行
 由 authored runtime 负责。
 
 这条第一版闭环用于验证“离线设计是否被 Isaac 原样执行”。动态社会避让是后续 runtime
@@ -156,7 +156,7 @@ ros2 run toilet_benchmark manual_collection_node \
 
 - 静态验证使用圆形半径采样，只用于快速拒绝明显穿墙路线，不替代骨骼扫掠检测；
 - `constrain_to_path=true` 强调复现编辑路线，不保证两个对向行人自动协商；
-- 同一 actor 只能由一个控制器驱动；运行 authored scenario 时不要同时运行 director；
+- 同一 actor 只能由一个 authored runner 驱动；
 - 在线验证前需先启动 bridge 并导入场景资产。
 
 设计边界见 [`docs/route_editor_scenario_design_cn.md`](docs/route_editor_scenario_design_cn.md)。

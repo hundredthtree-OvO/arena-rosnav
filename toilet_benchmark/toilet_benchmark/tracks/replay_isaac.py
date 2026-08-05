@@ -25,7 +25,7 @@ from .replay import (
     load_replay_bundle,
     require_valid_replay_bundle,
 )
-from ..hunav_isaac_mirror_core import person_yaw, point_to_polyline_distance
+from ..geometry import person_yaw, point_to_polyline_distance
 
 try:  # pragma: no cover - optional runtime dependency for live ROS integration
     from ..motion_backend import IsaacPeopleBackend, MotionCommand

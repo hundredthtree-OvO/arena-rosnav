@@ -2,7 +2,7 @@
 
 ## 边界
 
-编辑器只维护 `ScenarioDraft` 并输出标准 `EpisodeSpec`。它不订阅 director 状态来修改草稿，
+编辑器只维护 `ScenarioDraft` 并输出标准 `EpisodeSpec`。它不订阅运行器状态来修改草稿，
 也不发布无法确认执行结果的 shadow command。
 
 数据流固定为：
@@ -34,5 +34,5 @@ walkable map -> ScenarioDraft -> EpisodeSpec JSON -> authored scenario runner ->
 5. 所有行人到终点或 timeout 后 runner 明确退出；
 6. 重复固定 seed 时事件顺序、路线和停留时长一致。
 
-之后动态避让应放在 runtime/local-motion 层。编辑器可以增加 behavior/profile 字段，但不应
-包含某个规划器的 generation、phase、临时 TTL 或内部调试按钮。
+之后如引入动态避让，应作为独立运动 backend 接入 authored runtime。编辑器可以增加
+behavior/profile 字段，但不应包含某个规划器的 generation、phase、临时 TTL 或内部调试按钮。

@@ -1,42 +1,17 @@
 # Toilet Benchmark 文档索引
 
-## 当前规范
+## 当前文档
 
-1. `benchmark_design_cn.md`：benchmark 范围、Track、episode、接口和发布门槛；
-2. `pedestrian_ecosystem_architecture_cn.md`：目的性行人生态、Smart Object、事件管线和冻结接口；
-3. `code_structure_migration_cn.md`：从当前大文件向冻结边界迁移的执行顺序；
-4. `motion_backend_evaluation_cn.md`：HuNav、ORCA/HRVO、Replay、Isaac AnimGraph 和 SMPL-H 的评估方法；
-5. `replay_trajectory_schema_cn.md`：Replay 轨迹和时间基准。
-6. `route_editor_runtime_cleanup_plan_cn.md`：阶段 0/1 基线冻结、运行链路清理和路线编辑器迁移计划。
-7. `../toilet_benchmark_ui/README.md`：阶段 3 独立 Qt 2D 路线编辑器的启动和话题说明。
+- `benchmark_design_cn.md`：当前 benchmark 的 Track、episode 和验收边界。
+- `CURRENT_ARCHITECTURE_CN.md`：当前代码边界、运行所有权和主数据流。
+- `manual_collection_cn.md`：人工数采配置、启动、reset 和有效性检查。
+- `replay_trajectory_schema_cn.md`：Replay 轨迹字段和时间基准。
+- `dataset_preparation_cn.md`：训练数据审计和导出流程。
+- `animgraph_phase_probe_cn.md`：AnimGraph 生命周期隔离验证。
+- `../toilet_benchmark_ui/README.md`：独立 2D Route Editor 操作说明。
+- `../toilet_benchmark_ui/docs/route_editor_scenario_design_cn.md`：Route Editor 场景契约与运行边界。
 
-发生冲突时，benchmark 对外语义以 `benchmark_design_cn.md` 为准，内部职责和端口以
-`pedestrian_ecosystem_architecture_cn.md` 为准。
+## 当前边界
 
-## 操作说明
-
-- `hunav_takeover_cn.md`：HuNav 主链路；
-- `hunav_phase0_smoke_cn.md`：隔离 smoke；
-- `hunav_isaac_mirror_cn.md`：Isaac mirror；
-- `manual_collection_cn.md`：人工数采。
-- `route_editor_runtime_cleanup_plan_cn.md`：路线编辑器与运行链路清理的当前执行状态。
-
-阶段 3 编辑器不属于核心 benchmark 包，位于同一仓库的 sibling 包
-`toilet_benchmark_ui`，因此这里仅保留操作入口，不复制 UI 代码或配置。RViz
-继续用于 LiDAR、TF 和 3D 场景诊断，不再承担路线编辑。
-
-## 实验与历史证据
-
-- `hunav_behavior_characterization_20260730_cn.md`；
-- `pedestrian_pair_guard_failure_review_20260724.md`；
-- `hunav_pedestrian_pipeline_migration_plan_cn.md`。
-
-这些文件记录实验结果和历史决策，不再单独定义当前接口。待代码迁移完成后再移动到
-`docs/experiments/`，避免当前 dirty worktree 中发生大规模重命名。
-
-## 文档清理规则
-
-Git 是旧实现和旧文档的归档。当前规范吸收仍有效的实验结论后，可直接删除 HuNav、
-People Navigation、旧 director 和失败 guard 尝试对应的历史操作文档，不再要求 shadow
-对照或在仓库内保留回退副本。删除前只检查当前 setup entry point、authored runtime、
-测试和 README 是否仍有引用。
+支持运行面是 `toilet_authored_scenario`、`manual_collection_node`、Replay、数据集和
+策略工具。历史实验由 Git 保存，不在当前文档中继续维护。

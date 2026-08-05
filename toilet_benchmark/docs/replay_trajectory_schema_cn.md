@@ -6,7 +6,7 @@
 本文定义 `Replay Track` 消费的冻结行人轨迹资产，并记录首个后端中立 replay actor
 foundation。目标是把 replay 轨迹和当前 `EpisodeSpec`、`AgentSnapshot`、
 `BenchmarkEvent` 契约对齐。当前 actor 负责严格校验、确定性插值和 dry-run，不调用
-实时 HuNav；live 模式通过 Isaac `external_motion` 写入运动，并可用
+实时社会运动规划；live 模式通过 Isaac `external_motion` 写入运动，并可用
 `--spawn-character` 在首帧位姿自动生成目标行人。
 
 ## 1. 设计目标
@@ -307,7 +307,7 @@ Replay 轨迹 bundle 进入正式使用前，建议至少通过以下检查：
 ## 10. 自定义起终点与冻结规则
 
 `start_reference`、`start_pose` 和 `semantic_goal` 是生成阶段的可编辑输入。后续轨迹生成器
-可以接收例如 `entrance_main -> urinal_3` 的语义起终点，离线运行全局规划/HuNav，
+可以接收例如 `entrance_main -> urinal_3` 的语义起终点，离线运行全局规划，
 通过穿模和碰撞 validator 后输出候选 bundle。
 
 正式 Replay 只消费已经封存的 `trajectory[]`，不会根据起终点重新规划。改变起点、终点、
@@ -352,14 +352,14 @@ ros2 run toilet_benchmark toilet_replay sealed.yaml --step-sec 0.1
 
 下一切片：
 
-1. Replay 使用独立于 Interactive HuNav 的追赶策略和误差上限；
+1. Replay 使用独立于 authored runtime 的追赶策略和误差上限；
 2. terminal frame 必须等待 live pose 进入位置/yaw 容差后才报告完成；
 3. validator 增加时间对齐 RMSE、路径横向误差和终点误差阈值；
 4. 未通过上述阈值前，不把 `finished=true` 视为正式 Replay 合格。
 
 ## 12. Replay 追赶与终态握手
 
-live runner 已增加只作用于 Replay Track 的闭环，不修改 Interactive HuNav 或 Isaac
+live runner 已增加只作用于 Replay Track 的闭环，不修改 authored runtime 或 Isaac
 全局 external-motion 行为：
 
 1. 从 `/isaac/pedestrian_states` 读取位置、速度以及 tags 中的
@@ -373,9 +373,9 @@ live runner 已增加只作用于 Replay Track 的闭环，不修改 Interactive
 
 ### Isaac 实时 Replay 验收
 
-冻结 Replay 与 Interactive HuNav 使用不同运动权威：
+冻结 Replay 与 authored runtime 使用不同运动权威：
 
-- Interactive `LOCOMOTION`：HuNav 给连续参考，AnimGraph 根运动负责自然行走；
+- Authored `LOCOMOTION`：路径执行器给连续参考，AnimGraph 根运动负责自然行走；
 - Replay `REPLAY_TRACK`：冻结轨迹插值负责根位姿，AnimGraph 只负责 Walk/Idle；
 - `FREEZE` 和 `TERMINAL_ALIGN` 继续负责回放末端静止与朝向收敛。
 

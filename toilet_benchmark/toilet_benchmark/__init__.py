@@ -1,1 +1,1 @@
-"""Toilet-scene benchmark helpers for Arena-Rosnav + Isaac + Hunav."""
+"""Authored toilet-scene benchmark, collection, replay, and dataset helpers."""

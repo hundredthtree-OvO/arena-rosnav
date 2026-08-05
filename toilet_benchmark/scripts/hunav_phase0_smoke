@@ -1,7 +1,0 @@
-#!/usr/bin/env python3
-
-from toilet_benchmark.hunav_phase0_smoke import main
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -22,7 +22,7 @@ class PedestrianDiagnosticRecorder:
         from people_msgs.msg import People
         from std_msgs.msg import String
 
-        from toilet_benchmark.hunav_isaac_mirror_core import person_yaw
+        from toilet_benchmark.geometry import person_yaw
 
         self._node = node
         self._pose_output = pose_output

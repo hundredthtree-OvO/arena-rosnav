@@ -4,7 +4,7 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from toilet_benchmark.domain.agent import AgentSnapshot
+from toilet_benchmark.tracks.replay import AgentSnapshot
 from toilet_benchmark.domain.task import (
     EXTERNAL_MOTION_REPLAY_TRACK,
     EXTERNAL_MOTION_TERMINAL_ALIGN,

@@ -81,11 +81,10 @@ scenarios:
 `max_episodes` 默认是 `10`。每个 episode 会创建带 session 唯一后缀的新行人实例，结束后移到停车区，不在同一 session 内复用 AnimGraph；达到上限后数采节点自动退出。`0` 表示不限制，但长时间运行会持续保留停车实例，不推荐用于正式采集。每个 session 结束后应重启 bridge，以释放这些实例。
 
 默认人数、角色、出生点、路线、停留和机器人起终点全部来自 `episode_path` 指向的 JSON。
-要改变人数或路线，应在 Route Editor 中修改并保存 EpisodeSpec。人工数采不再读取
-小便池目标、toilet semantics 或旧 director 配置。
+要改变人数或路线，应在 Route Editor 中修改并保存 EpisodeSpec。
 
 每轮 manifest 会保存 EpisodeSpec 的绝对路径及 SHA-256；这样 JSON 被修改后不会与旧数据
-静默混用。人工数采执行链路不启动 `toilet_director_node`。
+静默混用。人工数采执行链路会为每轮启动独立 authored runner。
 
 ## 3. 录制内容
 

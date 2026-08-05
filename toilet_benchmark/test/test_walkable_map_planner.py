@@ -3,23 +3,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from toilet_benchmark.route_provider import RouteRequest, WalkableMapRouteProvider
 from toilet_benchmark.walkable_map_planner import (
     WalkableMapPlanner,
     WalkableMapPlannerConfig,
 )
-
-
-class _Logger:
-    def __init__(self):
-        self.info_messages = []
-        self.error_messages = []
-
-    def info(self, message):
-        self.info_messages.append(message)
-
-    def error(self, message):
-        self.error_messages.append(message)
 
 
 def _payload(width=8, height=6):
@@ -84,23 +71,6 @@ class TestWalkableMapPlanner(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "no nearby free"):
             planner.plan([0.25, 0.25, 0.0], [3.75, 0.25, 0.0], z=0.0)
-
-    def test_provider_logs_scene_fingerprint(self):
-        planner = self._planner()
-        logger = _Logger()
-        provider = WalkableMapRouteProvider(
-            planner=planner,
-            walk_plane_z=0.0,
-            logger=logger,
-        )
-
-        plan = provider.plan(
-            RouteRequest("agent", [0.25, 0.25, 0.0], [3.75, 0.25, 0.0])
-        )
-
-        self.assertIsNotNone(plan)
-        self.assertEqual(plan.map_version, "abc123")
-        self.assertIn("fingerprint=abc123", logger.info_messages[0])
 
     def test_clip_step_stops_before_crossing_static_wall(self):
         planner = self._planner()
