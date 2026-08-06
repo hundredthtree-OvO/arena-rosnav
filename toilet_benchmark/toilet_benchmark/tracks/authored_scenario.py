@@ -126,7 +126,7 @@ class AuthoredScenarioNode(Node):
         self._activation_yaw_tolerance_rad = 0.20
         self._activation_yaw_stability_rad = 0.08
         self._boundary_ack_tolerance_m = min(
-            0.15,
+            0.30,
             float(self.episode.termination.goal_tolerance_m),
         )
         self.exit_code = 1

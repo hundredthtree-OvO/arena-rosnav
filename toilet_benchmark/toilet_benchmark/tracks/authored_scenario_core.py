@@ -12,6 +12,8 @@ from ..episodes.schema import EpisodeSpec, PedestrianEpisodeSpec, PedestrianHold
 # Isaac People character roots face local -Y while authored routes use the
 # conventional +X planar heading. Keep this conversion at the route boundary.
 ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD = math.pi / 2.0
+PLANNER_ENDPOINT_KINK_MAX_LENGTH_M = 0.10
+PLANNER_ENDPOINT_KINK_MIN_TURN_RAD = math.radians(45.0)
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,49 @@ def align_spec_start_yaw(spec: PedestrianEpisodeSpec) -> PedestrianEpisodeSpec:
     )
 
 
+def _turn_magnitude(
+    start: Sequence[float],
+    corner: Sequence[float],
+    end: Sequence[float],
+) -> float:
+    incoming = math.atan2(corner[1] - start[1], corner[0] - start[0])
+    outgoing = math.atan2(end[1] - corner[1], end[0] - corner[0])
+    return abs(normalize_yaw(outgoing - incoming))
+
+
+def _normalize_planner_endpoint_kinks(
+    points: Sequence[Sequence[float]],
+) -> list[tuple[float, float, float]]:
+    """Drop centimetre-scale sharp bends caused by planner endpoint snapping."""
+
+    normalized: list[tuple[float, float, float]] = []
+    for point in points:
+        parsed = tuple(float(value) for value in point[:3])
+        if normalized and math.dist(normalized[-1][:2], parsed[:2]) <= 1e-6:
+            continue
+        normalized.append(parsed)
+    changed = True
+    while changed and len(normalized) >= 3:
+        changed = False
+        if (
+            math.dist(normalized[0][:2], normalized[1][:2])
+            < PLANNER_ENDPOINT_KINK_MAX_LENGTH_M
+            and _turn_magnitude(normalized[0], normalized[1], normalized[2])
+            >= PLANNER_ENDPOINT_KINK_MIN_TURN_RAD
+        ):
+            normalized.pop(1)
+            changed = True
+        if len(normalized) >= 3 and (
+            math.dist(normalized[-2][:2], normalized[-1][:2])
+            < PLANNER_ENDPOINT_KINK_MAX_LENGTH_M
+            and _turn_magnitude(normalized[-3], normalized[-2], normalized[-1])
+            >= PLANNER_ENDPOINT_KINK_MIN_TURN_RAD
+        ):
+            normalized.pop(-2)
+            changed = True
+    return normalized
+
+
 def expand_authored_route(
     spec: PedestrianEpisodeSpec,
     planner: Callable[[Sequence[float], Sequence[float]], Sequence[Sequence[float]]],
@@ -141,7 +186,7 @@ def expand_authored_route(
             target_to_expanded[target_index] = len(expanded) - 1
             cursor = target
             continue
-        segment = [tuple(float(value) for value in point[:3]) for point in planner(cursor, target)]
+        segment = _normalize_planner_endpoint_kinks((cursor, *planner(cursor, target)))
         if not segment:
             raise ValueError(
                 f"{spec.agent_id}: planner returned no route to authored target {target_index}"

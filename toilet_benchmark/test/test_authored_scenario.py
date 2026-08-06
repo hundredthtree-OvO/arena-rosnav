@@ -100,6 +100,65 @@ def test_authored_targets_expand_through_planner_and_remap_holds() -> None:
     assert expanded.start_yaw == pytest.approx(math.pi / 2.0)
 
 
+def test_authored_route_removes_short_sharp_terminal_planner_kink() -> None:
+    spec = PedestrianEpisodeSpec(
+        agent_id="agent_01",
+        semantic_goal="route_terminal",
+        start_pose=(0.0, 0.0, 0.0),
+        route_waypoints=((1.0, 0.0, 0.0),),
+    )
+
+    def planner(start, goal):
+        return [start, (0.98, 0.08, 0.0), goal]
+
+    expanded = expand_authored_route(spec, planner)
+
+    assert expanded.route_waypoints == (
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+    )
+
+
+def test_authored_route_removes_short_sharp_initial_planner_kink() -> None:
+    spec = PedestrianEpisodeSpec(
+        agent_id="agent_01",
+        semantic_goal="route_terminal",
+        start_pose=(0.0, 0.0, 0.0),
+        route_waypoints=((1.0, 0.0, 0.0),),
+    )
+
+    def planner(start, goal):
+        return [start, (0.02, 0.08, 0.0), goal]
+
+    expanded = expand_authored_route(spec, planner)
+
+    assert expanded.route_waypoints == (
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+    )
+
+
+def test_authored_route_preserves_short_collinear_terminal_segment() -> None:
+    spec = PedestrianEpisodeSpec(
+        agent_id="agent_01",
+        semantic_goal="route_terminal",
+        start_pose=(0.0, 0.0, 0.0),
+        route_waypoints=((1.0, 0.0, 0.0),),
+    )
+
+    def planner(start, goal):
+        return [start, (0.95, 0.0, 0.0), goal]
+
+    expanded = expand_authored_route(spec, planner)
+
+    assert expanded.route_waypoints[-2:] == (
+        (0.95, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+    )
+
+
 def test_character_root_yaw_uses_isaac_people_heading_convention() -> None:
     assert route_heading_to_character_root_yaw(0.0) == pytest.approx(math.pi / 2.0)
     assert route_heading_to_character_root_yaw(math.pi) == pytest.approx(-math.pi / 2.0)
