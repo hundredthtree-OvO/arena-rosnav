@@ -218,6 +218,13 @@ class MapCanvas(QtWidgets.QGraphicsView):
                     )
                     self._circle(actor.spawn_pose, self.CENTER_MARKER_RADIUS_M, color)
                     self._arrow(actor.spawn_pose, actor.spawn_pose[3], color, 0.35)
+                    if actor.start_hold_duration_sec != 0.0:
+                        start_hold = (
+                            "保持到本轮结束"
+                            if actor.start_hold_duration_sec is None
+                            else f"停 {actor.start_hold_duration_sec:g}s"
+                        )
+                        self._ring(actor.spawn_pose, color, label=f"点0 {start_hold}")
                 for point_index, point in enumerate(actor.route):
                     is_selected = selected and point_index == self._selected_waypoint
                     self._circle(
@@ -228,18 +235,32 @@ class MapCanvas(QtWidgets.QGraphicsView):
                     )
                 for hold in actor.holds:
                     if hold.waypoint_index < len(actor.route):
+                        duration = (
+                            "保持到本轮结束"
+                            if hold.duration_sec is None
+                            else f"停 {hold.duration_sec:g}s"
+                        )
                         self._ring(
                             actor.route[hold.waypoint_index],
                             color,
-                            label=f"点{hold.waypoint_index + 1} 停 {hold.duration_sec:g}s",
+                            label=f"点{hold.waypoint_index + 1} {duration}",
                         )
+                        if hold.yaw is not None:
+                            self._arrow(actor.route[hold.waypoint_index], hold.yaw, color, 0.30)
                 if actor.route:
+                    terminal_label = (
+                        "终点保持"
+                        if str(actor.terminal_behavior) == "hold_until_episode_end"
+                        else f"终点容差 {self._scenario.goal_tolerance_m:g}m"
+                    )
                     self._ring(
                         actor.route[-1],
                         "#ffffff" if selected else color,
-                        label=f"终点容差 {self._scenario.goal_tolerance_m:g}m",
+                        label=terminal_label,
                         metres=self._scenario.goal_tolerance_m,
                     )
+                    if actor.terminal_yaw is not None:
+                        self._arrow(actor.route[-1], actor.terminal_yaw, color, 0.30)
             robot = self._scenario.robot
             if robot.spawn_pose is not None:
                 self._footprint_box(

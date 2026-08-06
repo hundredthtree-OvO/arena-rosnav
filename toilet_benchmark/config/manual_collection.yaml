@@ -3,7 +3,7 @@ session:
   operator_id: operator_01
   seed: 42
   selection_mode: fixed
-  fixed_scenario_id: narrow_head_on_002
+  fixed_scenario_id: narrow_head_on_003
   # Each episode uses a fresh Isaac People incarnation. Restart the bridge
   # between sessions to release the parked AnimGraph instances.
   max_episodes: 10
@@ -73,7 +73,7 @@ scenario_source:
   mode: authored_route
 
 scenarios:
-  - id: narrow_head_on_002
+  - id: narrow_head_on_003
     enabled: true
     weight: 1.0
-    episode_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark_ui/examples/narrow_head_on_002.json
+    episode_path: /home/stardust/resources/arena_ws/src/arena/arena-rosnav/toilet_benchmark_ui/examples/narrow_head_on_003.json

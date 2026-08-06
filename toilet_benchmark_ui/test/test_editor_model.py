@@ -2,6 +2,11 @@ import math
 
 import pytest
 
+from toilet_benchmark.episodes.schema import (
+    PedestrianHoldSpec,
+    PedestrianTerminalBehavior,
+)
+
 from toilet_benchmark_ui.editor_model import (
     ActorDraft,
     HoldDraft,
@@ -133,3 +138,87 @@ def test_live_pedestrian_heading_keeps_previous_value_without_effective_target()
 
     assert not actor.sync_walking_heading()
     assert actor.spawn_pose[3] == pytest.approx(0.75)
+
+
+def test_persistent_pedestrian_needs_only_spawn_and_preserves_manual_facing() -> None:
+    scenario = ScenarioDraft.default()
+    scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    scenario.robot.goal_pose = (0.75, 0.75, 0.0)
+    actor = scenario.add_pedestrian("standing_agent")
+    actor.auto_start_yaw = False
+    actor.start_hold_duration_sec = None
+    actor.terminal_behavior = PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+    actor.spawn_pose = (-0.75, -0.25, 0.0, 0.35)
+
+    assert scenario.validate(_map(), radius_m=0.0) == []
+    episode = scenario.to_episode_spec(map_path="/tmp/test.walkable.json")
+    restored = ScenarioDraft.from_episode_spec(episode)
+
+    assert not episode.pedestrians[0].auto_start_yaw
+    assert episode.pedestrians[0].start_hold_duration_sec is None
+    assert episode.pedestrians[0].route_waypoints == ()
+    assert restored.pedestrians[0].terminal_behavior == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+    assert restored.pedestrians[0].spawn_pose[3] == pytest.approx(0.35)
+
+
+def test_terminal_yaw_round_trip_is_separate_from_intermediate_holds() -> None:
+    scenario = ScenarioDraft.default()
+    scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    scenario.robot.goal_pose = (0.75, 0.75, 0.0)
+    actor = scenario.add_pedestrian("walking_agent")
+    actor.spawn_pose = (-0.75, -0.25, 0.0, 0.0)
+    actor.route = [(-0.25, -0.25, 0.0), (0.75, 0.75, 0.0)]
+    actor.terminal_behavior = PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+    actor.terminal_yaw = 0.4
+
+    episode = scenario.to_episode_spec(map_path="/tmp/test.walkable.json")
+    restored = ScenarioDraft.from_episode_spec(episode)
+
+    assert episode.pedestrians[0].terminal_yaw == pytest.approx(
+        0.4 + math.pi / 2.0
+    )
+    assert restored.pedestrians[0].terminal_yaw == pytest.approx(0.4)
+    assert restored.pedestrians[0].holds == []
+
+
+def test_legacy_terminal_infinite_hold_is_normalized_into_terminal_yaw() -> None:
+    scenario = ScenarioDraft.default()
+    scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    scenario.robot.goal_pose = (0.75, 0.75, 0.0)
+    actor = scenario.add_pedestrian("walking_agent")
+    actor.spawn_pose = (-0.75, -0.25, 0.0, 0.0)
+    actor.route = [(-0.25, -0.25, 0.0), (0.75, 0.75, 0.0)]
+    actor.terminal_behavior = PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+    episode = scenario.to_episode_spec(map_path="/tmp/test.walkable.json")
+    spec = episode.pedestrians[0]
+    legacy = spec.__class__(
+        **{
+            **spec.__dict__,
+            "holds": (PedestrianHoldSpec(1, None, yaw=1.3),),
+        }
+    )
+
+    restored = ScenarioDraft.from_episode_spec(
+        episode.__class__(**{**episode.__dict__, "pedestrians": (legacy,)})
+    )
+
+    assert restored.pedestrians[0].holds == []
+    assert restored.pedestrians[0].terminal_yaw == pytest.approx(1.3 - math.pi / 2.0)
+
+
+def test_validation_rejects_unreachable_or_ambiguous_hold_combinations() -> None:
+    scenario = ScenarioDraft.default()
+    scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    scenario.robot.goal_pose = (0.75, 0.75, 0.0)
+    actor = scenario.add_pedestrian("walking_agent")
+    actor.spawn_pose = (-0.75, -0.25, 0.0, 0.0)
+    actor.route = [(-0.25, -0.25, 0.0), (0.75, 0.75, 0.0)]
+    actor.start_hold_duration_sec = None
+    actor.terminal_behavior = PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+    actor.holds = [HoldDraft(0, None), HoldDraft(1, 2.0)]
+
+    errors = scenario.validate(_map(), radius_m=0.0)
+
+    assert any("unreachable" in error for error in errors)
+    assert any("finite duration" in error for error in errors)
+    assert any("terminal point" in error for error in errors)

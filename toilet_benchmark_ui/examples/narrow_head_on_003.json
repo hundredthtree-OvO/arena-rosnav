@@ -9,15 +9,15 @@
   "robot": {
     "model": "xms_mecanum",
     "start_pose": [
-      1.8640830647997468,
-      0.26135356873924565,
+      2.2715632702063395,
+      0.5819354799908556,
       0.03,
       3.141592653589793
     ],
     "goal_pose": [
-      -3.627292481051782,
-      -0.967794902876475,
-      3.141592653589793
+      -3.516342631338902,
+      -0.9301444362328648,
+      0.0
     ]
   },
   "pedestrians": [
@@ -32,34 +32,14 @@
       },
       "character": "original_female_adult_business_02",
       "start_pose": [
-        0.4315503137080432,
-        0.8449780228877177,
+        -0.3325743632900675,
+        1.052360342816013,
         0.0
       ],
-      "start_yaw": 1.560487413648653,
-      "route_waypoints": [
-        [
-          1.2893014054111003,
-          0.8361352281278922,
-          0.0
-        ],
-        [
-          0.1574236761534582,
-          -0.18962896401184604,
-          0.0
-        ],
-        [
-          -3.7157204286500356,
-          -0.9501093133568237,
-          0.0
-        ]
-      ],
-      "holds": [
-        {
-          "waypoint_index": 0,
-          "duration_sec": 5.0
-        }
-      ],
+      "start_yaw": 3.141592653589793,
+      "auto_start_yaw": false,
+      "start_hold_duration_sec": null,
+      "terminal_behavior": "hold_until_episode_end",
       "constrain_to_path": true
     },
     {
@@ -69,38 +49,52 @@
         "type": "regular",
         "configuration": "custom",
         "group_id": -1,
-        "walking_speed_mps": 0.5
+        "walking_speed_mps": 0.8
       },
       "character": "original_female_adult_business_02",
       "start_pose": [
-        2.836790488380533,
-        0.9068775862064946,
+        -0.3325743632900684,
+        0.4223270443894629,
         0.0
       ],
-      "start_yaw": -0.2973651452239241,
+      "start_yaw": 3.141592653589793,
+      "auto_start_yaw": false,
+      "start_hold_duration_sec": null,
+      "terminal_behavior": "hold_until_episode_end",
+      "constrain_to_path": true
+    },
+    {
+      "agent_id": "toilet_agent_03",
+      "semantic_goal": "route_terminal",
+      "behavior": {
+        "type": "regular",
+        "configuration": "custom",
+        "group_id": -1,
+        "walking_speed_mps": 0.8
+      },
+      "character": "original_female_adult_business_02",
+      "start_pose": [
+        -0.3325743632900684,
+        -0.2077062540370873,
+        0.0
+      ],
+      "start_yaw": 3.141592653589793,
+      "auto_start_yaw": false,
+      "start_hold_duration_sec": 5.0,
       "route_waypoints": [
         [
-          2.6687773879438517,
-          0.3586243110973246,
+          0.5242709225700404,
+          0.32152171664121454,
           0.0
         ],
         [
-          1.5634280429656844,
-          0.47358064297505376,
-          0.0
-        ],
-        [
-          -3.7157204286500356,
-          -0.9412665185969984,
+          0.5746735864441641,
+          0.9095527951726616,
           0.0
         ]
       ],
-      "holds": [
-        {
-          "waypoint_index": 0,
-          "duration_sec": 7.0
-        }
-      ],
+      "terminal_behavior": "hold_until_episode_end",
+      "terminal_yaw": 3.141592653589793,
       "constrain_to_path": true
     }
   ],
@@ -110,7 +104,7 @@
     "collision_policy": "terminate"
   },
   "difficulty": {
-    "pedestrian_count": 2
+    "pedestrian_count": 3
   },
   "assets": {
     "walkable_map": "/home/stardust/resources/arena_ws/arena_assets/navigation/shenxinfu_841837.walkable.json"

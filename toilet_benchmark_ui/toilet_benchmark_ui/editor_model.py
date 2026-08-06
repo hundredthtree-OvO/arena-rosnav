@@ -12,11 +12,17 @@ from toilet_benchmark.episodes.schema import (
     PedestrianBehaviorSpec,
     PedestrianEpisodeSpec,
     PedestrianHoldSpec,
+    PedestrianTerminalBehavior,
     RobotEpisodeSpec,
     TerminationSpec,
     TrackType,
 )
-from toilet_benchmark.tracks.authored_scenario_core import initial_character_root_yaw
+from toilet_benchmark.tracks.authored_scenario_core import (
+    ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD,
+    initial_character_root_yaw,
+    normalize_yaw,
+    route_heading_to_character_root_yaw,
+)
 
 
 @dataclass(frozen=True)
@@ -176,12 +182,15 @@ def _route_point(point: Sequence[float]) -> tuple[float, float, float]:
 @dataclass
 class HoldDraft:
     waypoint_index: int
-    duration_sec: float = 2.0
+    duration_sec: float | None = 2.0
+    yaw: float | None = None
 
     def __post_init__(self) -> None:
         if int(self.waypoint_index) < 0:
             raise ValueError("hold waypoint_index must be non-negative")
-        if not math.isfinite(float(self.duration_sec)) or float(self.duration_sec) <= 0.0:
+        if self.duration_sec is not None and (
+            not math.isfinite(float(self.duration_sec)) or float(self.duration_sec) <= 0.0
+        ):
             raise ValueError("hold duration_sec must be positive and finite")
 
 
@@ -194,6 +203,10 @@ class ActorDraft:
     route: list[tuple[float, float, float]] = field(default_factory=list)
     holds: list[HoldDraft] = field(default_factory=list)
     character: str | None = None
+    auto_start_yaw: bool = True
+    start_hold_duration_sec: float | None = 0.0
+    terminal_behavior: PedestrianTerminalBehavior = PedestrianTerminalBehavior.RETIRE
+    terminal_yaw: float | None = None
     velocity_mps: float = 0.8
     constrain_to_path: bool = True
 
@@ -226,7 +239,11 @@ class ActorDraft:
 
     def sync_walking_heading(self, *, epsilon_m: float = 1e-6) -> bool:
         """Update the UI walking heading from spawn to the first effective target."""
-        if self.kind != "pedestrian" or self.spawn_pose is None:
+        if (
+            self.kind != "pedestrian"
+            or self.spawn_pose is None
+            or not self.auto_start_yaw
+        ):
             return False
         start_x, start_y = self.spawn_pose[:2]
         for target in self.route:
@@ -290,8 +307,15 @@ class ScenarioDraft:
                     errors.append(f"{actor.actor_id}: spawn is outside or occupied")
             if actor.kind != "pedestrian":
                 continue
-            if not actor.route:
-                errors.append(f"{actor.actor_id}: route needs at least one target")
+            if (
+                not actor.route
+                and actor.terminal_behavior != PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+            ):
+                errors.append(
+                    f"{actor.actor_id}: route needs a target unless terminal behavior keeps it active"
+                )
+            if actor.start_hold_duration_sec is None and actor.route:
+                errors.append(f"{actor.actor_id}: route is unreachable while spawn holds until episode end")
             elif grid is not None:
                 for point_index, point in enumerate(actor.route):
                     point_result = grid.validate_polyline((point,), radius_m=radius_m)
@@ -303,6 +327,14 @@ class ScenarioDraft:
                 if hold.waypoint_index >= len(actor.route):
                     errors.append(
                         f"{actor.actor_id}: hold waypoint {hold.waypoint_index} is outside route"
+                    )
+                elif hold.waypoint_index == len(actor.route) - 1:
+                    errors.append(
+                        f"{actor.actor_id}: terminal point behavior must use terminal settings"
+                    )
+                elif hold.duration_sec is None:
+                    errors.append(
+                        f"{actor.actor_id}: intermediate hold must have a finite duration"
                     )
         if self.robot.goal_pose is None:
             errors.append(f"{self.robot.actor_id}: robot goal pose is missing")
@@ -341,7 +373,11 @@ class ScenarioDraft:
         for actor in self.pedestrians:
             if actor.spawn_pose is None:
                 raise ValueError(f"{actor.actor_id} spawn pose is required")
-            start_yaw = initial_character_root_yaw(actor.spawn_pose, actor.route)
+            start_yaw = (
+                initial_character_root_yaw(actor.spawn_pose, actor.route)
+                if actor.auto_start_yaw and actor.route
+                else route_heading_to_character_root_yaw(actor.spawn_pose[3])
+            )
             pedestrians.append(
                 PedestrianEpisodeSpec(
                     agent_id=actor.actor_id,
@@ -349,13 +385,26 @@ class ScenarioDraft:
                     character=actor.character,
                     start_pose=actor.spawn_pose[:3],
                     start_yaw=start_yaw,
+                    auto_start_yaw=actor.auto_start_yaw,
+                    start_hold_duration_sec=actor.start_hold_duration_sec,
                     route_waypoints=tuple(actor.route),
                     holds=tuple(
                         PedestrianHoldSpec(
                             waypoint_index=hold.waypoint_index,
                             duration_sec=hold.duration_sec,
+                            yaw=(
+                                None
+                                if hold.yaw is None
+                                else route_heading_to_character_root_yaw(hold.yaw)
+                            ),
                         )
                         for hold in actor.holds
+                    ),
+                    terminal_behavior=actor.terminal_behavior,
+                    terminal_yaw=(
+                        None
+                        if actor.terminal_yaw is None
+                        else route_heading_to_character_root_yaw(actor.terminal_yaw)
                     ),
                     constrain_to_path=actor.constrain_to_path,
                     behavior=PedestrianBehaviorSpec(
@@ -395,18 +444,49 @@ class ScenarioDraft:
         for spec in episode.pedestrians:
             actor = ActorDraft.pedestrian(spec.agent_id)
             actor.character = spec.character
+            actor.auto_start_yaw = spec.auto_start_yaw
+            actor.start_hold_duration_sec = spec.start_hold_duration_sec
+            actor.terminal_behavior = spec.terminal_behavior
+            actor.terminal_yaw = (
+                None
+                if spec.terminal_yaw is None
+                else normalize_yaw(
+                    spec.terminal_yaw - ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD
+                )
+            )
             if spec.start_pose is not None:
+                ui_yaw = 0.0 if spec.start_yaw is None else spec.start_yaw
+                if not spec.auto_start_yaw:
+                    ui_yaw = normalize_yaw(
+                        ui_yaw - ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD
+                    )
                 actor.spawn_pose = (
                     spec.start_pose[0],
                     spec.start_pose[1],
                     spec.start_pose[2],
-                    0.0 if spec.start_yaw is None else spec.start_yaw,
+                    ui_yaw,
                 )
             actor.route = list(spec.route_waypoints)
-            actor.holds = [
-                HoldDraft(hold.waypoint_index, hold.duration_sec)
-                for hold in spec.holds
-            ]
+            actor.holds = []
+            terminal_index = len(spec.route_waypoints) - 1
+            for hold in spec.holds:
+                hold_yaw = (
+                    None
+                    if hold.yaw is None
+                    else normalize_yaw(hold.yaw - ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD)
+                )
+                if (
+                    hold.waypoint_index == terminal_index
+                    and hold.duration_sec is None
+                    and spec.terminal_behavior
+                    == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+                ):
+                    if actor.terminal_yaw is None:
+                        actor.terminal_yaw = hold_yaw
+                    continue
+                actor.holds.append(
+                    HoldDraft(hold.waypoint_index, hold.duration_sec, hold_yaw)
+                )
             if spec.behavior.walking_speed_mps is not None:
                 actor.velocity_mps = spec.behavior.walking_speed_mps
             actor.constrain_to_path = spec.constrain_to_path

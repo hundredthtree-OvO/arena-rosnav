@@ -211,7 +211,12 @@ class TestEpisodeValidatorManifestSplits(unittest.TestCase):
             ],
         )
         self.assertEqual(episodes[0].task_type, "authored_route")
-        self.assertEqual(len(episodes[0].pedestrians), 2)
+        source_scenario = config.enabled_scenarios()[0]
+        source_payload = json.loads(Path(source_scenario.episode_path).read_text(encoding="utf-8"))
+        self.assertEqual(
+            len(episodes[0].pedestrians),
+            len(source_payload["pedestrians"]),
+        )
         self.assertEqual(episodes[0].metadata["source"], "manual_collection_authored_route")
         self.assertTrue(all(not validate_episode(episode) for episode in episodes))
 

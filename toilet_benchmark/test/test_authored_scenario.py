@@ -8,6 +8,7 @@ from toilet_benchmark.episodes.schema import (
     PedestrianBehaviorSpec,
     PedestrianEpisodeSpec,
     PedestrianHoldSpec,
+    PedestrianTerminalBehavior,
     RobotEpisodeSpec,
     TerminationSpec,
     TrackType,
@@ -59,6 +60,82 @@ def test_terminal_hold_completes_only_after_duration() -> None:
     assert not runtime.complete
     assert runtime.release_hold(4.0) == "complete"
     assert runtime.complete
+
+
+def test_spawn_can_hold_until_episode_end_without_a_motion_mode() -> None:
+    runtime = RouteRuntime.create(
+        PedestrianEpisodeSpec(
+            agent_id="standing_agent",
+            semantic_goal="route_terminal",
+            start_pose=(1.0, 2.0, 0.0),
+            start_yaw=0.25,
+            auto_start_yaw=False,
+            start_hold_duration_sec=None,
+            route_waypoints=((1.0, 2.0, 0.0),),
+            terminal_behavior=PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END,
+        )
+    )
+    assert runtime.activate(10.0) == "terminal_hold"
+    assert runtime.state == "HOLDING_UNTIL_EPISODE_END"
+    assert not runtime.complete
+
+
+def test_finite_spawn_hold_releases_into_existing_route() -> None:
+    spec = _spec()
+    runtime = RouteRuntime.create(
+        spec.__class__(
+            **{**spec.__dict__, "start_hold_duration_sec": 1.5}
+        )
+    )
+    assert runtime.activate(10.0) == "start_hold"
+    assert runtime.release_start_hold(11.4) is None
+    assert runtime.release_start_hold(11.5) == "dispatch"
+
+
+def test_terminal_behavior_keeps_completed_walker_visible() -> None:
+    spec = _spec()
+    runtime = RouteRuntime.create(
+        spec.__class__(
+            **{
+                **spec.__dict__,
+                "terminal_behavior": PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END,
+            }
+        )
+    )
+    runtime.state = "MOVING"
+    assert runtime.arrive(0.0) == "hold"
+    assert runtime.release_hold(2.0) == "dispatch"
+    assert runtime.arrive(3.0) == "terminal_hold"
+    assert not runtime.complete
+
+
+def test_terminal_hold_uses_terminal_specific_yaw() -> None:
+    spec = _spec()
+    runtime = RouteRuntime.create(
+        spec.__class__(
+            **{
+                **spec.__dict__,
+                "terminal_behavior": PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END,
+                "terminal_yaw": -0.7,
+            }
+        )
+    )
+    runtime.boundary_cursor = len(runtime.boundary_indices) - 1
+    assert runtime.stop_yaw() == pytest.approx(-0.7)
+
+
+def test_intermediate_hold_can_be_indefinite_and_has_its_own_yaw() -> None:
+    spec = _spec()
+    spec = spec.__class__(
+        **{
+            **spec.__dict__,
+            "holds": (PedestrianHoldSpec(1, None, yaw=1.1),),
+        }
+    )
+    runtime = RouteRuntime.create(spec)
+    runtime.state = "MOVING"
+    assert runtime.arrive(0.0) == "terminal_hold"
+    assert runtime.hold_yaw() == pytest.approx(1.1)
 
 
 def test_hold_at_spawn_is_rejected() -> None:

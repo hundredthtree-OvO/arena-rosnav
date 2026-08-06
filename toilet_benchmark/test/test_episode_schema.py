@@ -12,6 +12,7 @@ from toilet_benchmark.episodes.schema import (
     PedestrianBehaviorSpec,
     PedestrianEpisodeSpec,
     PedestrianHoldSpec,
+    PedestrianTerminalBehavior,
     RobotEpisodeSpec,
     TerminationSpec,
     TrackType,
@@ -175,6 +176,55 @@ class TestEpisodeSchema(unittest.TestCase):
         self.assertEqual(payload["pedestrians"][0]["start_yaw"], 0.0)
         self.assertEqual(payload["pedestrians"][0]["holds"][0]["waypoint_index"], 1)
         self.assertTrue(payload["pedestrians"][0]["constrain_to_path"])
+
+    def test_persistent_pedestrian_round_trip_and_route_default_compatibility(self):
+        persistent = PedestrianEpisodeSpec.from_mapping(
+            {
+                "agent_id": "standing_agent",
+                "semantic_goal": "route_terminal",
+                "start_pose": [1.0, 2.0, 0.0],
+                "start_yaw": 0.5,
+                "auto_start_yaw": False,
+                "start_hold_duration_sec": None,
+                "terminal_behavior": "hold_until_episode_end",
+                "terminal_yaw": 1.2,
+            }
+        )
+        legacy_route = PedestrianEpisodeSpec.from_mapping(
+            {
+                "agent_id": "walking_agent",
+                "semantic_goal": "route_terminal",
+                "route_waypoints": [[1.0, 0.0, 0.0]],
+            }
+        )
+
+        self.assertFalse(persistent.auto_start_yaw)
+        self.assertIsNone(persistent.start_hold_duration_sec)
+        self.assertEqual(
+            persistent.terminal_behavior,
+            PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END,
+        )
+        self.assertEqual(persistent.terminal_yaw, 1.2)
+        self.assertEqual(persistent.to_dict()["terminal_yaw"], 1.2)
+        self.assertEqual(legacy_route.terminal_behavior, PedestrianTerminalBehavior.RETIRE)
+        self.assertNotIn("terminal_behavior", legacy_route.to_dict())
+
+    def test_point_hold_round_trip_preserves_indefinite_duration_and_yaw(self):
+        hold = PedestrianHoldSpec.from_mapping(
+            {"waypoint_index": 1, "duration_sec": None, "yaw": 1.25}
+        )
+        self.assertIsNone(hold.duration_sec)
+        self.assertEqual(hold.yaw, 1.25)
+        self.assertEqual(hold.to_dict()["yaw"], 1.25)
+
+    def test_negative_spawn_hold_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "start_hold_duration_sec"):
+            PedestrianEpisodeSpec(
+                agent_id="standing_agent",
+                semantic_goal="route_terminal",
+                start_pose=(0.0, 0.0, 0.0),
+                start_hold_duration_sec=-1.0,
+            )
 
 
 if __name__ == "__main__":

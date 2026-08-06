@@ -1,4 +1,4 @@
-"""Simulator-neutral state for authored pedestrian routes."""
+"""Simulator-neutral state for authored pedestrian motion."""
 
 from __future__ import annotations
 
@@ -6,7 +6,12 @@ from dataclasses import dataclass, replace
 import math
 from typing import Callable, Sequence
 
-from ..episodes.schema import EpisodeSpec, PedestrianEpisodeSpec, PedestrianHoldSpec
+from ..episodes.schema import (
+    EpisodeSpec,
+    PedestrianEpisodeSpec,
+    PedestrianHoldSpec,
+    PedestrianTerminalBehavior,
+)
 
 
 # Isaac People character roots face local -Y while authored routes use the
@@ -24,6 +29,40 @@ class ActivationGateStatus:
     yaw: float
     position_error_m: float
     yaw_error_rad: float
+
+
+def _observe_activation(
+    runtime,
+    pose: Sequence[float],
+    metadata: dict[str, str],
+    *,
+    position_tolerance_m: float,
+    position_stability_m: float,
+    yaw_tolerance_rad: float,
+    yaw_stability_rad: float,
+    required_samples: int,
+) -> bool:
+    status = activation_gate_status(
+        runtime.spec,
+        pose,
+        metadata,
+        position_tolerance_m=position_tolerance_m,
+        yaw_tolerance_rad=yaw_tolerance_rad,
+    )
+    if not status.eligible:
+        runtime.reset_activation_observation()
+        return False
+    current_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+    if runtime.activation_pose is not None:
+        position_step = math.dist(current_pose[:2], runtime.activation_pose[:2])
+        yaw_step = abs(_angle_difference(status.yaw, float(runtime.activation_yaw)))
+        if position_step > position_stability_m or yaw_step > yaw_stability_rad:
+            runtime.reset_activation_observation()
+    runtime.generation = status.generation
+    runtime.activation_pose = current_pose
+    runtime.activation_yaw = status.yaw
+    runtime.activation_stable_samples += 1
+    return runtime.activation_stable_samples >= max(1, int(required_samples))
 
 
 def activation_gate_status(
@@ -45,7 +84,9 @@ def activation_gate_status(
         yaw = float(metadata.get("yaw_rad", "nan"))
     except (TypeError, ValueError):
         yaw = math.nan
-    start = spec.route_waypoints[0]
+    if spec.start_pose is None:
+        raise ValueError(f"{spec.agent_id}: start_pose is required for activation")
+    start = spec.start_pose
     position_error = math.hypot(float(pose[0]) - start[0], float(pose[1]) - start[1])
     expected_yaw = float(spec.start_yaw or 0.0)
     yaw_error = abs(_angle_difference(yaw, expected_yaw)) if math.isfinite(yaw) else math.inf
@@ -116,6 +157,10 @@ def initial_character_root_yaw(
 def align_spec_start_yaw(spec: PedestrianEpisodeSpec) -> PedestrianEpisodeSpec:
     if spec.start_pose is None:
         raise ValueError(f"{spec.agent_id}: start_pose is required for yaw alignment")
+    if not spec.auto_start_yaw:
+        if spec.start_yaw is None:
+            raise ValueError(f"{spec.agent_id}: manual start yaw is required")
+        return spec
     return replace(
         spec,
         start_yaw=initial_character_root_yaw(spec.start_pose, spec.route_waypoints),
@@ -216,6 +261,7 @@ def expand_authored_route(
         PedestrianHoldSpec(
             waypoint_index=target_to_expanded[hold.waypoint_index],
             duration_sec=hold.duration_sec,
+            yaw=hold.yaw,
         )
         for hold in spec.holds
     )
@@ -241,11 +287,11 @@ class RouteRuntime:
 
     @classmethod
     def create(cls, spec: PedestrianEpisodeSpec) -> "RouteRuntime":
-        if len(spec.route_waypoints) < 2:
-            raise ValueError(f"{spec.agent_id}: authored route needs at least two waypoints")
+        if not spec.route_waypoints:
+            raise ValueError(f"{spec.agent_id}: runtime route needs a spawn waypoint")
         last = len(spec.route_waypoints) - 1
         boundaries = sorted({hold.waypoint_index for hold in spec.holds} | {last})
-        if boundaries[0] <= 0:
+        if len(spec.route_waypoints) > 1 and boundaries[0] <= 0:
             raise ValueError(f"{spec.agent_id}: a hold cannot target the spawn waypoint")
         if boundaries[-1] > last:
             raise ValueError(f"{spec.agent_id}: hold waypoint is outside the route")
@@ -279,29 +325,16 @@ class RouteRuntime:
     ) -> bool:
         """Accept reactivation only after several stable simulator samples."""
 
-        status = activation_gate_status(
-            self.spec,
+        return _observe_activation(
+            self,
             pose,
             metadata,
             position_tolerance_m=position_tolerance_m,
+            position_stability_m=position_stability_m,
             yaw_tolerance_rad=yaw_tolerance_rad,
+            yaw_stability_rad=yaw_stability_rad,
+            required_samples=required_samples,
         )
-        if not status.eligible:
-            self.reset_activation_observation()
-            return False
-
-        current_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
-        if self.activation_pose is not None:
-            position_step = math.dist(current_pose[:2], self.activation_pose[:2])
-            yaw_step = abs(_angle_difference(status.yaw, float(self.activation_yaw)))
-            if position_step > position_stability_m or yaw_step > yaw_stability_rad:
-                self.reset_activation_observation()
-
-        self.generation = status.generation
-        self.activation_pose = current_pose
-        self.activation_yaw = status.yaw
-        self.activation_stable_samples += 1
-        return self.activation_stable_samples >= max(1, int(required_samples))
 
     def reset_activation_observation(self) -> None:
         self.activation_stable_samples = 0
@@ -317,19 +350,76 @@ class RouteRuntime:
             self.previous_boundary + 1 : self.current_boundary + 1
         ]
 
+    @property
+    def has_forward_route(self) -> bool:
+        return len(self.spec.route_waypoints) > 1
+
+    def activate(self, now: float) -> str:
+        duration = self.spec.start_hold_duration_sec
+        if duration is None:
+            self.state = "HOLDING_UNTIL_EPISODE_END"
+            return "terminal_hold"
+        if float(duration) > 0.0:
+            self.state = "START_HOLDING"
+            self.hold_until = float(now) + float(duration)
+            return "start_hold"
+        if not self.has_forward_route:
+            if self.spec.terminal_behavior == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END:
+                self.state = "HOLDING_UNTIL_EPISODE_END"
+                return "terminal_hold"
+            self.state = "COMPLETE"
+            return "complete"
+        return "dispatch"
+
+    def release_start_hold(self, now: float) -> str | None:
+        if self.state != "START_HOLDING" or self.hold_until is None or now < self.hold_until:
+            return None
+        self.hold_until = None
+        if not self.has_forward_route:
+            if self.spec.terminal_behavior == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END:
+                self.state = "HOLDING_UNTIL_EPISODE_END"
+                return "terminal_hold"
+            self.state = "COMPLETE"
+            return "complete"
+        return "dispatch"
+
     def hold_duration(self) -> float | None:
         for hold in self.spec.holds:
             if hold.waypoint_index == self.current_boundary:
                 return hold.duration_sec
         return None
 
+    def hold_yaw(self) -> float | None:
+        for hold in self.spec.holds:
+            if hold.waypoint_index == self.current_boundary:
+                return hold.yaw
+        return None
+
+    def stop_yaw(self) -> float | None:
+        hold_yaw = self.hold_yaw()
+        if hold_yaw is not None:
+            return hold_yaw
+        if (
+            self.current_boundary == len(self.spec.route_waypoints) - 1
+            and self.spec.terminal_behavior
+            == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+        ):
+            return self.spec.terminal_yaw
+        return None
+
     def arrive(self, now: float) -> str:
         duration = self.hold_duration()
-        if duration is not None and self.state != "HOLDING":
+        if self._current_hold() is not None and self.state != "HOLDING":
+            if duration is None:
+                self.state = "HOLDING_UNTIL_EPISODE_END"
+                return "terminal_hold"
             self.state = "HOLDING"
             self.hold_until = float(now) + float(duration)
             return "hold"
         if self.current_boundary == len(self.spec.route_waypoints) - 1:
+            if self.spec.terminal_behavior == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END:
+                self.state = "HOLDING_UNTIL_EPISODE_END"
+                return "terminal_hold"
             self.state = "COMPLETE"
             return "complete"
         self.boundary_cursor += 1
@@ -337,11 +427,20 @@ class RouteRuntime:
         self.hold_until = None
         return "dispatch"
 
+    def _current_hold(self) -> PedestrianHoldSpec | None:
+        for hold in self.spec.holds:
+            if hold.waypoint_index == self.current_boundary:
+                return hold
+        return None
+
     def release_hold(self, now: float) -> str | None:
         if self.state != "HOLDING" or self.hold_until is None or now < self.hold_until:
             return None
         self.hold_until = None
         if self.current_boundary == len(self.spec.route_waypoints) - 1:
+            if self.spec.terminal_behavior == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END:
+                self.state = "HOLDING_UNTIL_EPISODE_END"
+                return "terminal_hold"
             self.state = "COMPLETE"
             return "complete"
         self.boundary_cursor += 1

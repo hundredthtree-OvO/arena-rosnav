@@ -30,6 +30,11 @@ class CollisionPolicy(StringEnum):
     CONTAIN = "contain"
 
 
+class PedestrianTerminalBehavior(StringEnum):
+    RETIRE = "retire"
+    HOLD_UNTIL_EPISODE_END = "hold_until_episode_end"
+
+
 def _numeric_tuple(value: Sequence[Any], length: int, field_name: str) -> tuple[float, ...]:
     if len(value) != length:
         raise ValueError(f"{field_name} must contain {length} values")
@@ -39,25 +44,36 @@ def _numeric_tuple(value: Sequence[Any], length: int, field_name: str) -> tuple[
 @dataclass(frozen=True)
 class PedestrianHoldSpec:
     waypoint_index: int
-    duration_sec: float
+    duration_sec: float | None
+    yaw: float | None = None
 
     def __post_init__(self) -> None:
         if int(self.waypoint_index) < 0:
             raise ValueError("pedestrian hold waypoint_index must be non-negative")
-        if float(self.duration_sec) <= 0.0:
+        if self.duration_sec is not None and float(self.duration_sec) <= 0.0:
             raise ValueError("pedestrian hold duration_sec must be positive")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "waypoint_index": int(self.waypoint_index),
-            "duration_sec": float(self.duration_sec),
+            "duration_sec": (
+                None if self.duration_sec is None else float(self.duration_sec)
+            ),
         }
+        if self.yaw is not None:
+            value["yaw"] = float(self.yaw)
+        return value
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PedestrianHoldSpec":
         return cls(
             waypoint_index=int(value["waypoint_index"]),
-            duration_sec=float(value["duration_sec"]),
+            duration_sec=(
+                None
+                if value.get("duration_sec") is None
+                else float(value["duration_sec"])
+            ),
+            yaw=float(value["yaw"]) if value.get("yaw") is not None else None,
         )
 
 
@@ -119,10 +135,26 @@ class PedestrianEpisodeSpec:
     start_reference: str | None = None
     start_pose: tuple[float, float, float] | None = None
     start_yaw: float | None = None
+    auto_start_yaw: bool = True
+    start_hold_duration_sec: float | None = 0.0
     route_waypoints: tuple[tuple[float, float, float], ...] = ()
     holds: tuple[PedestrianHoldSpec, ...] = ()
+    terminal_behavior: PedestrianTerminalBehavior = PedestrianTerminalBehavior.RETIRE
+    terminal_yaw: float | None = None
     constrain_to_path: bool = False
     behavior: PedestrianBehaviorSpec = field(default_factory=PedestrianBehaviorSpec)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "terminal_behavior",
+            PedestrianTerminalBehavior(self.terminal_behavior),
+        )
+        if (
+            self.start_hold_duration_sec is not None
+            and float(self.start_hold_duration_sec) < 0.0
+        ):
+            raise ValueError("pedestrian start_hold_duration_sec must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -138,10 +170,22 @@ class PedestrianEpisodeSpec:
             value["start_pose"] = list(self.start_pose)
         if self.start_yaw is not None:
             value["start_yaw"] = float(self.start_yaw)
+        if not self.auto_start_yaw:
+            value["auto_start_yaw"] = False
+        if self.start_hold_duration_sec != 0.0:
+            value["start_hold_duration_sec"] = (
+                None
+                if self.start_hold_duration_sec is None
+                else float(self.start_hold_duration_sec)
+            )
         if self.route_waypoints:
             value["route_waypoints"] = [list(point) for point in self.route_waypoints]
         if self.holds:
             value["holds"] = [hold.to_dict() for hold in self.holds]
+        if self.terminal_behavior != PedestrianTerminalBehavior.RETIRE:
+            value["terminal_behavior"] = self.terminal_behavior.value
+        if self.terminal_yaw is not None:
+            value["terminal_yaw"] = float(self.terminal_yaw)
         if self.constrain_to_path:
             value["constrain_to_path"] = True
         return value
@@ -169,6 +213,13 @@ class PedestrianEpisodeSpec:
                 if value.get("start_yaw") is not None
                 else None
             ),
+            auto_start_yaw=bool(value.get("auto_start_yaw", True)),
+            start_hold_duration_sec=(
+                None
+                if "start_hold_duration_sec" in value
+                and value.get("start_hold_duration_sec") is None
+                else float(value.get("start_hold_duration_sec", 0.0))
+            ),
             route_waypoints=tuple(
                 _numeric_tuple(point, 3, "pedestrian.route_waypoint")
                 for point in route_waypoints
@@ -176,6 +227,17 @@ class PedestrianEpisodeSpec:
             holds=tuple(
                 PedestrianHoldSpec.from_mapping(item)
                 for item in value.get("holds", ())
+            ),
+            terminal_behavior=PedestrianTerminalBehavior(
+                value.get(
+                    "terminal_behavior",
+                    PedestrianTerminalBehavior.RETIRE.value,
+                )
+            ),
+            terminal_yaw=(
+                float(value["terminal_yaw"])
+                if value.get("terminal_yaw") is not None
+                else None
             ),
             constrain_to_path=bool(value.get("constrain_to_path", False)),
             behavior=PedestrianBehaviorSpec.from_mapping(value.get("behavior", {})),

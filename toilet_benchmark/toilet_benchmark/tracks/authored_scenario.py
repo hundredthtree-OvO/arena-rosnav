@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -105,6 +106,8 @@ class AuthoredScenarioNode(Node):
         self._status_pub = self.create_publisher(String, status_topic, 10) if status_topic else None
         self._cancel_service = self.create_service(Trigger, cancel_service, self._cancel_cb)
         self._active_announced: set[str] = set()
+        self._active_heartbeat_interval_sec = 0.5
+        self._last_active_heartbeat_at = 0.0
         self._retire_retry_at: dict[str, float] = {}
         self._retire_inflight: set[str] = set()
         self._cancel_requested = False
@@ -327,6 +330,7 @@ class AuthoredScenarioNode(Node):
             self.get_logger().error("Authored scenario timed out")
             self._finish(1)
             return
+        self._publish_active_heartbeats(now)
         for agent_id, runtime in self._runtimes.items():
             if runtime.complete:
                 continue
@@ -345,6 +349,18 @@ class AuthoredScenarioNode(Node):
                 elif action == "complete":
                     self._diag("hold_released", agent_id=agent_id, action=action)
                     self._retire(runtime, reason="completed after terminal hold")
+                continue
+            if runtime.state == "START_HOLDING":
+                action = runtime.release_start_hold(now)
+                if action == "dispatch":
+                    self._diag("start_hold_released", agent_id=agent_id)
+                    self._dispatch(runtime)
+                elif action == "terminal_hold":
+                    self._diag("terminal_hold_started", agent_id=agent_id, source="spawn")
+                elif action == "complete":
+                    self._retire(runtime, reason="completed after spawn hold")
+                continue
+            if runtime.state == "HOLDING_UNTIL_EPISODE_END":
                 continue
             pose = self._poses.get(agent_id)
             if pose is None or now - self._pose_times.get(agent_id, 0.0) > 2.0:
@@ -378,7 +394,23 @@ class AuthoredScenarioNode(Node):
                     pose=list(pose),
                     yaw=runtime.activation_yaw,
                 )
-                self._dispatch(runtime)
+                action = runtime.activate(now)
+                if action == "dispatch":
+                    self._dispatch(runtime)
+                elif action == "start_hold":
+                    self._send_stop_at_pose(runtime, pose, metadata)
+                    self._announce_active(runtime)
+                    self._diag(
+                        "start_hold_started",
+                        agent_id=agent_id,
+                        duration_sec=runtime.spec.start_hold_duration_sec,
+                    )
+                elif action == "terminal_hold":
+                    self._send_stop_at_pose(runtime, pose, metadata)
+                    self._announce_active(runtime)
+                    self._diag("terminal_hold_started", agent_id=agent_id, source="spawn")
+                else:
+                    self._retire(runtime, reason="route has no forward target")
                 continue
             if runtime.state == "WAITING_FOR_EXECUTION":
                 metadata = self._pose_metadata.get(agent_id, {})
@@ -428,6 +460,15 @@ class AuthoredScenarioNode(Node):
                 )
             elif action == "complete":
                 self._retire(runtime, reason="reached route terminal")
+            elif action == "terminal_hold":
+                self.get_logger().info(
+                    f"{agent_id} reached its authored point and will remain until episode end"
+                )
+                self._diag(
+                    "terminal_hold_started",
+                    agent_id=agent_id,
+                    boundary=runtime.current_boundary,
+                )
             elif action == "dispatch":
                 self._dispatch(runtime)
         if all(runtime.complete for runtime in self._runtimes.values()):
@@ -614,6 +655,14 @@ class AuthoredScenarioNode(Node):
         if runtime.spec.agent_id in self._active_announced:
             return
         self._active_announced.add(runtime.spec.agent_id)
+        self._publish_active_status(runtime, heartbeat=False)
+
+    def _publish_active_status(
+        self,
+        runtime: RouteRuntime,
+        *,
+        heartbeat: bool,
+    ) -> None:
         self._publish_status(
             "pedestrian_active",
             agent_id=runtime.spec.agent_id,
@@ -621,7 +670,18 @@ class AuthoredScenarioNode(Node):
             episode_id=self.episode.episode_id,
             generation=runtime.generation,
             command_generation=runtime.command_generation,
+            heartbeat=bool(heartbeat),
         )
+
+    def _publish_active_heartbeats(self, now: float) -> None:
+        if now - self._last_active_heartbeat_at < self._active_heartbeat_interval_sec:
+            return
+        self._last_active_heartbeat_at = float(now)
+        for agent_id in sorted(self._active_announced):
+            runtime = self._runtimes.get(agent_id)
+            if runtime is None or runtime.complete or runtime.state in {"RETIRING", "CANCELLING"}:
+                continue
+            self._publish_active_status(runtime, heartbeat=True)
 
     def _publish_status(self, event: str, **fields) -> None:
         if self._status_pub is None:
@@ -638,7 +698,11 @@ class AuthoredScenarioNode(Node):
                 goal_pose=target,
                 path_points=(),
                 velocity=0.0,
-                orientation=float(runtime.spec.start_yaw or 0.0),
+                orientation=float(
+                    runtime.stop_yaw()
+                    if runtime.stop_yaw() is not None
+                    else runtime.spec.start_yaw or 0.0
+                ),
                 stop=True,
                 constrain_to_path=runtime.spec.constrain_to_path,
                 phase="AUTHORED_HOLD",
@@ -721,9 +785,19 @@ def plan_episode_routes(
     *,
     planner_radius_m: float = 0.30,
 ) -> tuple:
+    route_specs = tuple(spec for spec in episode.pedestrians if spec.route_waypoints)
+    if not route_specs:
+        return tuple(
+            replace(
+                spec,
+                route_waypoints=(tuple(spec.start_pose),),
+                start_yaw=float(spec.start_yaw or 0.0),
+            )
+            for spec in episode.pedestrians
+        )
     map_path = str(episode.assets.get("walkable_map", "")).strip()
     if not map_path:
-        raise ValueError("authored scenario assets.walkable_map is required")
+        raise ValueError("authored scenario assets.walkable_map is required for route pedestrians")
     planner = WalkableMapPlanner.from_file(
         WalkableMapPlannerConfig(
             map_path=map_path,
@@ -740,6 +814,10 @@ def plan_episode_routes(
                 list(goal),
                 z=float(goal[2]),
             ),
+        ) if spec.route_waypoints else replace(
+            spec,
+            route_waypoints=(tuple(spec.start_pose),),
+            start_yaw=float(spec.start_yaw or 0.0),
         )
         for spec in episode.pedestrians
     )

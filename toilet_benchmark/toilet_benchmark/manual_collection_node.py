@@ -469,7 +469,24 @@ class ManualCollectionNode(Node):
             if self._pedestrian_process is not None and self._pedestrian_process.poll() not in (None, 0):
                 self._finish_episode("failed", "pedestrian_runtime_failed", episode_started=False)
             elif now - self._state_started_at > self.pedestrian_start_timeout_sec:
-                self._finish_episode("failed", "pedestrian_start_timeout", episode_started=False)
+                expected = set(self._active_agent_ids())
+                ready = set(self._active_pedestrian_generations)
+                details = {
+                    "ready_agent_ids": sorted(ready),
+                    "missing_agent_ids": sorted(expected - ready),
+                    "expected_agent_ids": sorted(expected),
+                }
+                self.get_logger().error(
+                    "Pedestrian startup timed out: "
+                    f"ready={details['ready_agent_ids']}, "
+                    f"missing={details['missing_agent_ids']}"
+                )
+                self._finish_episode(
+                    "failed",
+                    "pedestrian_start_timeout",
+                    episode_started=False,
+                    extra=details,
+                )
 
     def _begin_episode(self) -> None:
         max_episodes = self.config.session.max_episodes
@@ -772,7 +789,7 @@ class ManualCollectionNode(Node):
 
     def _advance_running(self, now: float) -> None:
         if now - self._episode_started_at > self.config.episode.timeout_sec:
-            self._finish_episode("failed", "episode_timeout")
+            self._finish_episode("failed", "episode_timeout", abort_pedestrian_runtime=True)
             return
         if self._pedestrian_process is not None:
             return_code = self._pedestrian_process.poll()
@@ -787,7 +804,11 @@ class ManualCollectionNode(Node):
             <= self.config.episode.goal_tolerance_m
             and linear_speed <= self.config.episode.goal_stop_speed_mps
         ):
-            self._finish_episode("succeeded", "robot_reached_goal")
+            self._finish_episode(
+                "succeeded",
+                "robot_reached_goal",
+                abort_pedestrian_runtime=True,
+            )
 
     def _stop_pedestrian_runtime(self) -> None:
         process = self._pedestrian_process
@@ -952,8 +973,8 @@ class ManualCollectionNode(Node):
                 future.add_done_callback(self._authored_cancel_done)
                 self._set_state("WAIT_AUTHORED_RUNTIME_EXIT")
                 self.get_logger().info(
-                    "Collision recorded as an immediate episode failure; waiting for "
-                    "the authored runtime to stop and park pedestrians gracefully."
+                    f"Episode ended ({reason}); waiting for the authored runtime to "
+                    "stop and park remaining pedestrians gracefully."
                 )
                 return
             agent_ids = self._active_agent_ids()

@@ -23,3 +23,5 @@ def test_authored_runner_uses_people_only_as_segment_executor() -> None:
     assert "self.create_service(Trigger, cancel_service" in source
     assert "AUTHORED_CANCEL" in source
     assert "pedestrian_departure_diagnostic" in source
+    assert "_publish_active_heartbeats(now)" in source
+    assert 'heartbeat=bool(heartbeat)' in source

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from python_qt_binding import QtCore, QtWidgets
 
-from toilet_benchmark.episodes.schema import EpisodeSpec
+from toilet_benchmark.episodes.schema import EpisodeSpec, PedestrianTerminalBehavior
 from toilet_benchmark.walkable_map_planner import (
     WalkableMapPlanner,
     WalkableMapPlannerConfig,
@@ -138,6 +138,9 @@ class EditorWindow(QtWidgets.QMainWindow):
         form = QtWidgets.QFormLayout(properties)
         self._kind = QtWidgets.QLabel("-")
         form.addRow("类型", self._kind)
+        self._auto_heading = QtWidgets.QCheckBox("沿首段自动计算")
+        self._auto_heading.toggled.connect(self._actor_fields_changed)
+        form.addRow("出生朝向", self._auto_heading)
         self._yaw = QtWidgets.QDoubleSpinBox()
         self._yaw.setRange(-180.0, 180.0)
         self._yaw.setSuffix(" deg")
@@ -148,7 +151,36 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._speed.setSingleStep(0.05)
         self._speed.setSuffix(" m/s")
         self._speed.valueChanged.connect(self._actor_fields_changed)
-        form.addRow("行人速度", self._speed)
+        self._speed_label = QtWidgets.QLabel("行人速度")
+        form.addRow(self._speed_label, self._speed)
+        self._start_hold_mode = QtWidgets.QComboBox()
+        self._start_hold_mode.addItem("立即出发", "none")
+        self._start_hold_mode.addItem("停留指定时间", "duration")
+        self._start_hold_mode.addItem("保持到本轮结束", "episode")
+        self._start_hold_mode.currentIndexChanged.connect(self._actor_fields_changed)
+        form.addRow("出生点行为", self._start_hold_mode)
+        self._start_hold_duration = QtWidgets.QDoubleSpinBox()
+        self._start_hold_duration.setRange(0.1, 300.0)
+        self._start_hold_duration.setValue(2.0)
+        self._start_hold_duration.setSuffix(" s")
+        self._start_hold_duration.valueChanged.connect(self._actor_fields_changed)
+        form.addRow("出生停留时间", self._start_hold_duration)
+        self._terminal_behavior = QtWidgets.QComboBox()
+        self._terminal_behavior.addItem("到达后消失", PedestrianTerminalBehavior.RETIRE.value)
+        self._terminal_behavior.addItem(
+            "保持到本轮结束",
+            PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END.value,
+        )
+        self._terminal_behavior.currentIndexChanged.connect(self._actor_fields_changed)
+        form.addRow("终点行为", self._terminal_behavior)
+        self._terminal_manual_yaw = QtWidgets.QCheckBox("使用手动朝向")
+        self._terminal_manual_yaw.toggled.connect(self._actor_fields_changed)
+        form.addRow("终点朝向", self._terminal_manual_yaw)
+        self._terminal_yaw = QtWidgets.QDoubleSpinBox()
+        self._terminal_yaw.setRange(-180.0, 180.0)
+        self._terminal_yaw.setSuffix(" deg")
+        self._terminal_yaw.valueChanged.connect(self._actor_fields_changed)
+        form.addRow("终点手动方向", self._terminal_yaw)
         self._constrain = QtWidgets.QCheckBox("严格沿编辑路线")
         self._constrain.toggled.connect(self._actor_fields_changed)
         form.addRow("路线约束", self._constrain)
@@ -161,19 +193,23 @@ class EditorWindow(QtWidgets.QMainWindow):
         hold_form = QtWidgets.QFormLayout(hold_box)
         self._selected_point = QtWidgets.QLabel("未选择路线点")
         hold_form.addRow("路线点", self._selected_point)
+        self._hold_enabled = QtWidgets.QCheckBox("在此有限停留")
+        self._hold_enabled.toggled.connect(self._hold_fields_changed)
+        hold_form.addRow("阶段行为", self._hold_enabled)
         self._hold_duration = QtWidgets.QDoubleSpinBox()
         self._hold_duration.setRange(0.1, 300.0)
         self._hold_duration.setValue(2.0)
         self._hold_duration.setSuffix(" s")
+        self._hold_duration.valueChanged.connect(self._hold_fields_changed)
         hold_form.addRow("停留时间", self._hold_duration)
-        hold_buttons = QtWidgets.QHBoxLayout()
-        add_hold = QtWidgets.QPushButton("在选中点停留")
-        add_hold.clicked.connect(self._add_hold)
-        remove_hold = QtWidgets.QPushButton("移除停留")
-        remove_hold.clicked.connect(self._remove_hold)
-        hold_buttons.addWidget(add_hold)
-        hold_buttons.addWidget(remove_hold)
-        hold_form.addRow(hold_buttons)
+        self._hold_manual_yaw = QtWidgets.QCheckBox("使用手动朝向")
+        self._hold_manual_yaw.toggled.connect(self._hold_fields_changed)
+        hold_form.addRow("停留朝向", self._hold_manual_yaw)
+        self._hold_yaw = QtWidgets.QDoubleSpinBox()
+        self._hold_yaw.setRange(-180.0, 180.0)
+        self._hold_yaw.setSuffix(" deg")
+        self._hold_yaw.valueChanged.connect(self._hold_fields_changed)
+        hold_form.addRow("手动朝向", self._hold_yaw)
         root.addWidget(hold_box)
 
         files = QtWidgets.QGroupBox("文件与验证")
@@ -230,22 +266,74 @@ class EditorWindow(QtWidgets.QMainWindow):
         pedestrian = actor.kind == "pedestrian"
         if pedestrian:
             actor.sync_walking_heading()
-        self._yaw.setEnabled(not pedestrian)
-        self._yaw.setSuffix(" deg（自动行进方向）" if pedestrian else " deg")
+        self._auto_heading.setEnabled(pedestrian)
+        self._auto_heading.blockSignals(True)
+        self._auto_heading.setChecked(pedestrian and actor.auto_start_yaw)
+        self._auto_heading.blockSignals(False)
+        self._yaw.setEnabled(not pedestrian or not actor.auto_start_yaw)
+        self._yaw.setSuffix(
+            " deg（自动行进方向）"
+            if pedestrian and actor.auto_start_yaw
+            else " deg"
+        )
         self._yaw.setToolTip(
-            "由出生点到第一个有效路线点实时推导" if pedestrian else "机器人出生朝向（手动）"
+            "由出生点到第一个有效路线点实时推导"
+            if pedestrian and actor.auto_start_yaw
+            else "出生朝向（手动）"
         )
         self._yaw.blockSignals(True)
         self._yaw.setValue(0.0 if actor.spawn_pose is None else math.degrees(actor.spawn_pose[3]))
         self._yaw.blockSignals(False)
-        self._speed.setEnabled(pedestrian)
-        self._constrain.setEnabled(pedestrian)
+        spawn_persistent = pedestrian and actor.start_hold_duration_sec is None
+        self._speed.setEnabled(pedestrian and not spawn_persistent)
+        self._speed_label.setText(
+            "行人速度（当前不生效）" if spawn_persistent else "行人速度"
+        )
+        self._constrain.setEnabled(pedestrian and not spawn_persistent)
+        self._start_hold_mode.setEnabled(pedestrian)
+        self._terminal_behavior.setEnabled(pedestrian)
+        self._mode_actions["draw"].setEnabled(pedestrian)
+        self._mode_actions["edit"].setEnabled(True)
         self._speed.blockSignals(True)
         self._speed.setValue(actor.velocity_mps)
         self._speed.blockSignals(False)
         self._constrain.blockSignals(True)
         self._constrain.setChecked(actor.constrain_to_path)
         self._constrain.blockSignals(False)
+        start_mode = (
+            "episode"
+            if actor.start_hold_duration_sec is None
+            else "duration" if actor.start_hold_duration_sec > 0.0 else "none"
+        )
+        self._start_hold_mode.blockSignals(True)
+        self._start_hold_mode.setCurrentIndex(self._start_hold_mode.findData(start_mode))
+        self._start_hold_mode.blockSignals(False)
+        self._start_hold_duration.setEnabled(pedestrian and start_mode == "duration")
+        if actor.start_hold_duration_sec not in (None, 0.0):
+            self._start_hold_duration.blockSignals(True)
+            self._start_hold_duration.setValue(actor.start_hold_duration_sec)
+            self._start_hold_duration.blockSignals(False)
+        self._terminal_behavior.blockSignals(True)
+        self._terminal_behavior.setCurrentIndex(
+            self._terminal_behavior.findData(str(actor.terminal_behavior))
+        )
+        self._terminal_behavior.blockSignals(False)
+        terminal_holds = (
+            pedestrian
+            and actor.terminal_behavior
+            == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+        )
+        self._terminal_manual_yaw.setEnabled(terminal_holds)
+        self._terminal_manual_yaw.blockSignals(True)
+        self._terminal_manual_yaw.setChecked(
+            terminal_holds and actor.terminal_yaw is not None
+        )
+        self._terminal_manual_yaw.blockSignals(False)
+        self._terminal_yaw.setEnabled(terminal_holds and actor.terminal_yaw is not None)
+        if actor.terminal_yaw is not None:
+            self._terminal_yaw.blockSignals(True)
+            self._terminal_yaw.setValue(math.degrees(actor.terminal_yaw))
+            self._terminal_yaw.blockSignals(False)
         self._waypoint_selected(None)
         self._refresh_canvas()
         self._update_summary()
@@ -318,11 +406,35 @@ class EditorWindow(QtWidgets.QMainWindow):
         actor = self._actor()
         if actor is None:
             return
-        if actor.spawn_pose is not None and actor.kind == "robot":
+        if actor.spawn_pose is not None and (
+            actor.kind == "robot"
+            or (actor.kind == "pedestrian" and not actor.auto_start_yaw)
+        ):
             actor.spawn_pose = (*actor.spawn_pose[:3], math.radians(self._yaw.value()))
         if actor.kind == "pedestrian":
+            actor.auto_start_yaw = bool(self._auto_heading.isChecked())
             actor.velocity_mps = float(self._speed.value())
             actor.constrain_to_path = bool(self._constrain.isChecked())
+            start_mode = self._start_hold_mode.currentData()
+            actor.start_hold_duration_sec = (
+                None
+                if start_mode == "episode"
+                else float(self._start_hold_duration.value())
+                if start_mode == "duration"
+                else 0.0
+            )
+            actor.terminal_behavior = PedestrianTerminalBehavior(
+                self._terminal_behavior.currentData()
+            )
+            actor.terminal_yaw = (
+                math.radians(self._terminal_yaw.value())
+                if actor.terminal_behavior
+                == PedestrianTerminalBehavior.HOLD_UNTIL_EPISODE_END
+                and self._terminal_manual_yaw.isChecked()
+                else None
+            )
+            actor.sync_walking_heading()
+            self._actor_selected(actor.actor_id)
         self._invalidate_planner_validation()
         self._refresh_canvas()
         self._validate()
@@ -346,28 +458,69 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._update_summary()
 
     def _waypoint_selected(self, index) -> None:
-        self._selected_point.setText("未选择路线点" if index is None else f"点 {index + 1}")
+        actor = self._actor()
+        terminal = (
+            actor is not None
+            and index is not None
+            and index == len(actor.route) - 1
+        )
+        self._selected_point.setText(
+            "未选择路线点"
+            if index is None
+            else f"点 {index + 1}（终点，请使用上方终点行为）"
+            if terminal
+            else f"点 {index + 1}"
+        )
+        hold = None if actor is None else next(
+            (item for item in actor.holds if item.waypoint_index == index),
+            None,
+        )
+        editable = actor is not None and actor.kind == "pedestrian" and index is not None and not terminal
+        self._hold_enabled.blockSignals(True)
+        self._hold_enabled.setChecked(editable and hold is not None)
+        self._hold_enabled.blockSignals(False)
+        self._hold_enabled.setEnabled(editable)
+        if hold is not None and hold.duration_sec is not None:
+            self._hold_duration.blockSignals(True)
+            self._hold_duration.setValue(hold.duration_sec)
+            self._hold_duration.blockSignals(False)
+        self._hold_manual_yaw.blockSignals(True)
+        self._hold_manual_yaw.setChecked(editable and hold is not None and hold.yaw is not None)
+        self._hold_manual_yaw.blockSignals(False)
+        if hold is not None and hold.yaw is not None:
+            self._hold_yaw.blockSignals(True)
+            self._hold_yaw.setValue(math.degrees(hold.yaw))
+            self._hold_yaw.blockSignals(False)
+        hold_active = editable and hold is not None
+        self._hold_duration.setEnabled(hold_active)
+        self._hold_manual_yaw.setEnabled(hold_active)
+        self._hold_yaw.setEnabled(hold_active and hold.yaw is not None)
 
-    def _add_hold(self) -> None:
+    def _hold_fields_changed(self, *_args) -> None:
         actor = self._actor()
         index = self._canvas.selected_waypoint
-        if actor is None or actor.kind != "pedestrian" or index is None:
-            self._status("请先选择一个行人的路线点。")
+        if (
+            actor is None
+            or actor.kind != "pedestrian"
+            or index is None
+            or index == len(actor.route) - 1
+        ):
             return
         actor.holds = [hold for hold in actor.holds if hold.waypoint_index != index]
-        actor.holds.append(HoldDraft(index, float(self._hold_duration.value())))
+        if self._hold_enabled.isChecked():
+            actor.holds.append(HoldDraft(
+                index,
+                float(self._hold_duration.value()),
+                math.radians(self._hold_yaw.value())
+                if self._hold_manual_yaw.isChecked()
+                else None,
+            ))
         actor.holds.sort(key=lambda hold: hold.waypoint_index)
-        self._invalidate_planner_validation()
-        self._refresh_canvas()
-        self._update_summary()
-        self._validate()
-
-    def _remove_hold(self) -> None:
-        actor = self._actor()
-        index = self._canvas.selected_waypoint
-        if actor is None or index is None:
-            return
-        actor.holds = [hold for hold in actor.holds if hold.waypoint_index != index]
+        self._hold_duration.setEnabled(self._hold_enabled.isChecked())
+        self._hold_manual_yaw.setEnabled(self._hold_enabled.isChecked())
+        self._hold_yaw.setEnabled(
+            self._hold_enabled.isChecked() and self._hold_manual_yaw.isChecked()
+        )
         self._invalidate_planner_validation()
         self._refresh_canvas()
         self._update_summary()
@@ -415,7 +568,8 @@ class EditorWindow(QtWidgets.QMainWindow):
         )
         goal_summary = f"\n机器人终点: {goal}" if actor.kind == "robot" else ""
         self._actor_summary.setText(
-            f"出生点: {spawn}{goal_summary}\n路线点: {len(actor.route)}\n停留点: {len(actor.holds)}"
+            f"出生点: {spawn}{goal_summary}\n"
+            f"路线点: {len(actor.route)}\n停留点: {len(actor.holds)}"
         )
 
     def _cursor_changed(self, point) -> None:
