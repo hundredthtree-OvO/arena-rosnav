@@ -41,6 +41,23 @@ def _yaw(velocity, metadata: dict[str, str]) -> float:
     return 0.0
 
 
+def _quaternion_yaw(orientation) -> float:
+    if orientation is None:
+        return 0.0
+    try:
+        x = float(orientation.x)
+        y = float(orientation.y)
+        z = float(orientation.z)
+        w = float(orientation.w)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    yaw = math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+    return yaw if math.isfinite(yaw) else 0.0
+
+
 class RosWorker(QtCore.QThread):
     map_ready = QtCore.Signal(object)
     people_ready = QtCore.Signal(object)
@@ -144,12 +161,14 @@ class RosWorker(QtCore.QThread):
         self.people_ready.emit(people)
 
     def _robot_cb(self, message) -> None:
-        position = _xyz(getattr(message.pose, "pose", None))
+        pose = getattr(message.pose, "pose", None)
+        position = _xyz(pose)
         if position is None:
             return
         self.robot_ready.emit(
             {
                 "position": position,
+                "yaw": _quaternion_yaw(getattr(pose, "orientation", None)),
                 "frame_id": str(message.header.frame_id or "odom"),
             }
         )

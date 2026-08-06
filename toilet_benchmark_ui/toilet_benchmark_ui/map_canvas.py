@@ -7,6 +7,29 @@ import math
 from python_qt_binding import QtCore, QtGui, QtWidgets
 
 
+def oriented_box_corners(
+    center,
+    *,
+    yaw: float,
+    length: float,
+    width: float,
+) -> tuple[tuple[float, float], ...]:
+    """Return footprint corners in world coordinates."""
+
+    cx, cy = float(center[0]), float(center[1])
+    half_length, half_width = 0.5 * float(length), 0.5 * float(width)
+    forward = (math.cos(float(yaw)), math.sin(float(yaw)))
+    left = (-forward[1], forward[0])
+
+    def corner(forward_scale: float, left_scale: float) -> tuple[float, float]:
+        return (
+            cx + forward_scale * half_length * forward[0] + left_scale * half_width * left[0],
+            cy + forward_scale * half_length * forward[1] + left_scale * half_width * left[1],
+        )
+
+    return (corner(1, 1), corner(-1, 1), corner(-1, -1), corner(1, -1))
+
+
 class MapCanvas(QtWidgets.QGraphicsView):
     route_changed = QtCore.Signal(object)
     spawn_clicked = QtCore.Signal(object)
@@ -18,6 +41,10 @@ class MapCanvas(QtWidgets.QGraphicsView):
     waypoint_selected = QtCore.Signal(object)
 
     _ACTOR_COLORS = ("#f5c451", "#67d5b5", "#ff7f7f", "#72a7ff", "#d291ff")
+    PEDESTRIAN_FOOTPRINT_RADIUS_M = 0.26
+    ROBOT_FOOTPRINT_LENGTH_M = 0.70
+    ROBOT_FOOTPRINT_WIDTH_M = 0.42
+    CENTER_MARKER_RADIUS_M = 0.055
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -183,7 +210,13 @@ class MapCanvas(QtWidgets.QGraphicsView):
                 color = self._ACTOR_COLORS[index % len(self._ACTOR_COLORS)]
                 self._path(actor.authored_points(), color, selected=selected)
                 if actor.spawn_pose is not None:
-                    self._circle(actor.spawn_pose, 0.11, color, label=f"{actor.actor_id} 点0（出生）")
+                    self._footprint_circle(
+                        actor.spawn_pose,
+                        self.PEDESTRIAN_FOOTPRINT_RADIUS_M,
+                        color,
+                        label=f"{actor.actor_id} 点0（出生）",
+                    )
+                    self._circle(actor.spawn_pose, self.CENTER_MARKER_RADIUS_M, color)
                     self._arrow(actor.spawn_pose, actor.spawn_pose[3], color, 0.35)
                 for point_index, point in enumerate(actor.route):
                     is_selected = selected and point_index == self._selected_waypoint
@@ -209,7 +242,13 @@ class MapCanvas(QtWidgets.QGraphicsView):
                     )
             robot = self._scenario.robot
             if robot.spawn_pose is not None:
-                self._square(robot.spawn_pose, "#b18cff", label="机器人起点")
+                self._footprint_box(
+                    robot.spawn_pose,
+                    robot.spawn_pose[3],
+                    "#b18cff",
+                    label="机器人起点",
+                )
+                self._square(robot.spawn_pose, "#b18cff")
                 self._arrow(robot.spawn_pose, robot.spawn_pose[3], "#b18cff", 0.4)
             if robot.goal_pose is not None:
                 self._square(robot.goal_pose, "#55d68b", label="机器人终点")
@@ -220,9 +259,22 @@ class MapCanvas(QtWidgets.QGraphicsView):
                     metres=self._scenario.goal_tolerance_m,
                 )
         for person in self._people:
-            self._circle(person["position"], 0.18, "#63b3ed", label=person.get("id", ""))
+            self._footprint_circle(
+                person["position"],
+                self.PEDESTRIAN_FOOTPRINT_RADIUS_M,
+                "#63b3ed",
+                label=person.get("id", ""),
+            )
+            self._circle(person["position"], self.CENTER_MARKER_RADIUS_M, "#63b3ed")
+            self._arrow(person["position"], person.get("yaw", 0.0), "#63b3ed", 0.30)
         if self._robot is not None:
-            self._square(self._robot["position"], "#d6b6ff", label="机器人实时")
+            self._footprint_box(
+                self._robot["position"],
+                self._robot.get("yaw", 0.0),
+                "#d6b6ff",
+                label="机器人实时",
+            )
+            self._square(self._robot["position"], "#d6b6ff")
 
     def _radius_px(self, metres: float, minimum: float = 1.5, maximum: float = 5.0) -> float:
         return max(minimum, min(maximum, metres / self._map.resolution))
@@ -237,6 +289,52 @@ class MapCanvas(QtWidgets.QGraphicsView):
                                           QtGui.QBrush(QtGui.QColor(color))))
         self._label(center, label, color, radius)
 
+    def _footprint_circle(self, point, metres: float, color: str, label: str = "") -> None:
+        center = self._scene_point(point)
+        radius = float(metres) / self._map.resolution
+        outline = QtGui.QColor(color)
+        fill = QtGui.QColor(color)
+        fill.setAlpha(72)
+        pen = QtGui.QPen(outline, 1.5)
+        pen.setCosmetic(True)
+        self._add(
+            self.scene().addEllipse(
+                center.x() - radius,
+                center.y() - radius,
+                radius * 2.0,
+                radius * 2.0,
+                pen,
+                QtGui.QBrush(fill),
+            ),
+            9.0,
+        )
+        self._label(center, label, color, radius)
+
+    def _footprint_box(self, point, yaw: float, color: str, label: str = "") -> None:
+        polygon = QtGui.QPolygonF(
+            [
+                self._scene_point(corner)
+                for corner in oriented_box_corners(
+                    point,
+                    yaw=float(yaw),
+                    length=self.ROBOT_FOOTPRINT_LENGTH_M,
+                    width=self.ROBOT_FOOTPRINT_WIDTH_M,
+                )
+            ]
+        )
+        outline = QtGui.QColor(color)
+        fill = QtGui.QColor(color)
+        fill.setAlpha(72)
+        pen = QtGui.QPen(outline, 1.5)
+        pen.setCosmetic(True)
+        self._add(self.scene().addPolygon(polygon, pen, QtGui.QBrush(fill)), 9.0)
+        center = self._scene_point(point)
+        label_offset = 0.5 * max(
+            self.ROBOT_FOOTPRINT_LENGTH_M,
+            self.ROBOT_FOOTPRINT_WIDTH_M,
+        ) / self._map.resolution
+        self._label(center, label, color, label_offset)
+
     def _ring(self, point, color: str, label: str, *, metres: float = 0.10) -> None:
         center = self._scene_point(point)
         radius = max(1.5, metres / self._map.resolution)
@@ -246,9 +344,9 @@ class MapCanvas(QtWidgets.QGraphicsView):
                                           radius * 2.0, radius * 2.0, pen))
         self._label(center, label, color, radius)
 
-    def _square(self, point, color: str, label: str) -> None:
+    def _square(self, point, color: str, label: str = "") -> None:
         center = self._scene_point(point)
-        radius = self._radius_px(0.14)
+        radius = self._radius_px(self.CENTER_MARKER_RADIUS_M)
         pen = QtGui.QPen(QtGui.QColor(color), 1.5)
         pen.setCosmetic(True)
         self._add(self.scene().addRect(center.x() - radius, center.y() - radius,

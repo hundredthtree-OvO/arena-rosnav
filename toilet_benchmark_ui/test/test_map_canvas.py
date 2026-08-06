@@ -2,10 +2,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from python_qt_binding import QtWidgets
 
 from toilet_benchmark_ui.editor_model import MapSnapshot, ScenarioDraft
-from toilet_benchmark_ui.map_canvas import MapCanvas
+from toilet_benchmark_ui.map_canvas import MapCanvas, oriented_box_corners
 
 _APP = None
 
@@ -50,3 +51,19 @@ def test_robot_edit_hit_includes_goal_only_when_robot_is_selected() -> None:
 
     canvas.set_scenario(scenario, pedestrian.actor_id)
     assert canvas._nearest_edit_handle(point) is None
+
+
+def test_robot_footprint_corners_preserve_metric_length_width_and_yaw() -> None:
+    corners = oriented_box_corners((1.0, 2.0), yaw=0.5 * 3.141592653589793,
+                                   length=0.70, width=0.42)
+
+    assert corners[0] == pytest.approx((0.79, 2.35))
+    assert corners[1] == pytest.approx((0.79, 1.65))
+    assert corners[2] == pytest.approx((1.21, 1.65))
+    assert corners[3] == pytest.approx((1.21, 2.35))
+
+
+def test_canvas_footprints_match_isaac_scene_profile() -> None:
+    assert MapCanvas.PEDESTRIAN_FOOTPRINT_RADIUS_M == pytest.approx(0.26)
+    assert MapCanvas.ROBOT_FOOTPRINT_LENGTH_M == pytest.approx(0.70)
+    assert MapCanvas.ROBOT_FOOTPRINT_WIDTH_M == pytest.approx(0.42)
