@@ -14,6 +14,7 @@ from toilet_benchmark.episodes.schema import (
 )
 from toilet_benchmark.tracks.authored_scenario_core import (
     RouteRuntime,
+    activation_gate_status,
     expand_authored_route,
     initial_character_root_yaw,
     route_heading_to_character_root_yaw,
@@ -197,3 +198,28 @@ def test_activation_rejects_stale_heading() -> None:
         yaw_stability_rad=0.08,
         required_samples=1,
     )
+
+
+def test_activation_gate_status_explains_every_failed_condition() -> None:
+    status = activation_gate_status(
+        _spec(),
+        (0.3, 0.0, 0.0),
+        {
+            "embodiment_generation": "0",
+            "reactivation_ready": "false",
+            "motion_state": "accepted",
+            "yaw_rad": "nan",
+        },
+        position_tolerance_m=0.15,
+        yaw_tolerance_rad=0.20,
+    )
+
+    assert not status.eligible
+    assert status.reasons == (
+        "generation_missing",
+        "reactivation_not_ready",
+        "motion_state_not_idle",
+        "yaw_invalid",
+        "position_out_of_tolerance",
+    )
+    assert status.position_error_m == pytest.approx(0.3)

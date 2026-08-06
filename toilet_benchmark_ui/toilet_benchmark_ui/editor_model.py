@@ -190,6 +190,7 @@ class ActorDraft:
     actor_id: str
     kind: str
     spawn_pose: tuple[float, float, float, float] | None = None
+    goal_pose: tuple[float, float, float] | None = None
     route: list[tuple[float, float, float]] = field(default_factory=list)
     holds: list[HoldDraft] = field(default_factory=list)
     character: str | None = None
@@ -216,6 +217,25 @@ class ActorDraft:
     def set_route(self, points: Iterable[Sequence[float]]) -> None:
         self.route = [_route_point(point) for point in points]
         self.holds = [hold for hold in self.holds if hold.waypoint_index < len(self.route)]
+
+    def authored_points(self) -> list[tuple[float, float, float]]:
+        """Return UI route points with pedestrian spawn represented as point 0."""
+        if self.kind != "pedestrian" or self.spawn_pose is None:
+            return list(self.route)
+        return [self.spawn_pose[:3], *self.route]
+
+    def sync_walking_heading(self, *, epsilon_m: float = 1e-6) -> bool:
+        """Update the UI walking heading from spawn to the first effective target."""
+        if self.kind != "pedestrian" or self.spawn_pose is None:
+            return False
+        start_x, start_y = self.spawn_pose[:2]
+        for target in self.route:
+            dx = float(target[0]) - start_x
+            dy = float(target[1]) - start_y
+            if math.hypot(dx, dy) > epsilon_m:
+                self.spawn_pose = (*self.spawn_pose[:3], math.atan2(dy, dx))
+                return True
+        return False
 
 
 @dataclass
@@ -284,6 +304,21 @@ class ScenarioDraft:
                     errors.append(
                         f"{actor.actor_id}: hold waypoint {hold.waypoint_index} is outside route"
                     )
+        if self.robot.goal_pose is None:
+            errors.append(f"{self.robot.actor_id}: robot goal pose is missing")
+        else:
+            if grid is not None:
+                goal_result = grid.validate_polyline((self.robot.goal_pose,), radius_m=radius_m)
+                if not goal_result.valid:
+                    errors.append(f"{self.robot.actor_id}: robot goal is outside or occupied")
+            if self.robot.spawn_pose is not None and math.hypot(
+                self.robot.goal_pose[0] - self.robot.spawn_pose[0],
+                self.robot.goal_pose[1] - self.robot.spawn_pose[1],
+            ) <= self.goal_tolerance_m:
+                errors.append(
+                    f"{self.robot.actor_id}: robot start-goal distance must exceed "
+                    f"goal tolerance {self.goal_tolerance_m:g}m"
+                )
         for index, first in enumerate(self.pedestrians):
             if first.spawn_pose is None:
                 continue
@@ -300,6 +335,8 @@ class ScenarioDraft:
     def to_episode_spec(self, *, map_path: str) -> EpisodeSpec:
         if self.robot.spawn_pose is None:
             raise ValueError("robot spawn pose is required")
+        if self.robot.goal_pose is None:
+            raise ValueError("robot goal pose is required")
         pedestrians = []
         for actor in self.pedestrians:
             if actor.spawn_pose is None:
@@ -326,7 +363,6 @@ class ScenarioDraft:
                     ),
                 )
             )
-        robot_yaw = self.robot.spawn_pose[3]
         return EpisodeSpec(
             episode_id=self.scenario_id,
             scene_id=self.scene_id,
@@ -336,11 +372,7 @@ class ScenarioDraft:
             robot=RobotEpisodeSpec(
                 model=self.robot.actor_id,
                 start_pose=self.robot.spawn_pose,
-                goal_pose=(
-                    self.robot.spawn_pose[0],
-                    self.robot.spawn_pose[1],
-                    robot_yaw,
-                ),
+                goal_pose=self.robot.goal_pose,
             ),
             pedestrians=tuple(pedestrians),
             termination=TerminationSpec(
@@ -358,6 +390,7 @@ class ScenarioDraft:
         robot = ActorDraft.robot()
         robot.actor_id = episode.robot.model
         robot.spawn_pose = episode.robot.start_pose
+        robot.goal_pose = episode.robot.goal_pose
         pedestrians = []
         for spec in episode.pedestrians:
             actor = ActorDraft.pedestrian(spec.agent_id)
@@ -377,6 +410,7 @@ class ScenarioDraft:
             if spec.behavior.walking_speed_mps is not None:
                 actor.velocity_mps = spec.behavior.walking_speed_mps
             actor.constrain_to_path = spec.constrain_to_path
+            actor.sync_walking_heading()
             pedestrians.append(actor)
         return cls(
             scenario_id=episode.episode_id,

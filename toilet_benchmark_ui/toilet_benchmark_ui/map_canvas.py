@@ -10,8 +10,11 @@ from python_qt_binding import QtCore, QtGui, QtWidgets
 class MapCanvas(QtWidgets.QGraphicsView):
     route_changed = QtCore.Signal(object)
     spawn_clicked = QtCore.Signal(object)
+    robot_goal_clicked = QtCore.Signal(object)
     cursor_world_changed = QtCore.Signal(object)
     edit_finished = QtCore.Signal()
+    geometry_changed = QtCore.Signal()
+    mode_changed = QtCore.Signal(str)
     waypoint_selected = QtCore.Signal(object)
 
     _ACTOR_COLORS = ("#f5c451", "#67d5b5", "#ff7f7f", "#72a7ff", "#d291ff")
@@ -34,7 +37,7 @@ class MapCanvas(QtWidgets.QGraphicsView):
         self._robot: dict | None = None
         self._anchors: list[dict] = []
         self._overlay_items: list[object] = []
-        self._drag_index: int | None = None
+        self._drag_handle: tuple[str, int | None] | None = None
         self._selected_waypoint: int | None = None
         self._selection_radius_px = 10.0
 
@@ -47,9 +50,17 @@ class MapCanvas(QtWidgets.QGraphicsView):
         return self._selected_waypoint
 
     def set_mode(self, mode: str) -> None:
-        self._mode = str(mode)
-        cursor = QtCore.Qt.CrossCursor if self._mode in ("draw", "spawn") else QtCore.Qt.ArrowCursor
+        mode = str(mode)
+        if mode == self._mode:
+            return
+        self._mode = mode
+        cursor = (
+            QtCore.Qt.CrossCursor
+            if self._mode in ("draw", "spawn", "robot_goal")
+            else QtCore.Qt.ArrowCursor
+        )
         self.setCursor(cursor)
+        self.mode_changed.emit(self._mode)
 
     def set_map(self, grid) -> None:
         self._map = grid
@@ -170,20 +181,44 @@ class MapCanvas(QtWidgets.QGraphicsView):
             for index, actor in enumerate(self._scenario.pedestrians):
                 selected = actor.actor_id == self._selected_actor_id
                 color = self._ACTOR_COLORS[index % len(self._ACTOR_COLORS)]
-                self._path(actor.route, color, selected=selected)
+                self._path(actor.authored_points(), color, selected=selected)
                 if actor.spawn_pose is not None:
-                    self._circle(actor.spawn_pose, 0.11, color, label=f"{actor.actor_id} 起点")
+                    self._circle(actor.spawn_pose, 0.11, color, label=f"{actor.actor_id} 点0（出生）")
                     self._arrow(actor.spawn_pose, actor.spawn_pose[3], color, 0.35)
                 for point_index, point in enumerate(actor.route):
                     is_selected = selected and point_index == self._selected_waypoint
-                    self._circle(point, 0.055, "#ffffff" if is_selected else color, label=str(point_index))
+                    self._circle(
+                        point,
+                        0.055,
+                        "#ffffff" if is_selected else color,
+                        label=str(point_index + 1),
+                    )
                 for hold in actor.holds:
                     if hold.waypoint_index < len(actor.route):
-                        self._ring(actor.route[hold.waypoint_index], color, label=f"停 {hold.duration_sec:g}s")
+                        self._ring(
+                            actor.route[hold.waypoint_index],
+                            color,
+                            label=f"点{hold.waypoint_index + 1} 停 {hold.duration_sec:g}s",
+                        )
+                if actor.route:
+                    self._ring(
+                        actor.route[-1],
+                        "#ffffff" if selected else color,
+                        label=f"终点容差 {self._scenario.goal_tolerance_m:g}m",
+                        metres=self._scenario.goal_tolerance_m,
+                    )
             robot = self._scenario.robot
             if robot.spawn_pose is not None:
                 self._square(robot.spawn_pose, "#b18cff", label="机器人起点")
                 self._arrow(robot.spawn_pose, robot.spawn_pose[3], "#b18cff", 0.4)
+            if robot.goal_pose is not None:
+                self._square(robot.goal_pose, "#55d68b", label="机器人终点")
+                self._ring(
+                    robot.goal_pose,
+                    "#55d68b",
+                    label=f"机器人终点容差 {self._scenario.goal_tolerance_m:g}m",
+                    metres=self._scenario.goal_tolerance_m,
+                )
         for person in self._people:
             self._circle(person["position"], 0.18, "#63b3ed", label=person.get("id", ""))
         if self._robot is not None:
@@ -202,9 +237,9 @@ class MapCanvas(QtWidgets.QGraphicsView):
                                           QtGui.QBrush(QtGui.QColor(color))))
         self._label(center, label, color, radius)
 
-    def _ring(self, point, color: str, label: str) -> None:
+    def _ring(self, point, color: str, label: str, *, metres: float = 0.10) -> None:
         center = self._scene_point(point)
-        radius = self._radius_px(0.10, maximum=6.0)
+        radius = max(1.5, metres / self._map.resolution)
         pen = QtGui.QPen(QtGui.QColor(color), 2.0)
         pen.setCosmetic(True)
         self._add(self.scene().addEllipse(center.x() - radius, center.y() - radius,
@@ -250,6 +285,33 @@ class MapCanvas(QtWidgets.QGraphicsView):
                 nearest, distance_limit = index, distance
         return nearest
 
+    def _nearest_edit_handle(self, scene_point) -> tuple[str, int | None] | None:
+        actor = self._selected_actor()
+        if actor is None:
+            return None
+        candidates: list[tuple[float, int, int, str, int | None]] = []
+
+        def add(kind: str, point, priority: int, index: int | None = None) -> None:
+            if point is None:
+                return
+            location = self._scene_point(point)
+            distance = math.hypot(
+                location.x() - scene_point.x(), location.y() - scene_point.y()
+            )
+            if distance <= self._selection_radius_px:
+                candidates.append((distance, priority, -1 if index is None else index, kind, index))
+
+        add("spawn", actor.spawn_pose, 0)
+        if actor.kind == "robot":
+            add("goal", actor.goal_pose, 1)
+        else:
+            for index, point in enumerate(actor.route):
+                add("waypoint", point, 2, index)
+        if not candidates:
+            return None
+        _, _, _, kind, index = min(candidates)
+        return kind, index
+
     def _select_waypoint(self, index: int | None) -> None:
         self._selected_waypoint = index
         self.waypoint_selected.emit(index)
@@ -272,13 +334,21 @@ class MapCanvas(QtWidgets.QGraphicsView):
         if self._mode == "spawn":
             self.spawn_clicked.emit((world[0], world[1]))
             self.set_mode("select")
+        elif actor.kind == "robot" and self._mode == "robot_goal":
+            self.robot_goal_clicked.emit((world[0], world[1]))
+            self.set_mode("select")
         elif actor.kind == "pedestrian" and self._mode == "draw":
             actor.route.append((world[0], world[1], 0.0))
             self.route_changed.emit(list(actor.route))
             self._redraw()
-        elif actor.kind == "pedestrian" and self._mode == "edit":
-            self._drag_index = self._nearest_waypoint(scene_point)
-            self._select_waypoint(self._drag_index)
+        elif self._mode == "edit":
+            self._drag_handle = self._nearest_edit_handle(scene_point)
+            waypoint = (
+                self._drag_handle[1]
+                if self._drag_handle is not None and self._drag_handle[0] == "waypoint"
+                else None
+            )
+            self._select_waypoint(waypoint)
         elif self._mode == "select":
             self._select_waypoint(self._nearest_waypoint(scene_point))
         self.cursor_world_changed.emit(world)
@@ -288,15 +358,21 @@ class MapCanvas(QtWidgets.QGraphicsView):
         if world is not None:
             self.cursor_world_changed.emit(world)
         actor = self._selected_actor()
-        if self._drag_index is not None and world is not None and actor is not None:
-            actor.route[self._drag_index] = (world[0], world[1], 0.0)
-            self.route_changed.emit(list(actor.route))
+        if self._drag_handle is not None and world is not None and actor is not None:
+            kind, index = self._drag_handle
+            if kind == "spawn" and actor.spawn_pose is not None:
+                actor.spawn_pose = (world[0], world[1], *actor.spawn_pose[2:])
+            elif kind == "goal" and actor.kind == "robot" and actor.goal_pose is not None:
+                actor.goal_pose = (world[0], world[1], actor.goal_pose[2])
+            elif kind == "waypoint" and actor.kind == "pedestrian" and index is not None:
+                actor.route[index] = (world[0], world[1], 0.0)
+            self.geometry_changed.emit()
             self._redraw()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if self._drag_index is not None:
-            self._drag_index = None
+        if self._drag_handle is not None:
+            self._drag_handle = None
             self.edit_finished.emit()
         super().mouseReleaseEvent(event)
 

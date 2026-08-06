@@ -49,6 +49,7 @@ def test_scenario_draft_exports_two_independent_pedestrians() -> None:
     second.spawn_pose = (-1.5, -0.9, 0.0, math.pi)
     second.route = [(-1.5, -0.9, 0.0), (-2.5, -0.9, 0.0), (-3.8, -0.9, 0.0)]
     scenario.robot.spawn_pose = (0.0, -1.5, 0.03, 0.0)
+    scenario.robot.goal_pose = (-3.8, -0.91, 0.0)
 
     episode = scenario.to_episode_spec(map_path="/tmp/test.walkable.json")
     restored = ScenarioDraft.from_episode_spec(episode)
@@ -58,7 +59,10 @@ def test_scenario_draft_exports_two_independent_pedestrians() -> None:
         "toilet_agent_02",
     ]
     assert restored.actor("toilet_agent_01").holds[0].duration_sec == 2.0
+    assert restored.actor("toilet_agent_01").holds[0].waypoint_index == 1
+    assert list(episode.pedestrians[0].route_waypoints) == first.route
     assert episode.task_type == "authored_route"
+    assert restored.robot.goal_pose == pytest.approx((-3.8, -0.91, 0.0))
     assert episode.pedestrians[0].start_yaw == pytest.approx(math.pi / 2.0)
     assert episode.pedestrians[1].start_yaw == pytest.approx(-math.pi / 2.0)
 
@@ -79,8 +83,53 @@ def test_scenario_validation_reports_missing_spawn_and_invalid_hold() -> None:
 def test_scenario_accepts_one_safe_target_without_requiring_a_drawn_segment() -> None:
     scenario = ScenarioDraft.default()
     scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    scenario.robot.goal_pose = (0.75, 0.75, 0.0)
     actor = scenario.add_pedestrian("toilet_agent_01")
     actor.spawn_pose = (-0.75, -0.25, 0.0, 0.0)
     actor.route = [(0.75, 0.75, 0.0)]
 
     assert scenario.validate(_map(), radius_m=0.0) == []
+
+
+def test_scenario_validation_requires_distinct_robot_goal() -> None:
+    scenario = ScenarioDraft.default()
+    scenario.robot.spawn_pose = (-0.75, 0.75, 0.03, 0.0)
+    actor = scenario.add_pedestrian("toilet_agent_01")
+    actor.spawn_pose = (-0.75, -0.25, 0.0, 0.0)
+    actor.route = [(0.75, 0.75, 0.0)]
+
+    assert any("robot goal" in message for message in scenario.validate(_map(), radius_m=0.0))
+
+    scenario.robot.goal_pose = (-0.55, 0.75, 0.0)
+    assert any("goal tolerance" in message for message in scenario.validate(_map(), radius_m=0.0))
+
+
+def test_pedestrian_authored_points_include_spawn_only_for_display() -> None:
+    actor = ActorDraft.pedestrian("toilet_agent_01")
+    actor.spawn_pose = (1.0, 2.0, 0.0, 0.25)
+    actor.route = [(2.0, 2.0, 0.0), (3.0, 2.0, 0.0)]
+
+    assert actor.authored_points() == [
+        (1.0, 2.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 2.0, 0.0),
+    ]
+    assert actor.route == [(2.0, 2.0, 0.0), (3.0, 2.0, 0.0)]
+
+
+def test_live_pedestrian_heading_uses_first_non_degenerate_target() -> None:
+    actor = ActorDraft.pedestrian("toilet_agent_01")
+    actor.spawn_pose = (1.0, 2.0, 0.0, -1.0)
+    actor.route = [(1.0, 2.0, 0.0), (1.0, 3.0, 0.0)]
+
+    assert actor.sync_walking_heading()
+    assert actor.spawn_pose[3] == pytest.approx(math.pi / 2.0)
+
+
+def test_live_pedestrian_heading_keeps_previous_value_without_effective_target() -> None:
+    actor = ActorDraft.pedestrian("toilet_agent_01")
+    actor.spawn_pose = (1.0, 2.0, 0.0, 0.75)
+    actor.route = [(1.0, 2.0, 0.0)]
+
+    assert not actor.sync_walking_heading()
+    assert actor.spawn_pose[3] == pytest.approx(0.75)

@@ -59,6 +59,17 @@ ros2 run toilet_benchmark toilet_authored_scenario \
 默认采用 `detect_and_fail` 人机策略：不进行预测性人机 hard guard，实际接触由
 事件判定失败。行人与静态环境的 walkable-map 路径约束保持启用。
 
+运行器默认写入结构化诊断日志：
+
+```text
+/home/stardust/resources/arena_ws/log/toilet_benchmark/<episode>_<timestamp>.jsonl
+/home/stardust/resources/arena_ws/log/toilet_benchmark/latest.jsonl
+```
+
+日志包含激活门槛、命令代次、AnimGraph 执行状态、实时进度、guard 原因、hold
+和退出事件。可用 `--diagnostics-log /path/run.jsonl` 指定文件，用
+`--diagnostics-interval-sec 0.5` 调整周期，或用 `--no-diagnostics-log` 关闭。
+
 ## 人工数采
 
 ```bash

@@ -14,6 +14,61 @@ from ..episodes.schema import EpisodeSpec, PedestrianEpisodeSpec, PedestrianHold
 ISAAC_CHARACTER_ROOT_YAW_OFFSET_RAD = math.pi / 2.0
 
 
+@dataclass(frozen=True)
+class ActivationGateStatus:
+    eligible: bool
+    reasons: tuple[str, ...]
+    generation: int
+    yaw: float
+    position_error_m: float
+    yaw_error_rad: float
+
+
+def activation_gate_status(
+    spec: PedestrianEpisodeSpec,
+    pose: Sequence[float],
+    metadata: dict[str, str],
+    *,
+    position_tolerance_m: float,
+    yaw_tolerance_rad: float,
+) -> ActivationGateStatus:
+    """Describe the same instantaneous activation gate used by the runtime."""
+
+    reasons: list[str] = []
+    try:
+        generation = int(metadata.get("embodiment_generation", "0"))
+    except (TypeError, ValueError):
+        generation = 0
+    try:
+        yaw = float(metadata.get("yaw_rad", "nan"))
+    except (TypeError, ValueError):
+        yaw = math.nan
+    start = spec.route_waypoints[0]
+    position_error = math.hypot(float(pose[0]) - start[0], float(pose[1]) - start[1])
+    expected_yaw = float(spec.start_yaw or 0.0)
+    yaw_error = abs(_angle_difference(yaw, expected_yaw)) if math.isfinite(yaw) else math.inf
+    if generation <= 0:
+        reasons.append("generation_missing")
+    if metadata.get("reactivation_ready", "").lower() != "true":
+        reasons.append("reactivation_not_ready")
+    if metadata.get("motion_state", "").lower() != "idle":
+        reasons.append("motion_state_not_idle")
+    if not math.isfinite(yaw):
+        reasons.append("yaw_invalid")
+    elif yaw_error > yaw_tolerance_rad:
+        reasons.append("yaw_out_of_tolerance")
+    if position_error > position_tolerance_m:
+        reasons.append("position_out_of_tolerance")
+    return ActivationGateStatus(
+        eligible=not reasons,
+        reasons=tuple(reasons),
+        generation=generation,
+        yaw=yaw,
+        position_error_m=position_error,
+        yaw_error_rad=yaw_error,
+    )
+
+
 def with_agent_id_suffix(episode: EpisodeSpec, suffix: str) -> EpisodeSpec:
     """Create fresh runtime identities without changing authored route semantics."""
 
@@ -179,37 +234,27 @@ class RouteRuntime:
     ) -> bool:
         """Accept reactivation only after several stable simulator samples."""
 
-        try:
-            generation = int(metadata.get("embodiment_generation", "0"))
-            yaw = float(metadata.get("yaw_rad", "nan"))
-        except (TypeError, ValueError):
-            self.reset_activation_observation()
-            return False
-        expected_yaw = float(self.spec.start_yaw or 0.0)
-        start = self.spec.route_waypoints[0]
-        valid = (
-            generation > 0
-            and metadata.get("reactivation_ready", "").lower() == "true"
-            and metadata.get("motion_state", "").lower() == "idle"
-            and math.isfinite(yaw)
-            and math.hypot(float(pose[0]) - start[0], float(pose[1]) - start[1])
-            <= position_tolerance_m
-            and abs(_angle_difference(yaw, expected_yaw)) <= yaw_tolerance_rad
+        status = activation_gate_status(
+            self.spec,
+            pose,
+            metadata,
+            position_tolerance_m=position_tolerance_m,
+            yaw_tolerance_rad=yaw_tolerance_rad,
         )
-        if not valid:
+        if not status.eligible:
             self.reset_activation_observation()
             return False
 
         current_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         if self.activation_pose is not None:
             position_step = math.dist(current_pose[:2], self.activation_pose[:2])
-            yaw_step = abs(_angle_difference(yaw, float(self.activation_yaw)))
+            yaw_step = abs(_angle_difference(status.yaw, float(self.activation_yaw)))
             if position_step > position_stability_m or yaw_step > yaw_stability_rad:
                 self.reset_activation_observation()
 
-        self.generation = generation
+        self.generation = status.generation
         self.activation_pose = current_pose
-        self.activation_yaw = yaw
+        self.activation_yaw = status.yaw
         self.activation_stable_samples += 1
         return self.activation_stable_samples >= max(1, int(required_samples))
 

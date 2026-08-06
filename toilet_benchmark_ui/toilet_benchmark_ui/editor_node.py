@@ -35,12 +35,18 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._scenario = ScenarioDraft.default()
         self._scenario.add_pedestrian("toilet_agent_01")
         self._selected_actor_id = "toilet_agent_01"
+        self._planner_validation_state: bool | None = None
+        self._scenario_path: Path | None = None
+        self._mode_actions: dict[str, QtWidgets.QAction] = {}
 
         self._canvas = MapCanvas()
         self._canvas.route_changed.connect(self._route_changed)
         self._canvas.spawn_clicked.connect(self._spawn_clicked)
+        self._canvas.robot_goal_clicked.connect(self._robot_goal_clicked)
         self._canvas.cursor_world_changed.connect(self._cursor_changed)
         self._canvas.edit_finished.connect(self._validate)
+        self._canvas.geometry_changed.connect(self._geometry_changed)
+        self._canvas.mode_changed.connect(self._sync_mode_action)
         self._canvas.waypoint_selected.connect(self._waypoint_selected)
 
         self._build_toolbar()
@@ -65,16 +71,17 @@ class EditorWindow(QtWidgets.QMainWindow):
         group = QtWidgets.QActionGroup(self)
         group.setExclusive(True)
         for label, mode in (("选择", "select"), ("画路线", "draw"),
-                            ("编辑路线点", "edit"), ("设置出生点", "spawn")):
+                            ("编辑路线点", "edit"), ("设置出生点", "spawn"),
+                            ("设置机器人终点", "robot_goal")):
             action = QtWidgets.QAction(label, self)
             action.setCheckable(True)
             action.setChecked(mode == "select")
             action.triggered.connect(lambda _checked=False, value=mode: self._set_mode(value))
             group.addAction(action)
             toolbar.addAction(action)
+            self._mode_actions[mode] = action
         toolbar.addSeparator()
-        for label, handler in (("删除路线点", self._delete_waypoint),
-                               ("清空当前路线", self._clear_route),
+        for label, handler in (("清空当前路线", self._clear_route),
                                ("适配地图", self._canvas.fit_map)):
             action = QtWidgets.QAction(label, self)
             action.triggered.connect(handler)
@@ -107,7 +114,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._radius.setSingleStep(0.01)
         self._radius.setValue(0.30)
         self._radius.setSuffix(" m")
-        self._radius.valueChanged.connect(self._validate)
+        self._radius.valueChanged.connect(self._validation_input_changed)
         scenario_form.addRow("静态验证半径", self._radius)
         root.addWidget(scenario_box)
 
@@ -135,7 +142,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._yaw.setRange(-180.0, 180.0)
         self._yaw.setSuffix(" deg")
         self._yaw.valueChanged.connect(self._actor_fields_changed)
-        form.addRow("出生朝向", self._yaw)
+        form.addRow("初始方向", self._yaw)
         self._speed = QtWidgets.QDoubleSpinBox()
         self._speed.setRange(0.05, 2.5)
         self._speed.setSingleStep(0.05)
@@ -220,10 +227,17 @@ class EditorWindow(QtWidgets.QMainWindow):
         if actor is None:
             return
         self._kind.setText("机器人" if actor.kind == "robot" else "行人")
+        pedestrian = actor.kind == "pedestrian"
+        if pedestrian:
+            actor.sync_walking_heading()
+        self._yaw.setEnabled(not pedestrian)
+        self._yaw.setSuffix(" deg（自动行进方向）" if pedestrian else " deg")
+        self._yaw.setToolTip(
+            "由出生点到第一个有效路线点实时推导" if pedestrian else "机器人出生朝向（手动）"
+        )
         self._yaw.blockSignals(True)
         self._yaw.setValue(0.0 if actor.spawn_pose is None else math.degrees(actor.spawn_pose[3]))
         self._yaw.blockSignals(False)
-        pedestrian = actor.kind == "pedestrian"
         self._speed.setEnabled(pedestrian)
         self._constrain.setEnabled(pedestrian)
         self._speed.blockSignals(True)
@@ -244,6 +258,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         actor = self._scenario.add_pedestrian(f"toilet_agent_{number:02d}")
         self._selected_actor_id = actor.actor_id
         self._refresh_actor_list()
+        self._invalidate_planner_validation()
         self._validate()
 
     def _remove_pedestrian(self) -> None:
@@ -254,15 +269,25 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._scenario.remove_pedestrian(actor.actor_id)
         self._selected_actor_id = self._scenario.robot.actor_id
         self._refresh_actor_list()
+        self._invalidate_planner_validation()
         self._validate()
 
     def _set_mode(self, mode: str) -> None:
-        if mode in ("draw", "edit") and (self._actor() is None or self._actor().kind != "pedestrian"):
-            self._status("机器人只设置出生位；请先选择一个行人再编辑路线。")
+        if mode == "draw" and (self._actor() is None or self._actor().kind != "pedestrian"):
+            self._status("机器人没有行人路线；请先选择一个行人再画路线。")
+            self._canvas.set_mode("select")
+            return
+        if mode == "robot_goal" and (self._actor() is None or self._actor().kind != "robot"):
+            self._status("请先选择机器人，再设置机器人终点。")
             self._canvas.set_mode("select")
             return
         self._canvas.set_mode(mode)
         self._status(f"编辑模式: {mode}")
+
+    def _sync_mode_action(self, mode: str) -> None:
+        action = self._mode_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
 
     def _spawn_clicked(self, point) -> None:
         actor = self._actor()
@@ -271,6 +296,20 @@ class EditorWindow(QtWidgets.QMainWindow):
         z = 0.03 if actor.kind == "robot" else 0.0
         yaw = 0.0 if actor.spawn_pose is None else actor.spawn_pose[3]
         actor.spawn_pose = (float(point[0]), float(point[1]), z, yaw)
+        actor.sync_walking_heading()
+        self._refresh_heading_field(actor)
+        self._invalidate_planner_validation()
+        self._refresh_canvas()
+        self._update_summary()
+        self._validate()
+
+    def _robot_goal_clicked(self, point) -> None:
+        actor = self._actor()
+        if actor is None or actor.kind != "robot":
+            return
+        yaw = actor.goal_pose[2] if actor.goal_pose is not None else 0.0
+        actor.goal_pose = (float(point[0]), float(point[1]), yaw)
+        self._invalidate_planner_validation()
         self._refresh_canvas()
         self._update_summary()
         self._validate()
@@ -279,19 +318,35 @@ class EditorWindow(QtWidgets.QMainWindow):
         actor = self._actor()
         if actor is None:
             return
-        if actor.spawn_pose is not None:
+        if actor.spawn_pose is not None and actor.kind == "robot":
             actor.spawn_pose = (*actor.spawn_pose[:3], math.radians(self._yaw.value()))
         if actor.kind == "pedestrian":
             actor.velocity_mps = float(self._speed.value())
             actor.constrain_to_path = bool(self._constrain.isChecked())
+        self._invalidate_planner_validation()
         self._refresh_canvas()
+        self._validate()
 
     def _route_changed(self, _points) -> None:
+        actor = self._actor()
+        if actor is not None:
+            actor.sync_walking_heading()
+            self._refresh_heading_field(actor)
+        self._invalidate_planner_validation()
+        self._refresh_canvas()
         self._update_summary()
         self._validate()
 
+    def _geometry_changed(self) -> None:
+        actor = self._actor()
+        if actor is not None:
+            actor.sync_walking_heading()
+            self._refresh_heading_field(actor)
+        self._invalidate_planner_validation()
+        self._update_summary()
+
     def _waypoint_selected(self, index) -> None:
-        self._selected_point.setText("未选择路线点" if index is None else f"waypoint {index}")
+        self._selected_point.setText("未选择路线点" if index is None else f"点 {index + 1}")
 
     def _add_hold(self) -> None:
         actor = self._actor()
@@ -302,6 +357,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         actor.holds = [hold for hold in actor.holds if hold.waypoint_index != index]
         actor.holds.append(HoldDraft(index, float(self._hold_duration.value())))
         actor.holds.sort(key=lambda hold: hold.waypoint_index)
+        self._invalidate_planner_validation()
         self._refresh_canvas()
         self._update_summary()
         self._validate()
@@ -312,12 +368,10 @@ class EditorWindow(QtWidgets.QMainWindow):
         if actor is None or index is None:
             return
         actor.holds = [hold for hold in actor.holds if hold.waypoint_index != index]
+        self._invalidate_planner_validation()
         self._refresh_canvas()
         self._update_summary()
-
-    def _delete_waypoint(self) -> None:
-        if not self._canvas.delete_selected_waypoint():
-            self._status("请先选中一个路线点。")
+        self._validate()
 
     def _clear_route(self) -> None:
         actor = self._actor()
@@ -325,6 +379,7 @@ class EditorWindow(QtWidgets.QMainWindow):
             return
         actor.route.clear()
         actor.holds.clear()
+        self._invalidate_planner_validation()
         self._refresh_canvas()
         self._update_summary()
         self._validate()
@@ -336,13 +391,31 @@ class EditorWindow(QtWidgets.QMainWindow):
     def _refresh_canvas(self) -> None:
         self._canvas.set_scenario(self._scenario, self._selected_actor_id)
 
+    def _refresh_heading_field(self, actor) -> None:
+        self._yaw.blockSignals(True)
+        self._yaw.setValue(0.0 if actor.spawn_pose is None else math.degrees(actor.spawn_pose[3]))
+        self._yaw.blockSignals(False)
+
+    def _invalidate_planner_validation(self) -> None:
+        self._planner_validation_state = False
+
+    def _validation_input_changed(self, *_args) -> None:
+        self._invalidate_planner_validation()
+        self._validate()
+
     def _update_summary(self) -> None:
         actor = self._actor()
         if actor is None:
             return
         spawn = "未设置" if actor.spawn_pose is None else f"({actor.spawn_pose[0]:.2f}, {actor.spawn_pose[1]:.2f})"
+        goal = (
+            "未设置"
+            if actor.goal_pose is None
+            else f"({actor.goal_pose[0]:.2f}, {actor.goal_pose[1]:.2f})"
+        )
+        goal_summary = f"\n机器人终点: {goal}" if actor.kind == "robot" else ""
         self._actor_summary.setText(
-            f"出生点: {spawn}\n路线点: {len(actor.route)}\n停留点: {len(actor.holds)}"
+            f"出生点: {spawn}{goal_summary}\n路线点: {len(actor.route)}\n停留点: {len(actor.holds)}"
         )
 
     def _cursor_changed(self, point) -> None:
@@ -351,6 +424,7 @@ class EditorWindow(QtWidgets.QMainWindow):
     def _map_ready(self, grid: MapSnapshot) -> None:
         self._map = grid
         self._canvas.set_map(grid)
+        self._invalidate_planner_validation()
         self._validate()
 
     def _load_map(self) -> None:
@@ -374,23 +448,55 @@ class EditorWindow(QtWidgets.QMainWindow):
 
     def _save_scenario(self) -> None:
         self._sync_scenario_fields()
+        basic_errors = self._scenario_errors(plan_routes=False)
+        if basic_errors:
+            self._status("场景未通过基础检查，拒绝保存。")
+            self._show_validation(basic_errors, planner_checked=False)
+            return
         errors = self._scenario_errors(plan_routes=True)
         if errors:
             self._status("场景未通过验证，拒绝保存。")
-            self._show_validation(errors)
+            self._show_validation(errors, planner_checked=True)
             return
-        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "保存可执行场景", str(Path.home() / f"{self._scenario.scenario_id}.json"),
-            "Toilet episode (*.json)"
-        )
-        if not filename:
+        self._show_validation([], planner_checked=True)
+        path = self._choose_save_path()
+        if path is None:
+            self._status("已取消保存。")
             return
         try:
             episode = self._scenario.to_episode_spec(map_path=str(self._map_path))
-            Path(filename).write_text(json.dumps(episode.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            self._status(f"已保存可执行 episode: {filename}")
+            path.write_text(
+                json.dumps(episode.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self._scenario_path = path
+            self._status(f"已保存当前场景: {path}")
         except (OSError, ValueError) as exc:
             self._status(f"保存失败: {exc}")
+
+    def _choose_save_path(self) -> Path | None:
+        if self._scenario_path is not None:
+            choice = QtWidgets.QMessageBox.question(
+                self,
+                "保存场景",
+                f"覆盖当前场景文件？\n{self._scenario_path}",
+                QtWidgets.QMessageBox.Yes
+                | QtWidgets.QMessageBox.No
+                | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Yes,
+            )
+            if choice == QtWidgets.QMessageBox.Yes:
+                return self._scenario_path
+            if choice == QtWidgets.QMessageBox.Cancel:
+                return None
+        initial = self._scenario_path or Path.home() / f"{self._scenario.scenario_id}.json"
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "场景另存为",
+            str(initial),
+            "Toilet episode (*.json)",
+        )
+        return Path(filename) if filename else None
 
     def _load_scenario(self) -> None:
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -404,6 +510,8 @@ class EditorWindow(QtWidgets.QMainWindow):
             if episode.task_type != "authored_route":
                 raise ValueError(f"task_type 必须是 authored_route，实际为 {episode.task_type}")
             self._scenario = ScenarioDraft.from_episode_spec(episode)
+            self._scenario_path = Path(filename)
+            self._planner_validation_state = False
             map_path = episode.assets.get("walkable_map")
             if map_path:
                 self._map_path = Path(str(map_path))
@@ -414,25 +522,31 @@ class EditorWindow(QtWidgets.QMainWindow):
             self._selected_actor_id = self._scenario.robot.actor_id
             self._refresh_actor_list()
             self._validate()
-            self._status(f"场景已加载: {filename}")
+            self._status(f"当前场景文件: {self._scenario_path}")
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             self._status(f"场景加载失败: {exc}")
 
     def _validate(self, *_args) -> list[str]:
         errors = self._scenario_errors(plan_routes=False)
-        self._show_validation(errors)
+        self._show_validation(errors, planner_checked=False)
         return errors
 
     def _validate_with_planner(self, *_args) -> list[str]:
+        basic_errors = self._scenario_errors(plan_routes=False)
+        if basic_errors:
+            self._show_validation(basic_errors, planner_checked=False)
+            return basic_errors
         errors = self._scenario_errors(plan_routes=True)
-        self._show_validation(errors)
+        self._show_validation(errors, planner_checked=True)
         return errors
 
     def _scenario_errors(self, *, plan_routes: bool) -> list[str]:
         self._sync_scenario_fields()
         errors = self._scenario.validate(self._map, radius_m=float(self._radius.value()))
-        if not plan_routes or errors or not self._map_path.is_file():
+        if not plan_routes or errors:
             return errors
+        if not self._map_path.is_file():
+            return [f"walkable map is unavailable: {self._map_path}"]
         try:
             planner = WalkableMapPlanner.from_file(
                 WalkableMapPlannerConfig(
@@ -449,7 +563,7 @@ class EditorWindow(QtWidgets.QMainWindow):
                         planner.plan(list(cursor[:3]), list(target), z=float(target[2]))
                     except Exception as exc:
                         errors.append(
-                            f"{actor.actor_id}: cannot plan to target {target_index}: {exc}"
+                            f"{actor.actor_id}: cannot plan to UI point {target_index + 1}: {exc}"
                         )
                         break
                     cursor = target
@@ -457,13 +571,32 @@ class EditorWindow(QtWidgets.QMainWindow):
             errors.append(f"walkable map planner unavailable: {exc}")
         return errors
 
-    def _show_validation(self, errors: list[str]) -> None:
+    def _show_validation(self, errors: list[str], *, planner_checked: bool) -> None:
+        if planner_checked:
+            self._planner_validation_state = not errors
         if errors:
             self._validation.setStyleSheet("color: #c84b54")
-            self._validation.setText("REJECT\n" + "\n".join(f"- {error}" for error in errors))
+            planner = "规划检查: 失败" if planner_checked else self._planner_status_text()
+            basic = "基础检查: 通过" if planner_checked else "基础检查: 失败"
+            self._validation.setText(
+                basic
+                + "\n"
+                + planner
+                + "\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
         else:
-            self._validation.setStyleSheet("color: #2e9d62")
-            self._validation.setText("PASS: 场景参与者、路线、停留点均有效")
+            planner = "规划检查: 通过" if planner_checked else self._planner_status_text()
+            color = "#2e9d62" if planner_checked else "#c58a2a"
+            self._validation.setStyleSheet(f"color: {color}")
+            self._validation.setText(f"基础检查: 通过\n{planner}")
+
+    def _planner_status_text(self) -> str:
+        if self._planner_validation_state is None:
+            return "规划检查: 未执行"
+        if not self._planner_validation_state:
+            return "规划检查: 已过期，请重新验证"
+        return "规划检查: 通过"
 
     def _status(self, message: str) -> None:
         self._status_label.setText(str(message))
