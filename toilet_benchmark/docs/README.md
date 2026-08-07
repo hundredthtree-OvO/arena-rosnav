@@ -7,6 +7,7 @@
 - `manual_collection_cn.md`：人工数采配置、启动、reset 和有效性检查。
 - `replay_trajectory_schema_cn.md`：Replay 轨迹字段和时间基准。
 - `dataset_preparation_cn.md`：训练数据审计和导出流程。
+- `sim_real_lidar_alignment_cn.md`：Isaac Sim/真机双雷达差异、后处理对齐和验收顺序。
 - `animgraph_phase_probe_cn.md`：AnimGraph 生命周期隔离验证。
 - `../toilet_benchmark_ui/README.md`：独立 2D Route Editor 操作说明。
 - `../toilet_benchmark_ui/docs/route_editor_scenario_design_cn.md`：Route Editor 场景契约与运行边界。
