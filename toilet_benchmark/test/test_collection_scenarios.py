@@ -74,6 +74,7 @@ class TestCollectionScenarios(unittest.TestCase):
 
         self.assertIsInstance(config, ManualCollectionConfig)
         self.assertEqual(config.session.selection_mode, "round_robin")
+        self.assertEqual(config.session.control_source, "gamepad")
         self.assertEqual(config.pedestrian.count, 1)
         self.assertEqual(config.pedestrian.agent_ids, ("toilet_agent_01",))
         self.assertEqual(config.scenarios[0].robot_start, (1.8, 0.25, 0.0, 3.14159))
@@ -88,6 +89,14 @@ class TestCollectionScenarios(unittest.TestCase):
         config = load_manual_collection_config(self._write_config(payload))
 
         self.assertEqual(config.session.max_episodes, 10)
+
+    def test_session_preserves_explicit_keyboard_control_source(self):
+        payload = self._base_payload()
+        payload["session"]["control_source"] = "keyboard_diff"
+
+        config = load_manual_collection_config(self._write_config(payload))
+
+        self.assertEqual(config.session.control_source, "keyboard_diff")
 
     def test_negative_session_episode_limit_is_rejected(self):
         payload = self._base_payload()

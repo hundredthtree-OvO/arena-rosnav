@@ -58,6 +58,7 @@ def _parse_pose(value: Any, *, name: str, dims: int) -> tuple[float, ...]:
 class SessionConfig:
     output_root: Path
     operator_id: str
+    control_source: str
     seed: int
     selection_mode: str = "round_robin"
     max_episodes: int = 10
@@ -145,6 +146,10 @@ def _parse_session(raw: Mapping[str, Any]) -> SessionConfig:
     return SessionConfig(
         output_root=Path(_require_str(raw.get("output_root"), name="session.output_root")),
         operator_id=_require_str(raw.get("operator_id"), name="session.operator_id"),
+        control_source=_require_str(
+            raw.get("control_source", "gamepad"),
+            name="session.control_source",
+        ),
         seed=_require_int(raw.get("seed"), name="session.seed"),
         selection_mode=_require_str(raw.get("selection_mode", "round_robin"), name="session.selection_mode"),
         max_episodes=max_episodes,
@@ -393,6 +398,7 @@ def dump_manual_collection_config(config: ManualCollectionConfig) -> dict[str, A
         "session": {
             "output_root": str(config.session.output_root),
             "operator_id": config.session.operator_id,
+            "control_source": config.session.control_source,
             "seed": config.session.seed,
             "selection_mode": config.session.selection_mode,
             "max_episodes": config.session.max_episodes,

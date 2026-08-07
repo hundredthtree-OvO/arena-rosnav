@@ -1,6 +1,8 @@
 session:
   output_root: /home/stardust/resources/arena_ws/data/toilet_manual
   operator_id: operator_01
+  # gamepad for local collection; set keyboard_diff when using remote WASD.
+  control_source: gamepad
   seed: 42
   selection_mode: fixed
   fixed_scenario_id: narrow_head_on_003

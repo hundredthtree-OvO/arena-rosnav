@@ -57,6 +57,7 @@ class SessionManifest:
     session_id: str
     output_root: str
     operator_id: str
+    control_source: str
     seed: int
     selection_mode: str
     scenario_count: int
@@ -76,6 +77,7 @@ class EpisodeManifest:
     started_at: str
     ended_at: str | None
     operator_id: str
+    control_source: str
     seed: int
     selection_mode: str
     scenario: Mapping[str, Any]
@@ -316,6 +318,7 @@ class EpisodeRecorder:
                 session_id=self._session_id,
                 output_root=str(self._config.session.output_root),
                 operator_id=self._config.session.operator_id,
+                control_source=self._config.session.control_source,
                 seed=self._config.session.seed,
                 selection_mode=self._config.session.selection_mode,
                 scenario_count=len(self._config.scenarios),
@@ -346,6 +349,7 @@ class EpisodeRecorder:
             started_at=self._utc_for_episode(context),
             ended_at=ended_at,
             operator_id=self._config.session.operator_id,
+            control_source=self._config.session.control_source,
             seed=self._config.session.seed,
             selection_mode=self._config.session.selection_mode,
             scenario={

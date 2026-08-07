@@ -80,6 +80,10 @@ scenarios:
 
 `max_episodes` 默认是 `10`。每个 episode 会创建带 session 唯一后缀的新行人实例，结束后移到停车区，不在同一 session 内复用 AnimGraph；达到上限后数采节点自动退出。`0` 表示不限制，但长时间运行会持续保留停车实例，不推荐用于正式采集。每个 session 结束后应重启 bridge，以释放这些实例。
 
+`session.control_source` 记录操作输入来源。本地手柄保持 `gamepad`；通过远程桌面使用
+差速键盘数采前改为 `keyboard_diff`。两者都发布 `/cmd_vel_gamepad_diff`，该字段用于后续
+分来源审计，不改变控制话题或导出格式。
+
 默认人数、角色、出生点、路线、停留和机器人起终点全部来自 `episode_path` 指向的 JSON。
 要改变人数或路线，应在 Route Editor 中修改并保存 EpisodeSpec。
 

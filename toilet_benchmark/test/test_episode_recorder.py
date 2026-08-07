@@ -133,6 +133,8 @@ class TestEpisodeRecorder(unittest.TestCase):
 
         self.assertEqual(metadata["status"], "succeeded")
         self.assertEqual(metadata["scenario"]["id"], selection.scenario.id)
+        self.assertEqual(metadata["control_source"], "gamepad")
+        self.assertEqual(session_manifest["control_source"], "gamepad")
         self.assertEqual(metadata["event_count"], 2)
         self.assertEqual(session_manifest["status"], "completed")
         self.assertIsNotNone(session_manifest["ended_at"])
